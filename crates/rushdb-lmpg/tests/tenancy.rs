@@ -49,28 +49,3 @@ fn concurrent_registration_of_one_scope_yields_one_ordinal() {
             tenancy::resolve_or_register_scope(&store, "shared").unwrap()
         }));
     }
-    let mut ids: Vec<TenantId> = Vec::new();
-    for handle in handles {
-        ids.push(handle.join().unwrap());
-    }
-    assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
-    let active = store.active_tenants().unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0], (ids[0], TenantScope::of("shared")));
-}
-
-#[test]
-fn unregistered_scope_resolves_to_nothing_and_never_allocates() {
-    let store = Arc::new(Store::new_in_memory());
-    assert_eq!(
-        store.resolve_tenant(&TenantScope::of("ghost")).unwrap(),
-        None
-    );
-    assert_eq!(store.committed_version(), 0);
-    assert_eq!(members(&store, TenantId::UNREGISTERED, "User"), 0);
-}
-
-#[test]
-fn tenants_never_see_each_others_keys() {
-    let store = Arc::new(Store::new_in_memory());
-    let a = tenancy::resolve_or_register_scope(&store, "a").unwrap();

@@ -1,0 +1,62 @@
+//! Disk planning and native read/write parity tests: fallible reconstruction
+//! and scan projection must preserve payloads across store reopen.
+
+use rushdb_lmpg::{plan::FieldChange, reader::keys_ext, Lmpg};
+use rushdb_storage::{ScanBounds, ScanProjection, Store};
+use rushdb_types::ids::TenantId;
+use serde_json::json;
+use std::sync::Arc;
+
+#[test]
+fn fallible_reconstruction_preserves_record_and_relationship_payloads_after_reopen() {
+    let path = rushdb_storage::TempPath::store("native-rebuild");
+    let tenant = TenantId::from_ordinal(66);
+    let store = Arc::new(Store::open(&path).unwrap());
+    let lmpg = Lmpg::new(store, tenant);
+    let document = json!({"name": "Ada", "score": 99, "ratio": 0.5, "active": true,
+        "nickname": null, "tags": ["a", "b", "a"], "nums": [1, 2]});
+    let root = rushdb_lmpg::import::import_document(&lmpg, "Person", &document).unwrap();
+    let other = lmpg.create_record("Person", None, vec![]).unwrap();
+    let rel = lmpg
+        .create_relationship(
+            "KNOWS",
+            root,
+            other,
+            vec![
+                ("since".into(), FieldChange::Set(json!(2001))),
+                ("tier".into(), FieldChange::ExplicitNull),
+                ("tags".into(), FieldChange::Set(json!(["work", "friend"]))),
+            ],
+        )
+        .unwrap();
+    let expected_record = rushdb_lmpg::reconstruct::reconstruct_record(
+        &lmpg.store.read_view().unwrap(),
+        tenant,
+        root.ordinal,
+    )
+    .unwrap()
+    .unwrap();
+    let expected_rel = rushdb_lmpg::reconstruct::reconstruct_relationship(
+        &lmpg.store.read_view().unwrap(),
+        tenant,
+        rel.ordinal,
+    )
+    .unwrap()
+    .unwrap();
+    drop(lmpg);
+    let reopened = Store::open(&path).unwrap();
+    let view = reopened.read_view().unwrap();
+    let actual = rushdb_lmpg::reconstruct::reconstruct_record(&view, tenant, root.ordinal)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expected_record);
+    for (name, value) in document.as_object().unwrap() {
+        assert_eq!(&actual[name], value);
+    }
+    assert_eq!(
+        rushdb_lmpg::reconstruct::reconstruct_relationship(&view, tenant, rel.ordinal)
+            .unwrap()
+            .unwrap(),
+        expected_rel
+    );
+    drop(view);
