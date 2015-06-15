@@ -1,0 +1,15 @@
+# RushDB on Fly.io: one machine with a volume.
+#
+#   fly launch --copy-config --no-deploy --name <app>   # from this directory
+#   fly volumes create rushdb_data --size 10 --region <region>
+#   fly secrets set RUSHDB_TOKEN=$(openssl rand -hex 32)
+#   fly deploy
+#
+# The HTTP API is public over HTTPS at https://<app>.fly.dev. The PostgreSQL
+# wire port is reachable only on Fly's private network (<app>.internal:5432),
+# or from your machine with `fly proxy 5432`.
+app = "rushdb"
+primary_region = "iad"
+# A clean stop drains requests and writes a checkpoint.
+kill_signal = "SIGTERM"
+kill_timeout = 90
