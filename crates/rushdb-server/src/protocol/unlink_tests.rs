@@ -60,3 +60,34 @@ fn untyped_undirected_unlink_deletes_every_relationship_between_the_records() {
     );
     assert_eq!(
         mutate(&node, "unlinkRecordsById", &everything)["affected"],
+        0
+    );
+    let others = run(
+        &node,
+        &serde_json::json!({"kind": "query", "query": {"kind": "relationships", "query": {}}}),
+    )
+    .unwrap();
+    assert_eq!(
+        others["relationships"].as_array().unwrap().len(),
+        1,
+        "the link to another record stays"
+    );
+}
+
+fn relationship_count(node: &Node) -> usize {
+    run(
+        node,
+        &serde_json::json!({"kind": "query", "query": {"kind": "relationships", "query": {}}}),
+    )
+    .unwrap()["relationships"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// LINK-1: link and unlink by join keys share one key join, so unlink deletes
+/// exactly the pairs link creates: array keys match any element, values are
+/// type-strict (`1` is not `"1"`), a repeated value yields one pair, and
+/// edges between records whose keys do not match stay.
+#[test]
+fn unlink_by_keys_deletes_exactly_the_pairs_link_by_keys_creates() {
