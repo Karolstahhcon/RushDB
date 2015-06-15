@@ -286,3 +286,291 @@ fn read_searchquery(node: &Node, query: &Value) -> Vec<Value> {
     let envelope = RequestEnvelope {
         protocol_version: 1,
         request_id: None,
+        context: RequestContext::default(),
+        operation: Operation::Query {
+            query: Query::Records {
+                query: serde_json::from_value(query.clone()).unwrap(),
+            },
+        },
+    };
+    let ResponseEnvelope { response, .. } =
+        rushdb_server::protocol::ProtocolExecutor::new(node, None)
+            .execute(envelope)
+            .unwrap();
+    match response {
+        Response::Records { records, .. } => records,
+        Response::Rows { rows, .. } => rows,
+        other => panic!("searchquery read returned {other:?}"),
+    }
+}
+
+// ── sql ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn sql_read_and_aggregate() {
+    let node = bootstrap();
+    seed(&node);
+    let rows = read(
+        &node,
+        StatementLanguage::Sql,
+        "SELECT name FROM FACTION ORDER BY name",
+    );
+    assert_eq!(rows.len(), 3);
+    let agg = read(
+        &node,
+        StatementLanguage::Sql,
+        "SELECT founded_year_bby < 0 AS ancient, COUNT(*) AS n FROM FACTION GROUP BY ancient",
+    );
+    assert_eq!(agg.len(), 1);
+}
+
+#[test]
+fn sql_write_update_delete() {
+    let node = bootstrap();
+    seed(&node);
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Sql,
+            "INSERT INTO FACTION (name, founded_year_bby) VALUES ('New Republic', -25)",
+        ),
+        1
+    );
+    assert_eq!(label_count(&node, "FACTION"), 4);
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Sql,
+            "UPDATE FACTION SET name = 'N Republic' WHERE name = 'New Republic'",
+        ),
+        1
+    );
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Sql,
+            "DELETE FROM FACTION WHERE name = 'N Republic'"
+        ),
+        1
+    );
+    assert_eq!(label_count(&node, "FACTION"), 3);
+}
+
+#[test]
+fn sql_ddl_create_and_drop_vector_index() {
+    let node = bootstrap();
+    seed(&node);
+    let alias = write(
+        &node,
+        StatementLanguage::Sql,
+        "CREATE VECTOR INDEX _ddl ON FACTION(name) SIMILARITY cosine DIMENSIONS 4",
+    );
+    let _ = alias;
+    let indexes = node.scope().list_vector_indexes().unwrap();
+    assert_eq!(
+        indexes.get("data").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+}
+
+// ── cypher ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn cypher_read_aggregate() {
+    let node = bootstrap();
+    seed(&node);
+    let rows = read(
+        &node,
+        StatementLanguage::Cypher,
+        "MATCH (n:FACTION) RETURN n.name AS name ORDER BY name",
+    );
+    assert_eq!(rows.len(), 3);
+    let agg = read(
+        &node,
+        StatementLanguage::Cypher,
+        "MATCH (n:FACTION) RETURN count(n) AS n",
+    );
+    assert_eq!(agg[0].get("n").and_then(Value::as_u64), Some(3));
+}
+
+#[test]
+fn cypher_write_update_delete() {
+    let node = bootstrap();
+    seed(&node);
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Cypher,
+            "CREATE (n:FACTION {name: 'Rebel Alliance'})"
+        ),
+        1
+    );
+    assert_eq!(label_count(&node, "FACTION"), 4);
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Cypher,
+            "MATCH (n:FACTION {name: 'Rebel Alliance'}) SET n.name = 'Alliance'",
+        ),
+        1
+    );
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Cypher,
+            "MATCH (n:FACTION {name: 'Alliance'}) DELETE n"
+        ),
+        1
+    );
+    assert_eq!(label_count(&node, "FACTION"), 3);
+}
+
+// ── gql ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn gql_read_and_write() {
+    let node = bootstrap();
+    seed(&node);
+    let rows = read(
+        &node,
+        StatementLanguage::Gql,
+        "MATCH (n:FACTION) RETURN n.name AS name ORDER BY name",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Gql,
+            "INSERT (:FACTION {name: 'Rebel Alliance'})"
+        ),
+        1
+    );
+    assert_eq!(label_count(&node, "FACTION"), 4);
+}
+
+// ── gremlin ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn gremlin_read_and_write() {
+    let node = bootstrap();
+    seed(&node);
+    let rows = read(
+        &node,
+        StatementLanguage::Gremlin,
+        "g.V().hasLabel('FACTION').values('name')",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Gremlin,
+            "g.addV('FACTION').property('name', 'Rebel Alliance')",
+        ),
+        1
+    );
+    assert_eq!(label_count(&node, "FACTION"), 4);
+}
+
+// ── sql-pgq (read-only) ─────────────────────────────────────────────────────
+
+#[test]
+fn sql_pgq_read_and_write_rejected() {
+    let node = bootstrap();
+    seed(&node);
+    let rows = read(
+        &node,
+        StatementLanguage::SqlPgq,
+        "SELECT * FROM GRAPH_TABLE (MATCH (n:FACTION) COLUMNS (n.name AS name)) AS g ORDER BY name",
+    );
+    assert_eq!(rows.len(), 3);
+    // Writes are rejected as read-only.
+    let envelope = RequestEnvelope {
+        protocol_version: 1,
+        request_id: None,
+        context: RequestContext::default(),
+        operation: Operation::Mutate {
+            mutation: Mutation::Statement {
+                language: StatementLanguage::SqlPgq,
+                statement: "CREATE (:FACTION {name: 'X'})".into(),
+                parameters: None,
+            },
+        },
+    };
+    let err = rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+        .execute(envelope)
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidRequest);
+}
+
+// ── mongodb ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn mongodb_read_find_and_aggregate() {
+    let node = bootstrap();
+    seed(&node);
+    let rows = read(
+        &node,
+        StatementLanguage::Mongo,
+        r#"{"collection":"FACTION","filter":{"name":{"$ne":"Sith Order"}},"sort":{"name":1}}"#,
+    );
+    assert_eq!(rows.len(), 2);
+    let agg = read(
+        &node,
+        StatementLanguage::Mongo,
+        r#"{"aggregate":[{"$group":{"_id":"$name","n":{"$sum":1}}}],"collection":"FACTION"}"#,
+    );
+    assert_eq!(agg.len(), 3);
+}
+
+#[test]
+fn mongodb_write_upsert_and_delete() {
+    let node = bootstrap();
+    seed(&node);
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Mongo,
+            r#"{"insertOne":{"collection":"FACTION","document":{"name":"Rebel Alliance"}}}"#,
+        ),
+        1
+    );
+    assert_eq!(label_count(&node, "FACTION"), 4);
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Mongo,
+            r#"{"updateOne":{"collection":"FACTION","filter":{"name":"Rebel Alliance"},"update":{"$set":{"name":"Alliance"}}}}"#,
+        ),
+        1
+    );
+    assert_eq!(
+        write(
+            &node,
+            StatementLanguage::Mongo,
+            r#"{"deleteOne":{"collection":"FACTION","filter":{"name":"Alliance"}}}"#,
+        ),
+        1
+    );
+    assert_eq!(label_count(&node, "FACTION"), 3);
+}
+
+#[test]
+fn mongodb_index_ddl() {
+    let node = bootstrap();
+    seed(&node);
+    write(
+        &node,
+        StatementLanguage::Mongo,
+        r#"{"createIndex":{"collection":"FACTION","property":"name","similarity":"cosine","dimensions":4,"name":"faction-name-4"}}"#,
+    );
+    let indexes = node.scope().list_vector_indexes().unwrap();
+    assert_eq!(
+        indexes.get("data").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+}
+
+// ── capability advertisement ────────────────────────────────────────────────
+
+#[test]
+fn capabilities_advertise_only_enabled_languages() {
