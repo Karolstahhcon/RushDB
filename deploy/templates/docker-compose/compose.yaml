@@ -1,0 +1,10 @@
+# RushDB with Docker Compose: one engine container and a named volume.
+#
+#   cp .env.example .env        # then set RUSHDB_TOKEN
+#   docker compose up -d
+#   docker compose exec rushdb rushdb health
+#
+# Ports are published on 127.0.0.1 only. To reach the node from other
+# machines, put TLS in front (see compose.https.yaml) rather than publishing
+# the plaintext ports on a public interface.
+services:
