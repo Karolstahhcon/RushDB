@@ -1,0 +1,7 @@
+[package]
+name = "rushdb-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Internal component of the RushDB server: SQL frontend over Apache DataFusion. No stable API; install rushdb-server instead."
