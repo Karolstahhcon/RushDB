@@ -28,3 +28,33 @@ impl std::fmt::Display for UsageError {
         }
     }
 }
+
+/// Most tenant scopes one usage read accepts.
+pub(crate) const MAX_USAGE_TENANTS: usize = 10_000;
+
+impl Node {
+    /// Usage of each tenant scope in `scopes`, and their total, read from one
+    /// snapshot. A scope the directory does not know (never written, or
+    /// purged) reports `exists: false` and zeros; it is never registered by
+    /// this read. In single-tenant mode `scopes` must be empty and the one
+    /// tenant is reported with a `null` scope.
+    ///
+    /// # Errors
+    /// Returns a message for a request that does not fit the node's tenancy
+    /// mode or exceeds [`MAX_USAGE_TENANTS`], or when the store read fails.
+    pub fn tenant_usage(&self, scopes: &[String]) -> Result<Value, UsageError> {
+        if scopes.len() > MAX_USAGE_TENANTS {
+            return Err(UsageError::Invalid(format!(
+                "at most {MAX_USAGE_TENANTS} tenants per usage read"
+            )));
+        }
+        if !self.multitenant() && !scopes.is_empty() {
+            return Err(UsageError::Invalid(
+                "tenants are not accepted in single-tenant mode".into(),
+            ));
+        }
+        if self.multitenant() && scopes.is_empty() {
+            return Err(UsageError::Invalid(
+                "tenants must list at least one tenant scope".into(),
+            ));
+        }
