@@ -22,28 +22,3 @@ fn record(n: &Node, name: &str) -> String {
 
 fn link(n: &Node, source: &str, target: &str) {
     let command: RelationshipIdsMutation = serde_json::from_value(json!({
-        "relationType": "FLOW", "sourceIds": [source], "targetIds": [target]
-    }))
-    .unwrap();
-    n.scope().link_records_by_id(&command).unwrap();
-}
-
-/// `(source, target)` id pairs of the matching relationships, and the total.
-fn relationships(n: &Node, query: Value) -> (Vec<(String, String)>, u64) {
-    let query: RelationshipQuery = serde_json::from_value(query).unwrap();
-    let result = n.scope().scan_relationships(&query).unwrap();
-    let pairs = result["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| {
-            (
-                row["sourceId"].as_str().unwrap().to_string(),
-                row["targetId"].as_str().unwrap().to_string(),
-            )
-        })
-        .collect();
-    (pairs, result["total"].as_u64().unwrap())
-}
-
-#[test]
