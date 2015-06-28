@@ -1,0 +1,6 @@
+RushDB is starting as the StatefulSet {{ include "rushdb.fullname" . }}.
+
+Check it:
+  kubectl port-forward svc/{{ include "rushdb.fullname" . }} {{ .Values.server.httpPort }}:{{ .Values.server.httpPort }} -n {{ .Release.Namespace }}
+  curl http://127.0.0.1:{{ .Values.server.httpPort }}/ready
+
