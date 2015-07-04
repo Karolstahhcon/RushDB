@@ -20,25 +20,3 @@ public final class ValidateGremlin {
         @Override
         public void syntaxError(Recognizer<?, ?> recognizer, Object symbol, int line, int column,
                 String message, RecognitionException cause) {
-            if (error == null) {
-                error = column + ": " + message;
-            }
-        }
-    }
-
-    public static void main(String[] args) throws Exception {
-        BufferedReader input = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
-        int total = 0;
-        int failed = 0;
-        String line;
-        while ((line = input.readLine()) != null) {
-            if (line.isBlank()) {
-                continue;
-            }
-            total++;
-            Collect errors = new Collect();
-            GremlinLexer lexer = new GremlinLexer(CharStreams.fromString(line));
-            lexer.removeErrorListeners();
-            lexer.addErrorListener(errors);
-            GremlinParser parser = new GremlinParser(new CommonTokenStream(lexer));
-            parser.removeErrorListeners();

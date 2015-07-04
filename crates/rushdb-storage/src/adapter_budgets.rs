@@ -9,3 +9,15 @@
 
 use crate::resources::ByteBudget;
 use crate::{StorageError, Store};
+
+/// One named attribution child per adapter. `None` exactly when its parent
+/// budget (`logical_cache_resources` / `phase_resources`) is `None`.
+pub(crate) struct AdapterBudgets {
+    vector_cache: Option<ByteBudget>,
+    sql_phase: Option<ByteBudget>,
+    graph_phase: Option<ByteBudget>,
+}
+
+impl AdapterBudgets {
+    pub(crate) fn new(
+        cache: Option<&ByteBudget>,
