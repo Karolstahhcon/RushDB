@@ -337,3 +337,683 @@ impl RequestScope<'_> {
             }
         }
         let mut distinct = std::collections::BTreeSet::<Vec<u8>>::new();
+        let mut held = 0u64;
+        let mut numeric_only = true;
+        let mut any_numeric = false;
+        let mut null_present = false;
+        let mut min: Option<Scalar> = None;
+        let mut max: Option<Scalar> = None;
+        let mut outcome: Result<bool, String> = Ok(true);
+        for (ty, pid) in definitions {
+            // A definition with no owner under `labels` says nothing about
+            // them: a name stored as text on one label must not hide the
+            // numeric range of another.
+            if !labels.is_empty()
+                && !access::prop_support_label_counts(view, t, pid)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .any(|(label, count)| count > 0 && labels.contains(&label))
+            {
+                continue;
+            }
+            if rushdb_lmpg::derived::has_nulls(view, t, OwnerKind::Record, pid, labels)
+                .map_err(|e| e.to_string())?
+            {
+                null_present = true;
+            }
+            if !self.dictionary_answers(view, pid, labels)? {
+                outcome = Ok(false);
+                break;
+            }
+            let numeric = matches!(ty, LogicalType::Int64 | LogicalType::Float64);
+            if numeric {
+                any_numeric = true;
+            } else {
+                numeric_only = false;
+            }
+            let read = rushdb_lmpg::derived::for_each_dictionary_entry(
+                view,
+                t,
+                OwnerKind::Record,
+                pid,
+                labels,
+                &mut |entry, _| {
+                    let Some(payload) = entry.get(1..) else {
+                        outcome = Err("corrupt value dictionary entry".into());
+                        return false;
+                    };
+                    if !distinct.contains(payload) {
+                        let bytes = value_bytes(payload.len());
+                        if let Err(error) = meter.charge(bytes) {
+                            outcome = Err(error);
+                            return false;
+                        }
+                        held += bytes;
+                        distinct.insert(payload.to_vec());
+                    }
+                    if numeric {
+                        if let Ok(scalar) =
+                            rushdb_types::encoding::decode_order_preserving(ty, payload)
+                        {
+                            // Incomparable values replace, as before.
+                            let replaces = |held: Option<&Scalar>, beaten: Ordering| {
+                                held.is_none_or(|m| {
+                                    scalar_cmp(m, &scalar).is_none_or(|order| order == beaten)
+                                })
+                            };
+                            if replaces(min.as_ref(), Ordering::Greater) {
+                                min = Some(scalar.clone());
+                            }
+                            if replaces(max.as_ref(), Ordering::Less) {
+                                max = Some(scalar);
+                            }
+                        }
+                    }
+                    true
+                },
+            );
+            if let Err(error) = read {
+                outcome = Err(error.to_string());
+            }
+            if outcome.is_err() {
+                break;
+            }
+        }
+        meter.release(held);
+        if !outcome? {
+            return Ok(None);
+        }
+        Ok(Some(ValueDomainIndex {
+            distinct: distinct.len() as u64,
+            null_present,
+            min: min.map(|scalar| scalar_to_json(&scalar)),
+            max: max.map(|scalar| scalar_to_json(&scalar)),
+            numeric_only: numeric_only && any_numeric,
+        }))
+    }
+
+    /// The value domain under one `label` when exactly one of `definitions`
+    /// has owners there and the dictionary answers for it: the distinct
+    /// count from its counter and a numeric range from the dictionary's
+    /// first and last entries, so the read does not grow with the number
+    /// of distinct values. `None` sends the caller to the dictionary walk.
+    fn label_domain_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+        label: &str,
+        definitions: &[(rushdb_types::model::LogicalType, u64)],
+    ) -> Result<Option<ValueDomainIndex>, String> {
+        use rushdb_types::model::LogicalType;
+        let t = self.tenant();
+        let mut held = Vec::new();
+        for &(ty, pid) in definitions {
+            if access::prop_support_label_counts(view, t, pid)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .any(|(owner, count)| count > 0 && owner == label)
+            {
+                held.push((ty, pid));
+            }
+        }
+        let [(ty, pid)] = held[..] else {
+            return Ok(None);
+        };
+        let labels = [label.to_string()];
+        if !self.dictionary_answers(view, pid, &labels)? {
+            return Ok(None);
+        }
+        let derived = |e: rushdb_storage::StorageError| e.to_string();
+        let null_present =
+            rushdb_lmpg::derived::has_nulls(view, t, OwnerKind::Record, pid, &labels)
+                .map_err(derived)?;
+        let distinct = rushdb_lmpg::derived::label_distinct(view, t, OwnerKind::Record, label, pid)
+            .map_err(derived)?;
+        let numeric = matches!(ty, LogicalType::Int64 | LogicalType::Float64);
+        let (mut min, mut max) = (None, None);
+        if numeric {
+            if let Some((first, last)) =
+                rushdb_lmpg::derived::dictionary_bounds(view, t, OwnerKind::Record, label, pid)
+                    .map_err(derived)?
+            {
+                let decode = |entry: &[u8]| -> Result<serde_json::Value, String> {
+                    let payload = entry.get(1..).ok_or("corrupt value dictionary entry")?;
+                    rushdb_types::encoding::decode_order_preserving(ty, payload)
+                        .map(|scalar| rushdb_types::value::scalar_to_json(&scalar))
+                        .map_err(|e| e.to_string())
+                };
+                min = Some(decode(&first)?);
+                max = Some(decode(&last)?);
+            }
+        }
+        Ok(Some(ValueDomainIndex {
+            distinct,
+            null_present,
+            min,
+            max,
+            numeric_only: numeric,
+        }))
+    }
+
+    /// Exact top-k `(value, owner count)` pairs under `labels` (all labels
+    /// when empty) from the value dictionary's
+    /// refcounts (C7 `TopK`, DC10). `None` (caller counts during the scan)
+    /// when a definition holds arrays or long values, or no scalar definition
+    /// exists.
+    pub(crate) fn value_domain_top_k_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+        property: &str,
+        k: usize,
+        labels: &[String],
+        meter: &mut WorkingSet<'_>,
+    ) -> Result<Option<Vec<(serde_json::Value, u64)>>, String> {
+        if let [label] = labels {
+            if let Some(head) =
+                self.label_dictionary_head_in_view(view, property, label, k, meter)?
+            {
+                return Ok(Some(head));
+            }
+        }
+        Ok(self
+            .value_dictionary_in_view(view, property, labels, None, meter)?
+            .map(|mut out| {
+                for (value, _) in out.drain(k.min(out.len())..) {
+                    let encoded = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
+                    meter.release(value_bytes(encoded));
+                }
+                out
+            }))
+    }
+
+    /// The best `k` `(value, owner count)` pairs of one label's dictionary,
+    /// ranked as [`Self::value_dictionary_in_view`] ranks (descending count,
+    /// ties by the value's JSON text), when exactly one definition of
+    /// `property` has owners under `label` and the dictionary answers for
+    /// it. Only `k` values are held while the dictionary streams, so a
+    /// column of unique values fits the working set. `None` sends the caller
+    /// to the full dictionary read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a read fails, a row is corrupt, or the meter
+    /// stops the read.
+    fn label_dictionary_head_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+        property: &str,
+        label: &str,
+        k: usize,
+        meter: &mut WorkingSet<'_>,
+    ) -> Result<Option<Vec<(serde_json::Value, u64)>>, String> {
+        use std::cmp::{Ordering, Reverse};
+        use std::collections::BinaryHeap;
+        // Heap order: the greatest entry is the worst kept one.
+        struct Ranked(u64, String, serde_json::Value);
+        impl PartialEq for Ranked {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other) == Ordering::Equal
+            }
+        }
+        impl Eq for Ranked {}
+        impl PartialOrd for Ranked {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Ranked {
+            fn cmp(&self, other: &Self) -> Ordering {
+                Reverse(self.0)
+                    .cmp(&Reverse(other.0))
+                    .then_with(|| self.1.cmp(&other.1))
+            }
+        }
+        let Some(definitions) = self.scalar_definitions_of(view, property, &[])? else {
+            return Ok(None);
+        };
+        let t = self.tenant();
+        let mut held_by_label = Vec::new();
+        for (ty, pid) in definitions {
+            if access::prop_support_label_counts(view, t, pid)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .any(|(owner, count)| count > 0 && owner == label)
+            {
+                held_by_label.push((ty, pid));
+            }
+        }
+        let [(ty, pid)] = held_by_label[..] else {
+            return Ok(None);
+        };
+        let labels = [label.to_string()];
+        if !self.dictionary_answers(view, pid, &labels)? {
+            return Ok(None);
+        }
+        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(k.saturating_add(1));
+        let mut held = 0u64;
+        let mut outcome: Result<(), String> = Ok(());
+        let read = rushdb_lmpg::derived::for_each_dictionary_entry(
+            view,
+            t,
+            OwnerKind::Record,
+            pid,
+            &labels,
+            &mut |entry, owner_count| {
+                if k == 0 {
+                    return false;
+                }
+                // A count below the worst kept one cannot enter a full head.
+                if heap.len() == k && heap.peek().is_some_and(|worst| owner_count < worst.0) {
+                    return true;
+                }
+                let Some(value) = entry
+                    .get(1..)
+                    .and_then(|payload| dictionary_value(ty, payload))
+                else {
+                    return true;
+                };
+                let text = serde_json::to_string(&value).unwrap_or_default();
+                let bytes = value_bytes(text.len());
+                if let Err(error) = meter.charge(bytes) {
+                    outcome = Err(error);
+                    return false;
+                }
+                held += bytes;
+                heap.push(Ranked(owner_count, text, value));
+                if heap.len() > k {
+                    if let Some(dropped) = heap.pop() {
+                        let bytes = value_bytes(dropped.1.len());
+                        meter.release(bytes);
+                        held -= bytes;
+                    }
+                }
+                true
+            },
+        );
+        if let Err(error) = read.map_err(|e| e.to_string()).and(outcome) {
+            meter.release(held);
+            return Err(error);
+        }
+        // Kept values stay charged while the caller holds them, as the full
+        // dictionary read leaves them.
+        Ok(Some(
+            heap.into_sorted_vec()
+                .into_iter()
+                .map(|Ranked(count, _, value)| (value, count))
+                .collect(),
+        ))
+    }
+
+    /// Every distinct `(value, owner count)` pair under `labels` (all labels
+    /// when empty) from the value dictionary, keeping only the values that
+    /// match `search`, ranked by descending owner count (ties by the
+    /// value's JSON text). Values read back as the records response shows
+    /// them. `None` (caller scans) when a definition holds arrays or long
+    /// values, or no scalar definition exists.
+    ///
+    /// The dictionary is streamed, and each kept value is charged to `meter`
+    /// as it is kept; the returned values stay charged while the caller
+    /// holds them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a read fails, a row is corrupt, or the meter
+    /// stops the read.
+    pub(crate) fn value_dictionary_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+        property: &str,
+        labels: &[String],
+        search: Option<&ValueMatcher>,
+        meter: &mut WorkingSet<'_>,
+    ) -> Result<Option<Vec<(serde_json::Value, u64)>>, String> {
+        self.value_dictionary_of_types_in_view(view, property, labels, &[], search, meter)
+    }
+
+    /// [`Self::value_dictionary_in_view`] over the property's definitions of
+    /// `types` only (all when empty).
+    pub(crate) fn value_dictionary_of_types_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+        property: &str,
+        labels: &[String],
+        types: &[rushdb_types::model::LogicalType],
+        search: Option<&ValueMatcher>,
+        meter: &mut WorkingSet<'_>,
+    ) -> Result<Option<Vec<(serde_json::Value, u64)>>, String> {
+        use std::collections::hash_map::Entry;
+        use std::collections::HashMap;
+        let Some(definitions) = self.scalar_definitions_of(view, property, types)? else {
+            return Ok(None);
+        };
+        if definitions.is_empty() {
+            return Ok(None);
+        }
+        let t = self.tenant();
+        // Across definitions the higher count wins; within one, a value held
+        // under several labels sums their counts.
+        let mut counts: HashMap<Vec<u8>, (serde_json::Value, u64)> = HashMap::new();
+        let mut held = 0u64;
+        let mut outcome: Result<bool, String> = Ok(true);
+        for (ty, pid) in definitions {
+            if !self.dictionary_answers(view, pid, labels)? {
+                outcome = Ok(false);
+                break;
+            }
+            let mut definition: HashMap<Vec<u8>, (serde_json::Value, u64)> = HashMap::new();
+            let read = rushdb_lmpg::derived::for_each_dictionary_entry(
+                view,
+                t,
+                OwnerKind::Record,
+                pid,
+                labels,
+                &mut |entry, owner_count| {
+                    let Some(payload) = entry.get(1..) else {
+                        outcome = Err("corrupt value dictionary entry".into());
+                        return false;
+                    };
+                    let Some(value) = dictionary_value(ty, payload) else {
+                        return true;
+                    };
+                    if search.is_some_and(|search| !search.matches(&value)) {
+                        return true;
+                    }
+                    let fingerprint = match serde_json::to_vec(&value) {
+                        Ok(fingerprint) => fingerprint,
+                        Err(error) => {
+                            outcome = Err(error.to_string());
+                            return false;
+                        }
+                    };
+                    match definition.entry(fingerprint) {
+                        Entry::Occupied(mut kept) => kept.get_mut().1 += owner_count,
+                        Entry::Vacant(slot) => {
+                            let bytes = value_bytes(slot.key().len());
+                            if let Err(error) = meter.charge(bytes) {
+                                outcome = Err(error);
+                                return false;
+                            }
+                            held += bytes;
+                            slot.insert((value, owner_count));
+                        }
+                    }
+                    true
+                },
+            );
+            if let Err(error) = read {
+                outcome = Err(error.to_string());
+            }
+            if outcome.is_err() {
+                break;
+            }
+            for (fingerprint, (value, count)) in definition {
+                match counts.entry(fingerprint) {
+                    Entry::Occupied(mut kept) => {
+                        let bytes = value_bytes(kept.key().len());
+                        meter.release(bytes);
+                        held -= bytes;
+                        kept.get_mut().1 = kept.get().1.max(count);
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert((value, count));
+                    }
+                }
+            }
+        }
+        if !matches!(outcome, Ok(true)) {
+            meter.release(held);
+            outcome?;
+            return Ok(None);
+        }
+        let mut out: Vec<(serde_json::Value, u64)> = counts.into_values().collect();
+        out.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                let left = serde_json::to_string(&a.0).unwrap_or_default();
+                let right = serde_json::to_string(&b.0).unwrap_or_default();
+                left.cmp(&right)
+            })
+        });
+        Ok(Some(out))
+    }
+
+    /// Distinct count and, when it is at most `keep`, the values with their
+    /// owner counts (by descending count, ties by value) of a text property
+    /// on `label` that holds values too long for the dictionary. The count
+    /// is exact from the write-time counters: the dictionary's for short
+    /// values, the digest refcounts for long ones. Long values are digests
+    /// on disk, so listing them reads the label's records until every digest
+    /// is matched, at most `LONG_VALUE_WALK` records; past that the values
+    /// are left out and the count stays. `None` when the property has no
+    /// text definition.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear digest walk; splitting would scatter the shared read-view borrows"
+    )]
+    pub(crate) fn long_text_values_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+        property: &str,
+        label: &str,
+        keep: u64,
+        meter: &mut WorkingSet<'_>,
+    ) -> Result<Option<ScannedText>, String> {
+        use rushdb_lmpg::derived;
+        use rushdb_types::keys as k;
+        use rushdb_types::model::LogicalType;
+        use std::collections::{BTreeMap, BTreeSet};
+        let Some(definitions) = self.scalar_definitions_of(view, property, &[LogicalType::Utf8])?
+        else {
+            return Ok(None);
+        };
+        if definitions.is_empty() {
+            return Ok(None);
+        }
+        let t = self.tenant();
+        let scope = [label.to_string()];
+        let mut short: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut long: BTreeMap<[u8; k::LONG_DIGEST_BYTES], u64> = BTreeMap::new();
+        let distinct = if let [(_, pid)] = definitions.as_slice() {
+            derived::label_distinct(view, t, OwnerKind::Record, label, *pid)
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut entries: BTreeSet<Vec<u8>> = BTreeSet::new();
+            let mut digests = BTreeSet::new();
+            for (_, pid) in &definitions {
+                entries.extend(
+                    derived::dictionary(view, t, OwnerKind::Record, *pid, &scope)
+                        .map_err(|e| e.to_string())?
+                        .into_keys(),
+                );
+                digests.extend(
+                    derived::long_value_counts(view, t, OwnerKind::Record, label, *pid)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|(digest, _)| digest),
+                );
+            }
+            (entries.len() + digests.len()) as u64
+        };
+        if distinct == 0 || distinct > keep {
+            return Ok(Some((distinct, Vec::new())));
+        }
+        // At most `keep` values from here on.
+        for (_, pid) in &definitions {
+            for (entry, count) in derived::dictionary(view, t, OwnerKind::Record, *pid, &scope)
+                .map_err(|e| e.to_string())?
+            {
+                *short.entry(entry).or_default() += count;
+            }
+            for (digest, count) in
+                derived::long_value_counts(view, t, OwnerKind::Record, label, *pid)
+                    .map_err(|e| e.to_string())?
+            {
+                *long.entry(digest).or_default() += count;
+            }
+        }
+        let decode = |entry: &[u8]| -> Option<serde_json::Value> {
+            let scalar =
+                rushdb_types::encoding::decode_order_preserving(LogicalType::Utf8, entry.get(1..)?)
+                    .ok()?;
+            Some(rushdb_types::value::scalar_to_json(&scalar))
+        };
+        let mut found: BTreeMap<[u8; k::LONG_DIGEST_BYTES], serde_json::Value> = BTreeMap::new();
+        let mut held = 0u64;
+        let mut walked = 0u64;
+        let mut outcome: Result<(), String> = Ok(());
+        'walk: for (_, pid) in &definitions {
+            if found.len() == long.len() {
+                break;
+            }
+            let prefix =
+                k::presence_nullness_prefix(t, OwnerKind::Record, label, *pid, k::NULLNESS_VALUE);
+            let (start, end) = rushdb_storage::prefix_range(&prefix);
+            let mut visit = |key: &[u8]| -> Result<bool, String> {
+                walked += 1;
+                if walked > LONG_VALUE_WALK {
+                    return Ok(false);
+                }
+                if walked.is_multiple_of(1024) {
+                    meter.check()?;
+                }
+                let (_, _, _, _, owner) =
+                    k::parse_presence_key(key).ok_or("corrupt presence row")?;
+                let rows = view
+                    .range_prefix(&k::occ_pid_prefix(t, OwnerKind::Record, owner, *pid))
+                    .map_err(|e| e.to_string())?;
+                for (_, raw) in rows {
+                    let occ = rushdb_types::occurrence::decode_occ_value(&raw)
+                        .map_err(|_| "corrupt occurrence row".to_string())?;
+                    if occ.entry.len() <= k::DICT_MAX_VALUE_BYTES {
+                        continue;
+                    }
+                    let digest = k::long_value_digest(occ.entry);
+                    if !long.contains_key(&digest) || found.contains_key(&digest) {
+                        continue;
+                    }
+                    if let Some(value) = decode(occ.entry) {
+                        let bytes = value_bytes(occ.entry.len());
+                        meter.charge(bytes)?;
+                        held += bytes;
+                        found.insert(digest, value);
+                    }
+                }
+                Ok(found.len() < long.len())
+            };
+            view.for_each_row(&start, &end, &mut |key, _| match visit(key) {
+                Ok(more) => more,
+                Err(error) => {
+                    outcome = Err(error);
+                    false
+                }
+            })
+            .map_err(|e| e.to_string())?;
+            if outcome.is_err() || walked > LONG_VALUE_WALK {
+                break 'walk;
+            }
+        }
+        meter.release(held);
+        outcome?;
+        if found.len() < long.len() {
+            // Not every long value was reached within the walk.
+            return Ok(Some((distinct, Vec::new())));
+        }
+        let mut values: Vec<(serde_json::Value, u64)> = short
+            .into_iter()
+            .filter_map(|(entry, count)| Some((decode(&entry)?, count)))
+            .chain(
+                found
+                    .into_iter()
+                    .map(|(digest, value)| (value, long[&digest])),
+            )
+            .collect();
+        values.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                let left = serde_json::to_string(&a.0).unwrap_or_default();
+                let right = serde_json::to_string(&b.0).unwrap_or_default();
+                left.cmp(&right)
+            })
+        });
+        Ok(Some((distinct, values)))
+    }
+
+    /// Whether vector writes/searches must carry an explicit index name.
+    #[must_use]
+    pub fn require_vector_index_name(&self) -> bool {
+        self.require_vector_index_name
+    }
+
+    /// See `resources.introspection-value-max-chars` (0 = no cap).
+    #[must_use]
+    pub fn introspection_value_max_chars(&self) -> usize {
+        self.introspection_value_max_chars
+    }
+    /// Property-definition metadata keyed by normalized property name. A
+    /// family may have more than one typed definition, and every definition
+    /// gets its own public id.
+    pub(super) fn property_meta_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+    ) -> Result<PropertyMetadata, String> {
+        use rushdb_types::keys::{key, P_FAMILY};
+        let tenant = self.tenant();
+        // Include the separator: `property-family-signature` is a different
+        // key family and must not be scanned as a PropertyFamily row.
+        let pref = key(tenant, &[P_FAMILY, b""]);
+        let mut families = std::collections::BTreeMap::new();
+        let mut out = std::collections::BTreeMap::new();
+        for (_, raw) in view.range_prefix(&pref).map_err(|e| e.to_string())? {
+            let fam: rushdb_types::occurrence::PropertyFamily = serde_json::from_slice(&raw)
+                .map_err(|e| format!("corrupt property family: {e}"))?;
+            families.insert(fam.family_id, fam);
+        }
+        // Scan definitions once, not once per property family.
+        for (_, raw) in view
+            .range_prefix(&key(tenant, &[b"property-row", b""]))
+            .map_err(|e| e.to_string())?
+        {
+            let def: rushdb_types::occurrence::PropertyDefinition = serde_json::from_slice(&raw)
+                .map_err(|e| format!("corrupt property definition: {e}"))?;
+            let fam = families
+                .get(&def.family_id)
+                .ok_or("corrupt property definition: missing family")?;
+            if fam.namespace != "default" || fam.owner_scope != OwnerKind::Record {
+                continue;
+            }
+            if let rushdb_types::model::TypeState::Known(ty) = def.type_state {
+                out.entry(fam.normalized_name.clone())
+                    .or_insert_with(Vec::new)
+                    .push((
+                        def.property_id,
+                        fam.display_name.clone(),
+                        type_name_str(ty),
+                        ty,
+                    ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Property definitions actually present on records matched by a query.
+    /// The id is a tenant-local ordinal reference: it is only ever resolved
+    /// against the current request's tenant catalog (`resolve_property_name`),
+    /// so it carries no tenant fingerprint or cross-tenant capability.
+    pub(super) fn public_property_id(property_id: u64) -> String {
+        format!("p{property_id:016x}")
+    }
+
+    /// The property id behind [`Self::public_property_id`].
+    pub(super) fn private_property_id(public: &str) -> Option<u64> {
+        let hex = public.strip_prefix('p')?;
+        (hex.len() == 16)
+            .then(|| u64::from_str_radix(hex, 16).ok())
+            .flatten()
+    }
+
+    /// Exact `(min, max)` of `pid` on `label` from the label's value
+    /// dictionary, whose entries sort in value order; `None` when the
+    /// dictionary does not hold every value (arrays, long strings) or holds
+    /// none. Datetimes render as records do.
+    fn exact_range(
+        &self,
+        view: &rushdb_storage::ReadView,
+        meta: &PropertyMetadata,
+        label: &str,

@@ -40,3 +40,17 @@ fn null_scalar_after_a_typed_value_is_accepted() {
     .unwrap()
     .unwrap();
     assert!(
+        rebuilt.get("n").is_none_or(serde_json::Value::is_null),
+        "explicit null must reconstruct as null/absent, got {rebuilt:?}"
+    );
+}
+
+#[test]
+fn null_scalar_with_no_prior_type_then_a_string_is_accepted() {
+    let store = Arc::new(Store::new_in_memory());
+    let graph = Lmpg::new(store.clone(), TenantId::single());
+
+    // Null first (no known definition yet), then a string.
+    graph
+        .create_record("Q", None, vec![("v".into(), FieldChange::Set(json!(null)))])
+        .unwrap();
