@@ -38,3 +38,23 @@ fn bytecode_reads_and_writes_like_gremlin_text() {
         .unwrap();
         assert!(matches!(
             written,
+            Response::StatementMutation { affected: 1, .. }
+        ));
+    }
+    // g.V().hasLabel('person').has('age', P.gt(28)).values('name')
+    let Response::Rows { rows, .. } = execute(
+        &node,
+        Operation::Query {
+            query: Query::GremlinBytecode {
+                bytecode: serde_json::json!({"step": [
+                    ["V"],
+                    ["hasLabel", "person"],
+                    ["has", "age", {"@type": "g:P", "@value": {"predicate": "gt", "value": 28}}],
+                    ["values", "name"]
+                ]}),
+                parameters: None,
+            },
+        },
+    )
+    .unwrap() else {
+        panic!("rows")
