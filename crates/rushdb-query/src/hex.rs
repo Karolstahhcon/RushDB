@@ -13,3 +13,11 @@ pub fn hex_decode_16(hex: &str) -> Option<[u8; 16]> {
         *byte = (hi << 4) | lo;
     }
     Some(out)
+}
+
+trait HexVal {
+    fn hex_val(self) -> Option<u8>;
+}
+
+impl HexVal for u8 {
+    fn hex_val(self) -> Option<u8> {
