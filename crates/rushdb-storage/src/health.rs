@@ -17,3 +17,13 @@ impl StoreHealth {
 
     pub(crate) fn check(&self) -> Result<(), StorageError> {
         if self.0.load(Ordering::Acquire) {
+            Err(StorageError::Unhealthy)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn guard<T>(&self, guard: LockResult<T>) -> Result<T, StorageError> {
+        guard.map_err(|_| {
+            self.fence();
+            StorageError::Unhealthy

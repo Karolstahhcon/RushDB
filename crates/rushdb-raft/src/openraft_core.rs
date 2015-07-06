@@ -140,3 +140,145 @@ impl RaftStorage<TypeConfig> for RushRaftStore {
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
         self.inner.read_vote().await
+    }
+
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogId<NodeId>>,
+    ) -> Result<(), StorageError<NodeId>> {
+        self.inner.save_committed(committed).await
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+        self.inner.read_committed().await
+    }
+
+    async fn last_applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, ()>), StorageError<NodeId>> {
+        self.inner.last_applied_state().await
+    }
+
+    async fn delete_conflict_logs_since(
+        &mut self,
+        log_id: LogId<NodeId>,
+    ) -> Result<(), StorageError<NodeId>> {
+        self.inner.delete_conflict_logs_since(log_id).await
+    }
+
+    async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        self.inner.purge_logs_upto(log_id).await
+    }
+
+    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+    {
+        self.inner.append_to_log(entries).await
+    }
+
+    async fn apply_to_state_machine(
+        &mut self,
+        entries: &[Entry<TypeConfig>],
+    ) -> Result<Vec<ClientResponse>, StorageError<NodeId>> {
+        let responses = self.inner.apply_to_state_machine(entries).await?;
+        let mut pending: Vec<(LogId<NodeId>, ReplicatedCommit)> = Vec::new();
+        for entry in entries {
+            if let EntryPayload::Normal(request) = &entry.payload {
+                let wrapped: ReplicatedCommit = serde_json::from_str(&request.status)
+                    .map_err(|error| StorageIOError::apply(entry.log_id, &error))?;
+                pending.push((entry.log_id, wrapped));
+            }
+        }
+        if !pending.is_empty() {
+            let first_log_id = pending
+                .first()
+                .map(|(log_id, _)| *log_id)
+                .expect("pending is non-empty");
+            let rushdb = Arc::clone(&self.rushdb);
+            // The apply path performs a redb fsync. Run it off the async worker
+            // so raft heartbeats, elections and RPC handling are not stalled by
+            // durability on every committed batch.
+            tokio::task::spawn_blocking(move || -> Result<(), StorageError<NodeId>> {
+                for (log_id, wrapped) in pending {
+                    rushdb
+                        .apply_replicated_batch_with_payload(&wrapped.batch, Some(&wrapped.payload))
+                        .map_err(|error| StorageIOError::apply(log_id, &error))?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| StorageIOError::apply(first_log_id, &error))??;
+        }
+        Ok(responses)
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<NodeId>> {
+        self.inner.begin_receiving_snapshot().await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<NodeId, ()>,
+        snapshot: Box<std::io::Cursor<Vec<u8>>>,
+    ) -> Result<(), StorageError<NodeId>> {
+        self.inner.install_snapshot(meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+        self.inner.get_current_snapshot().await
+    }
+
+    fn get_log_reader(&mut self) -> impl std::future::Future<Output = Self::LogReader> {
+        std::future::ready(self.inner.clone())
+    }
+
+    fn get_snapshot_builder(&mut self) -> impl std::future::Future<Output = Self::SnapshotBuilder> {
+        std::future::ready(self.inner.clone())
+    }
+}
+
+/// Builds in-process [`InProcessNetwork`] clients from a shared node registry;
+/// used by deterministic engine tests instead of a TCP transport.
+#[derive(Clone, Default)]
+pub struct InProcessNetworkFactory {
+    nodes: Registry,
+}
+
+impl RaftNetworkFactory<TypeConfig> for InProcessNetworkFactory {
+    type Network = InProcessNetwork;
+    fn new_client(
+        &mut self,
+        target: NodeId,
+        _node: &(),
+    ) -> impl std::future::Future<Output = Self::Network> {
+        std::future::ready(InProcessNetwork {
+            target,
+            nodes: self.nodes.clone(),
+        })
+    }
+}
+
+/// Per-target RPC client that forwards `OpenRaft` requests to the target node's
+/// in-process handle looked up from the shared registry.
+pub struct InProcessNetwork {
+    target: NodeId,
+    nodes: Registry,
+}
+
+impl InProcessNetwork {
+    async fn target(&self) -> Result<OpenRaft, RPCError<NodeId, (), RaftError<NodeId>>> {
+        self.nodes
+            .read()
+            .await
+            .get(&self.target)
+            .cloned()
+            .ok_or_else(|| {
+                let error = std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "raft peer unavailable",
+                );
