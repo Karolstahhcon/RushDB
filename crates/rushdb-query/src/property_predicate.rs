@@ -20,3 +20,25 @@ pub fn parse_property_predicate(where_: &Json) -> Result<Expr, QueryDocumentErro
             Expr::Not(inner) => traverses(inner),
             Expr::Field(_) => false,
             Expr::Related(_) => true,
+        }
+    }
+    let expr = document::parse_where(where_)?;
+    if traverses(&expr) {
+        return Err(QueryDocumentError::Parse(
+            "a relationship predicate filters the relationship's own properties; \
+             traversal blocks are not supported"
+                .into(),
+        ));
+    }
+    Ok(expr)
+}
+
+/// Evaluate a [`parse_property_predicate`] expression on one object. `$type`
+/// tests the stored JSON shape (there is no declared type to consult).
+///
+/// # Errors
+/// Returns [`QueryError`] when evaluation fails.
+pub fn matches_properties(expr: &Expr, obj: &Map<String, Json>) -> Result<bool, QueryError> {
+    Ok(match expr {
+        Expr::And(items) => {
+            for item in items {
