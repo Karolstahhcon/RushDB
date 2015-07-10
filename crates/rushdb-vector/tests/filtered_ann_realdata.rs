@@ -68,3 +68,74 @@ fn read_ivecs(path: &str) -> Vec<Vec<u32>> {
     }
     out
 }
+
+/// Bind real vectors into an in-memory engine, one record per vector.
+fn bind_real(vectors: &[Vec<f32>], dims: usize) -> (VectorEngine, Vec<u64>) {
+    let store = Arc::new(Store::new_in_memory());
+    let lmpg = Lmpg::new(store.clone(), TenantId::from_ordinal(72));
+    let vecs = VectorEngine::new(Arc::new(Lmpg::new(store, TenantId::from_ordinal(72))));
+    vecs.ensure_space("real", u32::try_from(dims).unwrap())
+        .unwrap();
+
+    let mut ords = Vec::with_capacity(vectors.len());
+    for (i, vector) in vectors.iter().enumerate() {
+        let r: RecordRef = lmpg
+            .create_record(
+                "V",
+                None,
+                vec![("seed".into(), FieldChange::Set(serde_json::json!(i)))],
+            )
+            .unwrap();
+        let norm = rushdb_types::value::normalize_name("seed");
+        let sig = key(
+            lmpg.tenant,
+            &[
+                P_FAMILY_SIG,
+                b"default",
+                &[OwnerKind::Record.as_byte()],
+                norm.as_bytes(),
+            ],
+        );
+        let raw = lmpg.store.get(&sig).unwrap().expect("family signature");
+        let pid = u64::from_be_bytes(raw[..8].try_into().unwrap());
+        let src = SourceRef {
+            kind: OwnerKind::Record,
+            owner_ord: r.ordinal,
+            pid,
+            elem: 0,
+        };
+        vecs.bind("real", src, vector).unwrap();
+        ords.push(r.ordinal);
+    }
+    (vecs, ords)
+}
+
+/// Filter predicate: allow ordinals whose category is in `allowed`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "ordinals are reduced modulo a small constant, so the result always fits a 32-bit usize"
+)]
+fn allow_categories(allowed: &std::collections::HashSet<usize>) -> impl Fn(SourceRef) -> bool + '_ {
+    move |src| allowed.contains(&((src.owner_ord as usize) % 20))
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "recall and per-query latency are reported metrics that only need f64 precision"
+)]
+fn run_filtered_experiment(
+    vecs: &VectorEngine,
+    queries: &[Vec<f32>],
+    k: usize,
+    allowed: &std::collections::HashSet<usize>,
+) -> (f64, f64, f64, f64) {
+    let snap = vecs.snapshot().unwrap();
+    let space = vecs.lookup_space_in_view(&snap, "real").unwrap().unwrap();
+    let candidate = allow_categories(allowed);
+
+    let t_exact = Instant::now();
+    let mut exact: Vec<Vec<u64>> = Vec::new();
+    for q in queries {
+        let hits = vecs
+            .search_exact_in_view(&snap, &space, q, k, Some(&candidate))
+            .unwrap();
