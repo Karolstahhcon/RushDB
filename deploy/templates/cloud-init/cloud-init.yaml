@@ -1,0 +1,9 @@
+#cloud-config
+# RushDB on a fresh Linux VM: paste this file as "user data" when you create
+# the machine (DigitalOcean Droplet, Hetzner Cloud, AWS EC2, Google Compute
+# Engine, Azure, Vultr, Linode, ...) running Ubuntu or Debian.
+#
+# It installs the `rushdb` binary, creates a `rushdb` system user and
+# /var/lib/rushdb, writes /etc/rushdb/rushdb.env with a random token, and runs
+# the server under systemd (deploy/templates/systemd/rushdb.service).
+#
