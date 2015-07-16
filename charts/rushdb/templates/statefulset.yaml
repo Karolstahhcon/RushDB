@@ -1,0 +1,81 @@
+{{- if and .Values.server.multitenant (or .Values.server.pgwirePort .Values.server.grpcPort .Values.server.boltPort) }}
+{{- fail "server.multitenant needs server.pgwirePort, grpcPort and boltPort set to 0: those listeners authenticate only the bootstrap token, so the engine refuses them on a multitenant pod" }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rushdb.fullname" . }}
+  labels:
+    {{- include "rushdb.labels" . | nindent 4 }}
+spec:
+  # One node owns one data directory; a second replica would need its own
+  # directory and replication setup, which this chart does not configure.
+  replicas: 1
+  serviceName: {{ include "rushdb.fullname" . }}-headless
+  selector:
+    matchLabels:
+      {{- include "rushdb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rushdb.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rushdb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --port
+            - {{ .Values.server.httpPort | quote }}
+            - --pgwire-port
+            - {{ .Values.server.pgwirePort | quote }}
+            - --grpc-port
+            - {{ .Values.server.grpcPort | quote }}
+            - --bolt-port
+            - {{ .Values.server.boltPort | quote }}
+            {{- with .Values.server.languages }}
+            - --languages
+            - {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.server.multitenant }}
+            - --multitenant
+            {{- end }}
+            {{- range .Values.server.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: RUSHDB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rushdb.secretName" . }}
+                  key: {{ .Values.auth.existingSecretKey }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.httpPort }}
+            {{- if .Values.server.pgwirePort }}
+            - name: pgwire
+              containerPort: {{ .Values.server.pgwirePort }}
+            {{- end }}
+            {{- if .Values.server.grpcPort }}
+            - name: grpc
+              containerPort: {{ .Values.server.grpcPort }}
+            {{- end }}
