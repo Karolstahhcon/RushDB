@@ -514,3 +514,261 @@ impl RequestScope<'_> {
                         id,
                         &item.record_id,
                         &property,
+                        expected_hash,
+                        &item.vector,
+                    )?;
+                } else {
+                    self.bind_relationship_vector_external(
+                        id,
+                        &item.record_id,
+                        &property,
+                        &item.vector,
+                    )?;
+                }
+            } else if let Some(expected_hash) = item.source_hash {
+                self.bind_field_vector_if_source_hash(
+                    id,
+                    &item.record_id,
+                    &property,
+                    expected_hash,
+                    &item.vector,
+                )?;
+            }
+            updated += 1;
+        }
+        Ok(serde_json::json!({ "updated": updated, "requested": items.len() }))
+    }
+
+    pub(crate) fn upsert_vector_index_with_execution_context(
+        &self,
+        context: &mut rushdb_engine::ExecutionContext,
+        id: &str,
+        items: &[rushdb_protocol::VectorItem],
+    ) -> Result<serde_json::Value, String> {
+        context
+            .check_deadline()
+            .map_err(|error| error.to_string())?;
+        let result = self.upsert_vector_index(id, items)?;
+        Ok(result)
+    }
+
+    /// Records of `label` carrying `property` that are **not yet bound** to the
+    /// index `index` (the canonical space alias). The control plane backfills
+    /// these: fetch a batch, embed the text, then `upsertVectors`.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn vector_index_candidates(
+        &self,
+        query: &rushdb_protocol::VectorIndexCandidatesQuery,
+    ) -> Result<(Vec<serde_json::Value>, u64), String> {
+        let snap = Arc::new(self.store.read_view().map_err(|e| e.to_string())?);
+        self.vector_index_candidates_in_view(query, &snap)
+    }
+
+    /// Enumerate vector backfill candidates against a caller-owned pinned view.
+    pub(crate) fn vector_index_candidates_with_execution_context(
+        &self,
+        context: &mut rushdb_engine::ExecutionContext,
+        query: &rushdb_protocol::VectorIndexCandidatesQuery,
+    ) -> Result<(Vec<serde_json::Value>, u64), String> {
+        context
+            .check_deadline()
+            .map_err(|error| error.to_string())?;
+        let result = self.vector_index_candidates_in_view(query, context.read_view())?;
+        context
+            .check_deadline()
+            .map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines,
+        reason = "these casts narrow engine counters and sizes that are bounded by the process address space or clamped before conversion, so truncation cannot occur on supported 64-bit targets; the owner-kind branch is one linear candidate scan"
+    )]
+    pub(super) fn vector_index_candidates_in_view(
+        &self,
+        query: &rushdb_protocol::VectorIndexCandidatesQuery,
+        snap: &Arc<rushdb_storage::ReadView>,
+    ) -> Result<(Vec<serde_json::Value>, u64), String> {
+        let tenant = self.tenant();
+
+        let (owner, generation) = match snap
+            .get(self.vector_index_key(&query.index).as_bytes())
+            .map_err(|e| e.to_string())?
+        {
+            None => return Err("vector index not found".to_string()),
+            Some(raw) => {
+                let row: serde_json::Value = serde_json::from_slice(&raw)
+                    .map_err(|error| format!("corrupt vector index metadata: {error}"))?;
+                let owner = row
+                    .get("owner")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| "corrupt vector index metadata: missing owner".to_string())?;
+                (owner, row.get("generation").cloned().unwrap_or_default())
+            }
+        };
+        let owner_kind = if owner == "relationship" {
+            OwnerKind::Relationship
+        } else {
+            OwnerKind::Record
+        };
+
+        let norm = rushdb_types::value::normalize_name(&query.property);
+        let sig = key(
+            tenant,
+            &[
+                P_FAMILY_SIG,
+                b"default",
+                &[owner_kind.as_byte()],
+                norm.as_bytes(),
+            ],
+        );
+        let pid = match snap.get(&sig).map_err(|e| e.to_string())? {
+            Some(raw) => u64::from_be_bytes(
+                raw.as_slice()
+                    .try_into()
+                    .map_err(|_| "corrupt property family signature")?,
+            ),
+            None => return Ok((Vec::new(), 0)), // property family does not exist yet
+        };
+
+        let vectors = self.vector_engine()?;
+        let space = vectors
+            .lookup_space_in_view(snap, &query.index)
+            .map_err(|e| e.to_string())?;
+
+        let active_policy = rushdb_authz::load_active_policy_in_view(snap.as_ref(), tenant)
+            .map_err(|error| error.to_string())?;
+        let authz = rushdb_lmpg::AuthorizedView::new(snap.as_ref(), tenant, active_policy.as_ref());
+        // Relationships have no property-mask concept; the ordinal set below
+        // is already policy-filtered by endpoint label and relationship
+        // type. Records share one label/property pair for this whole scan,
+        // so a single up-front check covers every candidate.
+        if owner_kind == OwnerKind::Record && !authz.property_allowed(&query.label, &query.property)
+        {
+            return Err("vector index candidates denied by policy".to_string());
+        }
+
+        let ords: Vec<u64> = if owner_kind == OwnerKind::Relationship {
+            self.relationship_ordinals_matching(snap, &query.label, &serde_json::json!({}))?
+                .into_iter()
+                .collect()
+        } else {
+            access::label_members(snap, tenant, &query.label).map_err(|e| e.to_string())?
+        };
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        let mut encoded_bytes = 0usize;
+        let mut unbound = 0u64;
+        let skip = query.skip as usize;
+        let limit = query.limit as usize;
+
+        for ord in ords {
+            let rec = if owner_kind == OwnerKind::Relationship {
+                rushdb_lmpg::reconstruct::reconstruct_relationship(snap, tenant, ord)
+                    .map_err(|e| e.to_string())?
+            } else {
+                rushdb_lmpg::reconstruct::reconstruct_record(snap, tenant, ord)
+                    .map_err(|e| e.to_string())?
+            };
+            let Some(rec) = rec else {
+                continue;
+            };
+            let obj = rec.as_object().cloned().unwrap_or_default();
+            let Some(value) = obj
+                .iter()
+                .find(|(k, _)| rushdb_types::value::normalize_name(k) == norm)
+                .map(|(_, v)| v.clone())
+            else {
+                continue; // property absent on this owner
+            };
+            if value.is_null() {
+                continue;
+            }
+            // already bound to this index space?
+            let bound = match space.as_ref() {
+                Some(sp) => vectors
+                    .binding_of_in_view(
+                        snap,
+                        sp.space_id,
+                        rushdb_vector::SourceRef {
+                            kind: owner_kind,
+                            owner_ord: ord,
+                            pid,
+                            elem: 0,
+                        },
+                    )
+                    .map_err(|e| e.to_string())?
+                    .is_some(),
+                None => false,
+            };
+            if bound {
+                continue;
+            }
+            let position = unbound as usize;
+            unbound += 1;
+            if position >= skip && out.len() < limit {
+                // What a guarded upsert sends back, so a completion computed
+                // from this value is rejected if the value changes meanwhile.
+                let source_hash = rushdb_vector::source_hash(
+                    snap.as_ref(),
+                    tenant,
+                    rushdb_vector::SourceRef {
+                        kind: owner_kind,
+                        owner_ord: ord,
+                        pid,
+                        elem: 0,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                append_bounded_json_response(
+                    &mut out,
+                    &mut encoded_bytes,
+                    serde_json::json!({
+                        "id": obj.get(rushdb_types::value::ID_FIELD).cloned().unwrap_or(serde_json::Value::Null),
+                        "value": value,
+                        "sourceHash": source_hash,
+                        "indexGeneration": generation,
+                    }),
+                    self.max_response_bytes(),
+                )?;
+            }
+        }
+        Ok((out, unbound))
+    }
+
+    /// Exact vector search. The caller supplies the query vector; the database
+    /// never invokes an embedding provider.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn search_vectors(
+        &self,
+        query: &rushdb_protocol::VectorQuery,
+    ) -> Result<serde_json::Value, String> {
+        let snap = Arc::new(self.store.read_view().map_err(|e| e.to_string())?);
+        self.search_vectors_in_view(query, &snap)
+    }
+
+    /// Execute vector search against a caller-owned pinned view and work
+    /// budget. Response-byte admission remains at the protocol boundary.
+    pub(crate) fn search_vectors_with_execution_context(
+        &self,
+        context: &mut rushdb_engine::ExecutionContext,
+        query: &rushdb_protocol::VectorQuery,
+    ) -> Result<serde_json::Value, String> {
+        context
+            .check_deadline()
+            .map_err(|error| error.to_string())?;
+        let result = self.search_vectors_in_view(query, context.read_view())?;
+        context
+            .check_deadline()
+            .map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines,

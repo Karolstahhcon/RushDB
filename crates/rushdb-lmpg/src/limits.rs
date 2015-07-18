@@ -75,29 +75,3 @@ impl QueryLimits {
     /// Whether the request's time is up.
     #[must_use]
     pub fn expired(&self) -> bool {
-        self.deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    }
-}
-
-fn tighter<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_request_only_tightens_the_server_ceilings() {
-        let server = QueryLimits::of_server(&StorageResources {
-            unindexed_walk_max_owners: 1_000,
-            query_memory_max_bytes: 0,
-            ..StorageResources::default()
-        });
-        assert_eq!(server.unindexed_walk_max_owners(), Some(1_000));
-        assert_eq!(server.query_memory_max_bytes(), None);
-
