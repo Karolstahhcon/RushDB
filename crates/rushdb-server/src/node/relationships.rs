@@ -479,3 +479,244 @@ impl RequestScope<'_> {
                         }
                     }
                 }
+            }
+        }
+        let deleted = doomed.delete(&self.lmpg())?;
+        Ok(
+            serde_json::json!({ "message": "Relations have been successfully deleted", "deleted": deleted }),
+        )
+    }
+
+    /// Query-based relationship deletion using the caller-owned execution
+    /// view for matching and relationship reads.
+    pub(crate) fn unlink_records_with_execution_context(
+        &self,
+        context: &mut rushdb_engine::ExecutionContext,
+        command: &rushdb_protocol::RelationshipMutation,
+    ) -> Result<serde_json::Value, String> {
+        context
+            .check_deadline()
+            .map_err(|error| error.to_string())?;
+        let result = self.unlink_records_in_view(command, context.read_view())?;
+        Ok(result)
+    }
+
+    /// Link records by explicit record IDs (attach semantics). Endpoints are
+    /// named directly (dashed UUID or compact hex `_id`); a missing endpoint is
+    /// an error. Idempotent per pair.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn link_records_by_id(
+        &self,
+        command: &rushdb_protocol::RelationshipIdsMutation,
+    ) -> Result<serde_json::Value, String> {
+        let snap = self.store.read_view().map_err(|e| e.to_string())?;
+        self.link_records_by_id_in_view(command, &snap)
+    }
+
+    pub(super) fn link_records_by_id_in_view(
+        &self,
+        command: &rushdb_protocol::RelationshipIdsMutation,
+        snap: &rushdb_storage::ReadView,
+    ) -> Result<serde_json::Value, String> {
+        let rel_type = command.relation_type.clone();
+        let direction = command.direction;
+        let props: Vec<(String, rushdb_lmpg::plan::FieldChange)> = command
+            .properties
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            if v.is_null() {
+                                rushdb_lmpg::plan::FieldChange::ExplicitNull
+                            } else {
+                                rushdb_lmpg::plan::FieldChange::Set(v.clone())
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut endpoints: Vec<(rushdb_lmpg::RecordRef, u64)> = Vec::new();
+        for id_hex in command.source_ids.iter().chain(command.target_ids.iter()) {
+            let id = RecordId(bytes_from_hex(id_hex)?);
+            let hdr = rushdb_lmpg::reader::try_access::record_by_id(&snap, self.tenant(), &id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("record not found: {id_hex}"))?;
+            endpoints.push((
+                rushdb_lmpg::RecordRef {
+                    record_id: hdr.record_id,
+                    ordinal: hdr.ordinal,
+                },
+                hdr.ordinal,
+            ));
+        }
+        let sources = endpoints[..command.source_ids.len()].to_vec();
+        let targets = endpoints[command.source_ids.len()..].to_vec();
+
+        // E1/E5: stage every new edge into ONE batch commit instead of one
+        // commit per edge. Endpoint resolution above already failed fast on
+        // dangling ids (nothing staged yet); the single commit below makes
+        // the write half all-or-nothing — a concurrent endpoint delete or
+        // precondition conflict fails the whole batch with nothing applied.
+        let lmpg = self.lmpg();
+        let mut batch = lmpg.begin_batch();
+        let mut staged_pairs = std::collections::HashSet::new();
+        let mut created = 0usize;
+        let mut skipped_existing = 0usize;
+        for (sref, sord) in &sources {
+            for (tref, tord) in &targets {
+                let (a_ord, a_ref, b_ord, b_ref) = if direction == rushdb_protocol::Direction::In {
+                    (*tord, *tref, *sord, *sref)
+                } else {
+                    (*sord, *sref, *tord, *tref)
+                };
+                // Existence against the same pre-write snapshot (no extra
+                // read views), plus in-batch dedup so a repeated pair in one
+                // call cannot create a duplicate edge.
+                let edge_exists =
+                    access::edge_exists(&snap, self.tenant(), a_ord, &rel_type, b_ord)
+                        .map_err(|e| e.to_string())?;
+                if edge_exists || !staged_pairs.insert((a_ord, b_ord)) {
+                    skipped_existing += 1;
+                    continue;
+                }
+                batch
+                    .ops
+                    .push(rushdb_lmpg::BatchOp::CreateRelationshipById {
+                        rel_type: rel_type.clone(),
+                        source_id: a_ref.record_id,
+                        target_id: b_ref.record_id,
+                        fields: props.clone(),
+                    });
+                created += 1;
+            }
+        }
+        if created > 0 {
+            lmpg.run_batch(batch).map_err(|e| e.to_reason())?;
+        }
+        Ok(serde_json::json!({
+            "message": "Relations created",
+            "created": created,
+            "skipped_existing": skipped_existing,
+        }))
+    }
+
+    /// Link explicit record IDs using the caller-owned execution view.
+    pub(crate) fn link_records_by_id_with_execution_context(
+        &self,
+        context: &mut rushdb_engine::ExecutionContext,
+        command: &rushdb_protocol::RelationshipIdsMutation,
+    ) -> Result<serde_json::Value, String> {
+        context
+            .check_deadline()
+            .map_err(|error| error.to_string())?;
+        let result = self.link_records_by_id_in_view(command, context.read_view())?;
+        Ok(result)
+    }
+
+    /// Pairwise batch link: one edge per explicit (source, target) pair —
+    /// no cross-product expansion. Same contract as `link_records_by_id`:
+    /// fail-fast endpoint resolution on one snapshot, then a single atomic
+    /// batch commit; existing edges (same type) are skipped and reported.
+    /// A per-pair `relation_type` overrides the batch default, so one call
+    /// can carry heterogeneous edge types.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn link_records_pairs(
+        &self,
+        command: &rushdb_protocol::RelationshipPairsMutation,
+    ) -> Result<serde_json::Value, String> {
+        let snap = self.store.read_view().map_err(|e| e.to_string())?;
+        self.link_records_pairs_in_view(command, &snap)
+    }
+
+    pub(super) fn link_records_pairs_in_view(
+        &self,
+        command: &rushdb_protocol::RelationshipPairsMutation,
+        snap: &rushdb_storage::ReadView,
+    ) -> Result<serde_json::Value, String> {
+        let direction = command.direction;
+        let props: Vec<(String, rushdb_lmpg::plan::FieldChange)> = command
+            .properties
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            if v.is_null() {
+                                rushdb_lmpg::plan::FieldChange::ExplicitNull
+                            } else {
+                                rushdb_lmpg::plan::FieldChange::Set(v.clone())
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Resolve every endpoint before staging anything: a dangling id
+        // fails the whole call with zero partials.
+        let mut resolved: Vec<(rushdb_lmpg::RecordRef, rushdb_lmpg::RecordRef, String)> =
+            Vec::with_capacity(command.pairs.len());
+        for pair in &command.pairs {
+            let sid = RecordId(bytes_from_hex(&pair.source_id)?);
+            let tid = RecordId(bytes_from_hex(&pair.target_id)?);
+            let shdr = rushdb_lmpg::reader::try_access::record_by_id(&snap, self.tenant(), &sid)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("record not found: {}", pair.source_id))?;
+            let thdr = rushdb_lmpg::reader::try_access::record_by_id(&snap, self.tenant(), &tid)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("record not found: {}", pair.target_id))?;
+            let rel_type = pair
+                .relation_type
+                .clone()
+                .unwrap_or_else(|| command.relation_type.clone());
+            if rel_type.trim().is_empty() {
+                return Err("pair relation_type must be non-empty".to_string());
+            }
+            let (a_ref, b_ref) = if direction == rushdb_protocol::Direction::In {
+                (
+                    rushdb_lmpg::RecordRef {
+                        record_id: thdr.record_id,
+                        ordinal: thdr.ordinal,
+                    },
+                    rushdb_lmpg::RecordRef {
+                        record_id: shdr.record_id,
+                        ordinal: shdr.ordinal,
+                    },
+                )
+            } else {
+                (
+                    rushdb_lmpg::RecordRef {
+                        record_id: shdr.record_id,
+                        ordinal: shdr.ordinal,
+                    },
+                    rushdb_lmpg::RecordRef {
+                        record_id: thdr.record_id,
+                        ordinal: thdr.ordinal,
+                    },
+                )
+            };
+            resolved.push((a_ref, b_ref, rel_type));
+        }
+
+        let lmpg = self.lmpg();
+        let mut batch = lmpg.begin_batch();
+        // (source ord, type, target ord): same pair+type twice in one call
+        // stages once; same pair under *different* types stages twice
+        // (distinct edges, matching the catalog model).
+        let mut staged = std::collections::HashSet::new();
+        let mut created = 0usize;
+        let mut skipped_existing = 0usize;
+        for (a_ref, b_ref, rel_type) in &resolved {
+            let edge_exists =
+                access::edge_exists(&snap, self.tenant(), a_ref.ordinal, rel_type, b_ref.ordinal)
+                    .map_err(|e| e.to_string())?;
+            if edge_exists || !staged.insert((a_ref.ordinal, rel_type.clone(), b_ref.ordinal)) {

@@ -208,3 +208,108 @@ fn deleted_record_binding_is_retired_and_no_longer_searchable() {
     let rec_a = node
         .scope()
         .create_record(
+            "BOOK",
+            &serde_json::json!({ "embedding": [1.0, 0.0, 0.0] }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap()
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    let rec_b = node
+        .scope()
+        .create_record(
+            "BOOK",
+            &serde_json::json!({ "embedding": [0.0, 1.0, 0.0] }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap()
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    node.scope()
+        .upsert_vector_index(
+            alias,
+            &[
+                VectorItem {
+                    record_id: rec_a.clone(),
+                    vector: vec![1.0, 0.0, 0.0],
+                    source_hash: None,
+                    index_generation: None,
+                },
+                VectorItem {
+                    record_id: rec_b.clone(),
+                    vector: vec![0.0, 1.0, 0.0],
+                    source_hash: None,
+                    index_generation: None,
+                },
+            ],
+        )
+        .unwrap();
+
+    let _pre_b = node
+        .scope()
+        .vector_search(alias, &[0.0, 1.0, 0.0], 1)
+        .unwrap();
+    // Delete rec_a, then revalidate: its binding must be retired (tombstone)
+    // and the index must no longer return it.
+    node.scope().delete_record(&rec_a).unwrap();
+    let res = node.scope().revalidate_vector_index(alias).unwrap();
+    assert!(res["retired"].as_u64().unwrap_or(0) >= 1, "{res:?}");
+    let _post_b = node
+        .scope()
+        .vector_search(alias, &[0.0, 1.0, 0.0], 1)
+        .unwrap();
+    assert!(res["retired"].as_u64().unwrap_or(0) >= 1, "{res:?}");
+
+    // The surviving binding still scores correctly.
+    let hits_b = node
+        .scope()
+        .vector_search(alias, &[0.0, 1.0, 0.0], 1)
+        .unwrap();
+    assert_eq!(hits_b.len(), 1);
+    // The deleted record is gone: it must not appear in any result. The
+    // survivor (rec_b) is the only binding left, so a query returns it even at
+    // score 0 — the tombstone is that rec_a is absent.
+    let hits = node
+        .scope()
+        .vector_search(alias, &[1.0, 0.0, 0.0], 2)
+        .unwrap();
+    assert!(
+        !hits.iter().any(|(id, _)| id == &rec_a),
+        "deleted record must not be searchable: {hits:?}"
+    );
+    // Reopen: the Retired binding must be durable + still skipped.
+    drop(node);
+    let reopened = disk_node(&dir);
+    let hits2 = reopened
+        .scope()
+        .vector_search(alias, &[1.0, 0.0, 0.0], 2)
+        .unwrap();
+    assert!(
+        !hits2.iter().any(|(id, _)| id == &rec_a),
+        "deleted record must not be searchable after reopen: {hits2:?}"
+    );
+    std::mem::forget(rec_a);
+    std::mem::forget(rec_b);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// V-4b: `/ready` gating uses this signal. An index with no source values is
+/// settled; an unbound source value leaves it behind; binding it warms it.
+#[test]
+fn readiness_reflects_vector_index_warmup() {
+    let node = Node::bootstrap(&mut ServerConfig::default()).unwrap();
+    let alias = "emb__BOOK__embedding__cosine__3";
+    node.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            name: Some(alias.into()),
+            label: "BOOK".into(),
+            property: "embedding".into(),
+            dimensions: 3,
+            similarity: "cosine".into(),
+            model: None,
