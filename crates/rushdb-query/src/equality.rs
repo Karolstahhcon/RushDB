@@ -17,22 +17,3 @@ pub(crate) fn any_element(value: &Json, matcher: impl Fn(&Json) -> bool) -> bool
 }
 
 pub(crate) fn is_datetime(
-    declared_type: &DeclaredType<'_>,
-    name: &str,
-) -> Result<bool, QueryError> {
-    Ok(declared_type(name)? == Some(rushdb_types::model::LogicalType::DateTime))
-}
-
-/// Equality of a stored value with a literal. A datetime is reconstructed as
-/// its epoch milliseconds, so ISO-8601 text equals it when it names the same
-/// instant.
-pub(crate) fn value_equals(actual: &Json, expected: &Json, datetime: bool) -> bool {
-    strings_equal(actual, expected)
-        || (datetime
-            && actual.as_i64().is_some_and(|ms| {
-                expected.as_str().and_then(crate::datetime::parse_iso_8601) == Some(ms)
-            }))
-}
-
-pub(crate) fn strings_equal(a: &Json, b: &Json) -> bool {
-    match (a, b) {
