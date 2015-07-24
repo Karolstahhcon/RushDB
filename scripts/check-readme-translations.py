@@ -13,10 +13,3 @@ code = re.findall(r'```[a-z]*\n.*?\n```', english, flags=re.S)
 def local_links(text):
     """Links to repository files, without the language bar (each file leaves itself out)."""
     links = re.findall(r'\]\(((?!https?:)[^)#]+)', text)
-    return sorted({link for link in links if not re.fullmatch(r'README(_[A-Z]{2})?\.md', link)})
-
-translations = sorted(root.glob('README_*.md'))
-languages = re.findall(r'\[[^\]]+\]\((README(?:_[A-Z]{2})?\.md)\)', english)
-
-failures = []
-if sorted(languages) != sorted(path.name for path in translations):
