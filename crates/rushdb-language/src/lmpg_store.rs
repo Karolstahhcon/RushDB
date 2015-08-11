@@ -192,3 +192,197 @@ impl LmpgGraphStore {
         &self,
         reconstruct: impl FnOnce(&mut ReconstructSession<'_, OverlayView>) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
+        let cache = std::mem::take(
+            &mut *self
+                .families
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut session = ReconstructSession::with_cache(self.view.as_ref(), self.tenant, cache);
+        let result = reconstruct(&mut session);
+        *self
+            .families
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session.into_cache();
+        result
+    }
+
+    pub(crate) fn check(&self) -> Result<(), StorageError> {
+        match self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    // Grafeo 0.5.42's GraphStore methods cannot return storage errors. Poison
+    // the whole statement on first failure, stop further storage work, and
+    // reject its result at every engine boundary. This adapter is private so
+    // callers cannot accidentally accept its terminal placeholder values.
+    pub(crate) fn read<T: Default>(&self, read: impl FnOnce() -> Result<T, StorageError>) -> T {
+        if self.check().is_err() {
+            return T::default();
+        }
+        match read() {
+            Ok(value) => value,
+            Err(error) => {
+                let mut failure = self
+                    .failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if failure.is_none() {
+                    *failure = Some(error);
+                }
+                self.view.cancellation().cancel();
+                T::default()
+            }
+        }
+    }
+
+    fn node(&self, id: NodeId) -> Option<Node> {
+        self.read(|| self.try_node(id))
+    }
+
+    pub(crate) fn try_node(&self, id: NodeId) -> Result<Option<Node>, StorageError> {
+        let Some(record) = self.with_session(|session| session.reconstruct_record(id.as_u64()))?
+        else {
+            return Ok(None);
+        };
+        node_of(id, &record)
+    }
+
+    /// One property of a record, decoding only that property's occurrences.
+    fn try_node_property(&self, id: NodeId, name: &str) -> Result<Option<Value>, StorageError> {
+        let selected = HashSet::from([name.to_owned()]);
+        let Some(record) = self
+            .with_session(|session| session.reconstruct_record_selected(id.as_u64(), &selected))?
+        else {
+            return Ok(None);
+        };
+        record
+            .get(name)
+            .map(|value| json_to_value_checked(value).map_err(|()| StorageError::CorruptLog))
+            .transpose()
+    }
+
+    /// The ordered indexes that answer equality on `property` for every
+    /// label holding it, or `None`. Only types whose equality the index
+    /// encodes exactly qualify (not datetimes, which Grafeo compares as
+    /// strings).
+    fn equality_indexes(&self, property: &str) -> Option<Vec<IndexDef>> {
+        if let Some(known) = self
+            .equality_indexes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(property)
+        {
+            return known.clone();
+        }
+        let found = self.read(|| {
+            let norm = rushdb_types::value::normalize_name(property);
+            if norm.is_empty() || rushdb_types::value::is_reserved_name(&norm) {
+                return Ok(None);
+            }
+            let typed =
+                rushdb_lmpg::index::record_property_types(self.view.as_ref(), self.tenant, &norm)?;
+            if typed.iter().any(|(ty, _)| *ty == LogicalType::DateTime) {
+                return Ok(None);
+            }
+            let mut labels = BTreeSet::new();
+            for (_, pid) in &typed {
+                for (label, count) in
+                    access::prop_support_label_counts(self.view.as_ref(), self.tenant, *pid)?
+                {
+                    if count > 0 {
+                        labels.insert(label);
+                    }
+                }
+            }
+            let mut defs = Vec::with_capacity(labels.len());
+            for label in labels {
+                match rushdb_lmpg::index::ready_ordered(
+                    self.view.as_ref(),
+                    self.tenant,
+                    &label,
+                    &norm,
+                )? {
+                    Some(def) => defs.push(def),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(defs))
+        });
+        self.equality_indexes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(property.to_owned(), found.clone());
+        found
+    }
+
+    /// Owners whose `property` may equal `value`, from its ordered indexes,
+    /// or `None` when they cannot answer (no index, or a value the index
+    /// does not encode). A superset: the caller checks each owner.
+    fn indexed_candidates(&self, property: &str, value: &Value) -> Option<BTreeSet<u64>> {
+        let defs = self.equality_indexes(property)?;
+        let probes = equality_probes(value)?;
+        Some(self.read(|| {
+            let mut owners = BTreeSet::new();
+            for (start, end) in &probes {
+                for def in &defs {
+                    let rows = rushdb_lmpg::index::entries(
+                        self.view.as_ref(),
+                        self.tenant,
+                        def.id,
+                        start,
+                        end,
+                    )?;
+                    owners.extend(rows.into_iter().map(|(_, owner)| owner));
+                }
+            }
+            Ok(owners)
+        }))
+    }
+
+    /// Records matching every `conditions` equality, exactly as Grafeo
+    /// compares values.
+    fn matching_nodes(&self, conditions: &[(&str, Value)]) -> Vec<NodeId> {
+        if conditions.iter().any(|(_, value)| value.is_null()) {
+            return Vec::new();
+        }
+        let candidates = conditions
+            .iter()
+            .find_map(|(property, value)| self.indexed_candidates(property, value))
+            .map_or_else(
+                || self.node_ids(),
+                |owners| owners.into_iter().map(NodeId::new).collect(),
+            );
+        candidates
+            .into_iter()
+            .filter(|id| {
+                conditions.iter().all(|(property, expected)| {
+                    self.read(|| self.try_node_property(*id, property))
+                        .is_some_and(|actual| values_equal(&actual, expected))
+                })
+            })
+            .collect()
+    }
+}
+
+/// A Grafeo node from a reconstructed record document.
+pub(crate) fn node_of(id: NodeId, record: &Json) -> Result<Option<Node>, StorageError> {
+    let object = record.as_object().ok_or(StorageError::CorruptLog)?;
+    let label = object
+        .get(rushdb_types::value::LABEL_FIELD)
+        .and_then(Json::as_str)
+        .ok_or(StorageError::CorruptLog)?;
+    let mut node = Node::with_labels(id, [label]);
+    for (key, value) in object {
+        if !rushdb_types::value::is_reserved_name(key) {
+            node.set_property(
+                key.as_str(),
+                json_to_value_checked(value).map_err(|()| StorageError::CorruptLog)?,
+            );
