@@ -98,37 +98,3 @@ fn gc_after_redb_compaction_reopen_restores_watermark_and_data() {
     for i in 2..=20 {
         lmpg.update_fields(
             rushdb_lmpg::RecordRef {
-                ordinal: rec.ordinal,
-                record_id: rec.record_id,
-            },
-            vec![("v".into(), FieldChange::Set(json!(i)))],
-        )
-        .unwrap();
-    }
-
-    let ci = store.compact().unwrap();
-    // compaction reclaims superseded MVCC history before redb page compaction
-    assert_eq!(
-        store.gc_watermark(),
-        ci,
-        "compaction advanced the gc watermark"
-    );
-
-    drop(lmpg);
-    drop(store);
-
-    // reopen: data intact, gc watermark restored from redb
-    let reopened = Arc::new(Store::open(&db).unwrap());
-    assert_eq!(reopened.gc_watermark(), ci, "redb carries the gc watermark");
-
-    let lmpg2 = Lmpg::new(reopened, TenantId::from_ordinal(91));
-    let snap = lmpg2.store.read_view().unwrap();
-    let rebuilt = rushdb_lmpg::reconstruct::reconstruct_record(&snap, lmpg2.tenant, rec.ordinal)
-        .unwrap()
-        .unwrap();
-    assert_eq!(rebuilt.get("v"), Some(&json!(20)));
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
