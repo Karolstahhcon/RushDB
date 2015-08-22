@@ -100,3 +100,54 @@ mod tests {
     fn leg<'a>(name: &'static str, weight: f64, hits: &'a [(u64, f64)]) -> Leg<'a> {
         Leg { name, weight, hits }
     }
+
+    fn order(fused: &[Fused]) -> Vec<u64> {
+        fused.iter().map(|hit| hit.owner_ord).collect()
+    }
+
+    #[test]
+    fn rrf_favours_agreement_and_is_deterministic() {
+        let vector = [(7, 0.9), (3, 0.8)];
+        let lexical = [(4, 12.0), (3, 9.0)];
+        let legs = [leg("vector", 1.0, &vector), leg("lexical", 1.0, &lexical)];
+        let fused = fuse(&legs, Fusion::Rrf, 60.0, 10);
+        assert_eq!(fused[0].owner_ord, 3, "owner 3 is in both rankings");
+        assert_eq!(fused[0].provenance, vec![("vector", 1), ("lexical", 1)]);
+        assert!((fused[0].score - 2.0 / 62.0).abs() < 1e-12);
+        // 7 and 4 tie at rank 0 of one leg: the record breaks the tie.
+        assert_eq!(order(&fused), vec![3, 4, 7]);
+        assert_eq!(fused, fuse(&legs, Fusion::Rrf, 60.0, 10));
+    }
+
+    #[test]
+    fn weights_scale_each_legs_share() {
+        let vector = [(1, 0.9), (2, 0.5)];
+        let lexical = [(2, 8.0), (1, 1.0)];
+        for method in [Fusion::Rrf, Fusion::Dbsf] {
+            let favour_text = fuse(
+                &[leg("vector", 0.2, &vector), leg("lexical", 1.0, &lexical)],
+                method,
+                60.0,
+                10,
+            );
+            assert_eq!(order(&favour_text), vec![2, 1], "{method:?}");
+            let text_off = fuse(
+                &[leg("vector", 1.0, &vector), leg("lexical", 0.0, &lexical)],
+                method,
+                60.0,
+                10,
+            );
+            assert_eq!(
+                order(&text_off),
+                vec![1, 2],
+                "{method:?}: the vector order alone"
+            );
+        }
+        let weighted = fuse(&[leg("vector", 2.0, &vector)], Fusion::Rrf, 60.0, 10);
+        assert!((weighted[0].score - 2.0 / 61.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dbsf_maps_each_leg_by_its_own_distribution() {
+        // Scores 1, 2, 3: μ = 2, σ = √(2/3); the range [μ − 3σ, μ + 3σ] maps
+        // to [0, 1], so 2 lands on 0.5 and 3, one above the mean, on
