@@ -53,3 +53,31 @@ fn validate_value(
             for value in values.values() {
                 validate_value(value, depth + 1, remaining_nodes)?;
             }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+impl StagedOp {
+    pub(crate) fn encode(op: &BatchOp, limit: usize, budget: &ByteBudget) -> Result<Self, String> {
+        let fields: &[(String, FieldChange)] = match op {
+            BatchOp::CreateRecord { fields, .. }
+            | BatchOp::UpdateFields { fields, .. }
+            | BatchOp::CreateRelationship { fields, .. }
+            | BatchOp::CreateRelationshipById { fields, .. } => fields,
+            _ => &[],
+        };
+        let mut remaining_nodes = limit;
+        for (_, change) in fields {
+            if let FieldChange::Set(value) = change {
+                validate_value(value, 0, &mut remaining_nodes)?;
+            }
+        }
+        // Count without allocating an output buffer. The owned input cannot
+        // change between these two deterministic serializations.
+        let mut count = Counter { bytes: 0, limit };
+        serde_json::to_writer(&mut count, op).map_err(|e| e.to_string())?;
+        let charge = count
+            .bytes
+            .checked_add(OP_METADATA_ALLOWANCE)
