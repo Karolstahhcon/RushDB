@@ -336,3 +336,172 @@ fn corrupt_reads_fail_every_language_instead_of_returning_partial_results() {
             assert!(
                 matches!(
                     execute(graph, language, query, None),
+                    Err(LanguageError::Storage(StorageError::CorruptLog))
+                ),
+                "{language:?}"
+            );
+        }
+        let ci = graph.store.committed_version();
+        assert!(matches!(
+            execute_mutation(
+                graph,
+                QueryLanguage::Cypher,
+                "MATCH (p:Person) SET p.name='bad'",
+                None
+            ),
+            Err(LanguageError::Storage(StorageError::CorruptLog))
+        ));
+        assert_eq!(graph.store.committed_version(), ci);
+    });
+}
+
+#[test]
+fn first_storage_failure_is_sticky_and_stops_further_reads() {
+    on_backends(|graph| {
+        fixture(graph);
+        let view = Arc::new(
+            graph
+                .store
+                .read_with_limits(
+                    None,
+                    ReadLimits {
+                        max_item_bytes: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+        let adapter = LmpgGraphStore::new(Arc::new(OverlayView::new(view)), graph.tenant, None);
+        assert!(adapter.node_ids().is_empty());
+        assert!(matches!(
+            adapter.check(),
+            Err(StorageError::ResourceExhausted(_))
+        ));
+        adapter.read::<()>(|| panic!("poisoned adapter performed more storage work"));
+        assert!(matches!(
+            adapter.check(),
+            Err(StorageError::ResourceExhausted(_))
+        ));
+        let view = Arc::new(
+            graph
+                .store
+                .read_with_limits(
+                    None,
+                    ReadLimits {
+                        max_item_bytes: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            execute_in_view(
+                &view,
+                graph.tenant,
+                QueryLanguage::Cypher,
+                "MATCH (p:Person) RETURN p",
+                None
+            ),
+            Err(LanguageError::Storage(StorageError::ResourceExhausted(_)))
+        ));
+        let view = Arc::new(graph.store.read_view().unwrap());
+        view.cancellation().cancel();
+        assert!(matches!(
+            execute_in_view(
+                &view,
+                graph.tenant,
+                QueryLanguage::Cypher,
+                "MATCH (p:Person) RETURN p",
+                None
+            ),
+            Err(LanguageError::Storage(StorageError::Cancelled))
+        ));
+    });
+}
+
+#[test]
+fn malformed_ordinal_index_fails_without_suffix_slice_panic() {
+    on_backends(|graph| {
+        fixture(graph);
+        corrupt(
+            graph,
+            rushdb_types::keys::key(graph.tenant, &[rushdb_types::keys::P_REL_BY_ORD]),
+        );
+        let view = Arc::new(OverlayView::new(Arc::new(graph.store.read_view().unwrap())));
+        assert!(matches!(
+            LmpgGraphStore::new(view, graph.tenant, None).try_edge_ids(),
+            Err(StorageError::CorruptLog)
+        ));
+    });
+}
+
+#[test]
+fn native_graph_mutation_and_pinned_queries_survive_reopen() {
+    let path = rushdb_storage::TempPath::store("grafeo-reopen");
+    let tenant = TenantId::from_ordinal(69);
+    let graph = Lmpg::new(Arc::new(Store::open(&path).unwrap()), tenant);
+    fixture(&graph);
+    execute_mutation(
+        &graph,
+        QueryLanguage::Cypher,
+        "MATCH (p:Person) WHERE p.name='before' SET p.name='updated' RETURN p",
+        None,
+    )
+    .unwrap();
+    drop(graph);
+    let graph = Lmpg::new(Arc::new(Store::open(&path).unwrap()), tenant);
+    let result = execute(
+        &graph,
+        QueryLanguage::Cypher,
+        "MATCH (p:Person)-[e:KNOWS]->(f:Person) RETURN p, e",
+        None,
+    )
+    .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0]["p"]["name"], json!("updated"));
+    assert_eq!(result.rows[0]["e"]["since"], json!(2001));
+    drop(graph);
+    rushdb_storage::remove_store(&path).unwrap();
+}
+
+#[test]
+fn planner_statistics_come_from_the_catalog_counters() {
+    on_backends(|graph| {
+        fixture(graph);
+        graph.create_record("City", None, vec![]).unwrap();
+        let view = Arc::new(OverlayView::new(Arc::new(graph.store.read_view().unwrap())));
+        let store = LmpgGraphStore::new(view, graph.tenant, None);
+        let statistics = store.statistics();
+        assert_eq!((statistics.total_nodes, statistics.total_edges), (3, 1));
+        assert_eq!(statistics.labels["Person"].node_count, 2);
+        assert_eq!(statistics.labels["City"].node_count, 1);
+        assert_eq!(statistics.edge_types["KNOWS"].edge_count, 1);
+        assert_eq!(store.node_count(), 3);
+        assert_eq!(store.edge_count(), 1);
+        assert_eq!(store.nodes_by_label_count("Person"), 2);
+        assert!((store.estimate_avg_degree("KNOWS", true) - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(store.all_edge_types(), vec!["KNOWS".to_string()]);
+    });
+}
+
+/// Equality through declared ordered indexes returns exactly what a label
+/// scan returns, across integer/float coercion, signed zeros, strings,
+/// booleans and arrays, for reads and for writes.
+#[test]
+fn indexed_equality_matches_the_label_scan() {
+    let values = [
+        json!(1),
+        json!(1.0),
+        json!(2),
+        json!("1"),
+        json!(-0.0),
+        json!(0),
+        json!(true),
+        json!([1]),
+        json!(5.5),
+        json!(0.999_999_999_999_999_9),
+    ];
+    let seeded = |indexed: bool| {
+        let graph = Lmpg::new(Arc::new(Store::new_in_memory()), TenantId::from_ordinal(70));
+        for (i, value) in values.iter().enumerate() {
+            for label in ["User", "Other"] {
