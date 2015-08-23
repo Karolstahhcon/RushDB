@@ -21,3 +21,26 @@ pub(crate) struct AdapterBudgets {
 impl AdapterBudgets {
     pub(crate) fn new(
         cache: Option<&ByteBudget>,
+        phase: Option<&ByteBudget>,
+    ) -> Result<Self, StorageError> {
+        let child = |parent: Option<&ByteBudget>, name: &'static str| {
+            parent
+                .map(|parent| parent.child(name, parent.snapshot().limit))
+                .transpose()
+                .map_err(|e| StorageError::InvalidConfiguration(e.to_string()))
+        };
+        Ok(Self {
+            vector_cache: child(cache, "vector-cache")?,
+            sql_phase: child(phase, "sql-phase")?,
+            graph_phase: child(phase, "graph-phase")?,
+        })
+    }
+}
+
+impl Store {
+    /// The vector adapter's named child of [`Store::cache_budget`].
+    #[must_use]
+    pub fn vector_cache_budget(&self) -> Option<ByteBudget> {
+        self.adapter_budgets.vector_cache.clone()
+    }
+
