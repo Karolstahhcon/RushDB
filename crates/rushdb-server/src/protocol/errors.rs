@@ -72,3 +72,151 @@ pub(crate) fn execution_failed(error: impl ToString) -> ProtocolError {
     } else if message.contains("unsupported") {
         ErrorCode::Unsupported
     } else if is_invalid_request(&message) {
+        ErrorCode::InvalidRequest
+    } else {
+        ErrorCode::ExecutionFailed
+    };
+    // A fixed payload/operation ceiling requires changing the transaction.
+    // Shared-pool and active-transaction pressure may clear after other work
+    // finishes, so retain the protocol's retryable default for those cases.
+    let fixed_staging_limit = [
+        "resource exhausted: transaction staging byte limit",
+        "resource exhausted: transaction operation limit",
+        "resource exhausted: transaction JSON depth/size limit",
+        "resource exhausted: staging size overflow",
+        "resource exhausted: staging capacity overflow",
+        // Large transactions: a commit past the configured
+        // transaction ceiling (`StorageError::ResourceExhausted`, Display
+        // = "storage resource exhausted: {0}") — the ETL/bulk-load boundary.
+        "storage resource exhausted: expanded mutation batch exceeds",
+    ]
+    .iter()
+    .any(|reason| message.starts_with(reason));
+    // SEC-5: do not forward an unclassified execution fault's raw text (paths,
+    // key bytes, invariants); log it and return a generic message. Client-actionable
+    // codes (invalid request, not found, conflict, limits, cancellation) keep theirs.
+    let client_message = if code == ErrorCode::ExecutionFailed {
+        tracing::warn!(detail = %message, "suppressing internal execution error detail");
+        "internal execution error".to_string()
+    } else {
+        message
+    };
+    let error = ProtocolError::new(code, client_message);
+    if fixed_staging_limit {
+        error.with_retryable(false)
+    } else {
+        error
+    }
+}
+
+/// Request validation the engine reports as text: a malformed `where`, a
+/// missing required field, an out-of-range option. It describes the caller's
+/// input, so the caller sees it. A stored-state fault (`corrupt …`) stays
+/// internal however it is phrased.
+fn is_invalid_request(message: &str) -> bool {
+    !message.contains("corrupt")
+        && (message.starts_with("invalid ")
+            || message.contains("invalid property name")
+            || message.contains("invalid merge key")
+            || message.contains(" requires ")
+            || message.contains(" require an explicit ")
+            || message.contains(" must be "))
+}
+
+/// Native query failures carry their class in the error type: an
+/// unevaluable predicate is the client's, a query budget or group cap is a
+/// fixed property of the query and the data.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a `map_err` adapter, which supplies the owned error value"
+)]
+pub(crate) fn query_failed(error: rushdb_query::QueryError) -> ProtocolError {
+    use rushdb_query::QueryError;
+    let message = error.to_string();
+    match error {
+        QueryError::InvalidPredicate(_) => ProtocolError::new(ErrorCode::InvalidRequest, message),
+        QueryError::Cancelled => ProtocolError::new(ErrorCode::Cancelled, message),
+        QueryError::ResourceLimit(_) => {
+            ProtocolError::new(ErrorCode::ResourceExhausted, message).with_retryable(false)
+        }
+        QueryError::UnindexedWalk(_) => {
+            ProtocolError::new(ErrorCode::InvalidRequest, message).with_retryable(false)
+        }
+        QueryError::Storage(_) | QueryError::Engine(_) => execution_failed(message),
+    }
+}
+
+/// SQL failures carry their class in the error type: statement errors are
+/// the client's, the row safety limit is a fixed property of the query.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a `map_err` adapter, which supplies the owned error value"
+)]
+pub(crate) fn sql_failed(error: rushdb_sql::SqlError) -> ProtocolError {
+    use rushdb_sql::SqlError;
+    let message = error.to_string();
+    match error {
+        SqlError::Parse(_)
+        | SqlError::InvalidIdentity(_)
+        | SqlError::TextSearch(_)
+        | SqlError::UnindexedWalk(_) => ProtocolError::new(ErrorCode::InvalidRequest, message),
+        SqlError::ReadOnly(_) => ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("{message}; send writes as mutate.statement"),
+        ),
+        SqlError::UnsupportedMutation(_) => ProtocolError::new(ErrorCode::Unsupported, message),
+        SqlError::ResourceLimit(_) | SqlError::MemoryLimit(_) => {
+            ProtocolError::new(ErrorCode::ResourceExhausted, message).with_retryable(false)
+        }
+        SqlError::Cancelled => ProtocolError::new(ErrorCode::Cancelled, message),
+        SqlError::WriteConflict(_) => ProtocolError::new(ErrorCode::WriteConflict, message),
+        SqlError::BlockingInRuntime
+        | SqlError::Storage(_)
+        | SqlError::Commit(_)
+        | SqlError::Engine(_) => execution_failed(message),
+    }
+}
+
+/// Decode a required numeric field from an engine response. Protocol response
+/// shaping must not turn a malformed or schema-shifted engine payload into a
+/// successful zero-count mutation.
+pub(crate) fn response_u64(value: &serde_json::Value, field: &str) -> Result<u64, ProtocolError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| execution_failed(format!("engine response missing valid `{field}`")))
+}
+
+pub(crate) fn response_array(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Vec<serde_json::Value>, ProtocolError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| execution_failed(format!("engine response missing array `{field}`")))
+}
+
+/// Community-language parsers distinguish syntax they do not implement from a
+/// storage or execution failure. Preserve that distinction at Protocol v1 so a
+/// client can rely on the advertised profile instead of heuristically parsing
+/// an opaque server error.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a `map_err` adapter, which supplies the owned error value"
+)]
+pub(crate) fn language_execution_failed(error: rushdb_language::LanguageError) -> ProtocolError {
+    use rushdb_language::LanguageError;
+    let message = error.to_string();
+    match error {
+        LanguageError::MutationBytesExceeded(_) | LanguageError::GraphTooLarge(_) => {
+            ProtocolError::new(ErrorCode::ResourceExhausted, message).with_retryable(false)
+        }
+        LanguageError::UnsupportedMutation(_) => {
+            ProtocolError::new(ErrorCode::Unsupported, message)
+        }
+        LanguageError::Cancelled => ProtocolError::new(ErrorCode::Cancelled, message),
+        LanguageError::WriteConflict(_) => ProtocolError::new(ErrorCode::WriteConflict, message),
+        // The community engine reports syntax errors only as text.
+        LanguageError::Query { .. } if message.contains("syntax error") => {
