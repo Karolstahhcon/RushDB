@@ -1,0 +1,4 @@
+/target/
+/.rushdb/
+/.rushdb-*
+*.redb
