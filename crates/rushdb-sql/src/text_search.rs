@@ -34,3 +34,76 @@ const DEFAULT_LIMIT: usize = 10;
 /// Register `text_search` on `context`, searching `text` at `snapshot`.
 /// Without text indexes (`None`) the function exists but every call fails,
 /// so statements still plan the same way everywhere.
+pub(crate) fn install(
+    context: &SessionContext,
+    lmpg: &Lmpg,
+    snapshot: &Arc<ReadView>,
+    text: Option<&Arc<TextIndexes>>,
+) {
+    context.register_udtf(
+        "text_search",
+        Arc::new(TextSearchFunction {
+            text: text.cloned(),
+            tenant: lmpg.tenant,
+            snapshot: Arc::clone(snapshot),
+        }),
+    );
+}
+
+/// A `text_search` call that was invalid or whose search failed.
+#[derive(Debug)]
+pub(crate) struct TextSearchError(String);
+
+impl std::fmt::Display for TextSearchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextSearchError {}
+
+fn failed<T>(message: String) -> Result<T> {
+    Err(DataFusionError::External(Box::new(TextSearchError(
+        message,
+    ))))
+}
+
+struct TextSearchFunction {
+    text: Option<Arc<TextIndexes>>,
+    tenant: TenantId,
+    snapshot: Arc<ReadView>,
+}
+
+impl std::fmt::Debug for TextSearchFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("text_search")
+    }
+}
+
+impl TableFunctionImpl for TextSearchFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        if !(2..=4).contains(&exprs.len()) {
+            return failed(
+                "text_search(index, query [, limit [, options]]) takes 2 to 4 arguments".into(),
+            );
+        }
+        let index = text_argument(&exprs[0], "index")?;
+        let query = text_argument(&exprs[1], "query")?;
+        let limit = match exprs.get(2) {
+            None => DEFAULT_LIMIT,
+            Some(expr) => limit_argument(expr)?,
+        };
+        let opts = match exprs.get(3) {
+            None => LexicalOptions::default(),
+            Some(expr) => options_argument(&text_argument(expr, "options")?)?,
+        };
+        let Some(text) = &self.text else {
+            return failed("text_search is unavailable in this context".into());
+        };
+        let found = text
+            .search(
+                self.tenant,
+                &self.snapshot,
+                TextQuery {
+                    index: &index,

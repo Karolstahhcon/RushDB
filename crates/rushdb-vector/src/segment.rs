@@ -488,3 +488,493 @@ impl FrozenSegment {
             read(entries_path_for(path))?,
         ) else {
             return Ok(None);
+        };
+        let Ok(manifest) = serde_json::from_slice::<SegmentManifest>(&manifest_bytes) else {
+            return Ok(None);
+        };
+        let Some(entries) = decode_entries(&entry_bytes) else {
+            return Ok(None);
+        };
+        if manifest.format_version != SEGMENT_FORMAT_VERSION
+            || manifest.dims != dims
+            || manifest.entries != entries.len()
+            || manifest.input_fingerprint != segment_fingerprint(&entries)
+        {
+            return Ok(None);
+        }
+        let options = usearch_options(dims, similarity);
+        let Ok(index) = usearch::Index::new(&options) else {
+            return Ok(None);
+        };
+        if index.view(&path.to_string_lossy()).is_err() || index.size() != entries.len() {
+            return Ok(None);
+        }
+        Ok(Some(FrozenSegment {
+            entries,
+            manifest,
+            index,
+            buffer: None,
+            file: Some(SegmentFile::new(path)),
+        }))
+    }
+
+    /// Raw candidate gather, bypassing dedup/rerank — exposed at
+    /// `pub(crate)` for `ann.rs`'s own recall-regression tests, which
+    /// exercise the live `usearch` graph directly rather than duplicating
+    /// an index-construction harness.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "keys are vector positions assigned by build() as `key as u64` from a usize index, so they always round-trip back"
+    )]
+    pub(crate) fn gather(&self, query: &[f32], k: usize, ef: usize) -> Vec<usize> {
+        self.index
+            .search(query, k.max(ef))
+            .map(|matches| matches.keys.into_iter().map(|key| key as usize).collect())
+            .unwrap_or_default()
+    }
+
+    /// This segment's persisted manifest. Not yet surfaced by
+    /// `ann_lifecycle_in_view` (which reports the space-level `AnnManifest`
+    /// from the KV store, not per-segment provenance) — exercised today by
+    /// this module's own tests; per-segment lifecycle reporting is a
+    /// natural follow-on.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "per-segment lifecycle reporting not yet wired")
+    )]
+    pub(crate) fn manifest(&self) -> &SegmentManifest {
+        &self.manifest
+    }
+}
+
+fn manifest_path_for(path: &Path) -> PathBuf {
+    sidecar_path(path, ".manifest.json")
+}
+
+fn entries_path_for(path: &Path) -> PathBuf {
+    sidecar_path(path, ".entries")
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Whether `name` is a published segment file (not a sidecar, not staged).
+/// Segment names are `seg-<uuid v7>`, so their order is creation order.
+pub(crate) fn is_segment_file_name(name: &str) -> bool {
+    name.starts_with("seg-") && !name.contains('.')
+}
+
+/// Every persisted segment of one space, oldest first. A segment
+/// file whose sidecars or view are invalid is derived garbage and is
+/// deleted; the caller's reconcile decodes whatever it covered.
+///
+/// # Errors
+/// Returns [`VectorError::Engine`] when the directory or a sidecar cannot
+/// be read (other than not existing).
+pub(crate) fn open_space_dir(
+    dir: &Path,
+    dims: u32,
+    similarity: Similarity,
+) -> Result<Vec<FrozenSegment>, VectorError> {
+    let listing = match std::fs::read_dir(dir) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(VectorError::Engine(format!(
+                "segment directory read {}: {e}",
+                dir.display()
+            )))
+        }
+    };
+    let mut names: Vec<String> = listing
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| is_segment_file_name(name))
+        .collect();
+    names.sort();
+    let mut segments = Vec::with_capacity(names.len());
+    for name in names {
+        let path = dir.join(&name);
+        match FrozenSegment::open(&path, dims, similarity)? {
+            Some(segment) => segments.push(segment),
+            None => {
+                for doomed in [
+                    path.clone(),
+                    manifest_path_for(&path),
+                    entries_path_for(&path),
+                ] {
+                    if let Err(error) = std::fs::remove_file(&doomed) {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!(
+                                "rushdb: cannot remove invalid vector segment {}: {error}",
+                                doomed.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(segments)
+}
+
+/// Either tier a segment can be in. Immutable once constructed; a
+/// [`SegmentSet`] swap replaces the whole `Vec`, never mutates a segment in
+/// place.
+pub(crate) enum Segment {
+    Hot(HotSegment),
+    Frozen(FrozenSegment),
+}
+
+impl Segment {
+    pub(crate) fn entries(&self) -> &[SegmentEntry] {
+        match self {
+            Segment::Hot(hot) => &hot.entries,
+            Segment::Frozen(frozen) => &frozen.entries,
+        }
+    }
+
+    pub(crate) fn measured_bytes(&self) -> usize {
+        match self {
+            Segment::Hot(hot) => hot.measured_bytes(),
+            Segment::Frozen(frozen) => frozen.measured_bytes(),
+        }
+    }
+
+    fn gather(&self, query: &[f32], k: usize, ef: usize, similarity: Similarity) -> Vec<usize> {
+        match self {
+            Segment::Hot(hot) => hot.gather(query, k, similarity),
+            Segment::Frozen(frozen) => frozen.gather(query, k, ef),
+        }
+    }
+}
+
+pub(crate) type SourceKey = (u8, u64, u64, u64);
+
+pub(crate) fn source_key(source: SourceRef) -> SourceKey {
+    (
+        source.kind.as_byte(),
+        source.owner_ord,
+        source.pid,
+        source.elem,
+    )
+}
+
+/// Size-tiered merge: segments whose entry counts share a power-of-`MERGE_FACTOR`
+/// band (above the hot freeze size) form a tier, and `MERGE_FACTOR` frozen
+/// segments of one tier merge into one of the next (Lucene's
+/// `TieredMergePolicy` in its simplest form). Segment count is therefore
+/// logarithmic in the space size, not linear in its write history.
+pub(crate) const MERGE_FACTOR: usize = 10;
+
+/// One immutable state of a [`SegmentSet`]: the segments (oldest first),
+/// their stable ids, and the live map. Swapped as a unit, so a reader always
+/// sees segments and liveness that agree.
+#[derive(Clone)]
+struct SetState {
+    segments: Arc<Vec<Arc<Segment>>>,
+    ids: Arc<Vec<u64>>,
+    /// Canonical source → `(segment id, entry index)` of its one live entry,
+    /// maintained at mutation time: a rebind moves it, a retirement
+    /// removes it, a merge re-points it. A candidate any segment gathers
+    /// counts only if the live map points at it, so newest-wins, retirement
+    /// and dead (superseded) entries are one check, with no per-query index.
+    live: im::HashMap<SourceKey, (u64, usize)>,
+    /// Live entries per segment id, kept with `live` so the merge policy
+    /// can find mostly-dead segments without a scan.
+    live_counts: im::HashMap<u64, usize>,
+}
+
+impl SetState {
+    /// Point `key` at `(id, index)`, keeping per-segment counts.
+    fn set_live(&mut self, key: SourceKey, id: u64, index: usize) {
+        if let Some((old, _)) = self.live.insert(key, (id, index)) {
+            self.dec(old);
+        }
+        *self.live_counts.entry(id).or_insert(0) += 1;
+    }
+
+    fn remove_live(&mut self, key: &SourceKey) {
+        if let Some((old, _)) = self.live.remove(key) {
+            self.dec(old);
+        }
+    }
+
+    fn dec(&mut self, id: u64) {
+        if let Some(count) = self.live_counts.get_mut(&id) {
+            *count = count.saturating_sub(1);
+        }
+    }
+}
+
+/// Ordered, immutable snapshot of a space's segments behind a lock-free
+/// `ArcSwap` lease: a reader never blocks on a concurrent freeze or merge,
+/// and a writer never blocks a concurrent read. Writers (the absorb path and
+/// the maintenance merge) [`Self::fork`] the set and publish the fork, so an
+/// in-flight reader keeps exactly the state it started with.
+pub(crate) struct SegmentSet {
+    state: ArcSwap<SetState>,
+    /// Monotonic id for segments and their on-disk files (`seg-<n>`).
+    next_segment_id: std::sync::atomic::AtomicU64,
+}
+
+impl SegmentSet {
+    pub(crate) fn new() -> Self {
+        SegmentSet {
+            state: ArcSwap::new(Arc::new(SetState {
+                segments: Arc::new(Vec::new()),
+                ids: Arc::new(Vec::new()),
+                live: im::HashMap::new(),
+                live_counts: im::HashMap::new(),
+            })),
+            next_segment_id: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// An independent copy of this set (O(1): segments are shared `Arc`s and
+    /// the live map is persistent). Mutating the fork never affects a reader
+    /// of the original.
+    pub(crate) fn fork(&self) -> Self {
+        SegmentSet {
+            state: ArcSwap::new(self.state.load_full()),
+            next_segment_id: std::sync::atomic::AtomicU64::new(self.peek_segment_id()),
+        }
+    }
+
+    /// The next segment id this set would allocate.
+    pub(crate) fn peek_segment_id(&self) -> u64 {
+        self.next_segment_id
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Read-only snapshot of this set's current segments.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
+        Arc::clone(&self.state.load().segments)
+    }
+
+    /// Append a segment; every entry becomes the live one for its source
+    /// (later entries win within the segment too).
+    pub(crate) fn push(&self, segment: Arc<Segment>) {
+        let id = self.alloc_segment_id();
+        let mut state = (**self.state.load()).clone();
+        for (index, entry) in segment.entries().iter().enumerate() {
+            state.set_live(source_key(entry.source), id, index);
+        }
+        Arc::make_mut(&mut state.segments).push(segment);
+        Arc::make_mut(&mut state.ids).push(id);
+        self.state.store(Arc::new(state));
+    }
+
+    /// Appends one freshly bound entry to the newest hot segment (creating
+    /// one if the newest segment is frozen or none exists) and makes it the
+    /// source's live entry; the previous one becomes dead. The caller
+    /// serializes writers (production holds the space's ANN-cache lock).
+    pub(crate) fn push_to_hot(&self, entry: SegmentEntry, vector: Vec<f32>) {
+        let mut state = (**self.state.load()).clone();
+        let (mut hot, id) = match state.segments.last().map(Arc::as_ref) {
+            Some(Segment::Hot(hot)) => {
+                let hot = hot.clone();
+                let id = *state.ids.last().expect("ids parallel segments");
+                Arc::make_mut(&mut state.segments).pop();
+                Arc::make_mut(&mut state.ids).pop();
+                (hot, id)
+            }
+            _ => (HotSegment::new(), self.alloc_segment_id()),
+        };
+        state.set_live(source_key(entry.source), id, hot.len());
+        hot.push(entry, vector);
+        Arc::make_mut(&mut state.segments).push(Arc::new(Segment::Hot(hot)));
+        Arc::make_mut(&mut state.ids).push(id);
+        self.state.store(Arc::new(state));
+    }
+
+    /// Entry count of the newest segment when it is hot, else `0`.
+    pub(crate) fn newest_hot_len(&self) -> usize {
+        match self.state.load().segments.last().map(Arc::as_ref) {
+            Some(Segment::Hot(hot)) => hot.len(),
+            _ => 0,
+        }
+    }
+
+    /// Next id for a segment or its on-disk file, advancing the counter.
+    pub(crate) fn alloc_segment_id(&self) -> u64 {
+        self.next_segment_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Removes `source` from every future [`Self::search`] result: it has no
+    /// live entry any more. Its physical entries stay in their segments
+    /// until a merge drops them.
+    pub(crate) fn tombstone(&self, source: SourceRef) {
+        let key = source_key(source);
+        if !self.state.load().live.contains_key(&key) {
+            return;
+        }
+        let mut state = (**self.state.load()).clone();
+        state.remove_live(&key);
+        self.state.store(Arc::new(state));
+    }
+
+    /// Segment count (hot + frozen).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.state.load().segments.len()
+    }
+
+    /// Live (searchable) source count.
+    #[cfg(test)]
+    pub(crate) fn live_len(&self) -> usize {
+        self.state.load().live.len()
+    }
+
+    /// Real resident bytes: each segment's measured footprint plus the live
+    /// map.
+    pub(crate) fn measured_bytes(&self) -> usize {
+        let state = self.state.load();
+        state
+            .segments
+            .iter()
+            .map(|segment| segment.measured_bytes())
+            .sum::<usize>()
+            + state.live.len()
+                * (std::mem::size_of::<SourceKey>() + std::mem::size_of::<(u64, usize)>())
+                * 2
+    }
+
+    /// Freeze path: if the newest segment is a hot segment with at least
+    /// `min_len` entries, build it into a frozen segment — persisted under
+    /// `path` when given, resident only otherwise — and swap it in under the
+    /// same id (its live entries stay valid). `Ok(false)` when there is
+    /// nothing to freeze.
+    ///
+    /// # Errors
+    /// Returns whatever [`FrozenSegment::build`] returns; the hot segment is
+    /// left untouched on error.
+    pub(crate) fn freeze_newest_hot(
+        &self,
+        dims: u32,
+        similarity: Similarity,
+        path: Option<&Path>,
+    ) -> Result<bool, VectorError> {
+        self.freeze_hot_at_least(1, dims, similarity, path)
+    }
+
+    /// [`Self::freeze_newest_hot`] with a minimum size.
+    ///
+    /// # Errors
+    /// See [`Self::freeze_newest_hot`].
+    pub(crate) fn freeze_hot_at_least(
+        &self,
+        min_len: usize,
+        dims: u32,
+        similarity: Similarity,
+        path: Option<&Path>,
+    ) -> Result<bool, VectorError> {
+        let current = self.state.load_full();
+        let Some(Segment::Hot(hot)) = current.segments.last().map(Arc::as_ref) else {
+            return Ok(false);
+        };
+        if hot.len() == 0 || hot.len() < min_len {
+            return Ok(false);
+        }
+        let vectors = hot.vectors.iter().map(Ok);
+        let frozen = match path {
+            Some(path) => {
+                FrozenSegment::build(hot.entries.clone(), vectors, dims, similarity, path)?
+            }
+            None => FrozenSegment::build_in_memory(hot.entries.clone(), vectors, dims, similarity)?,
+        };
+        let mut state = (*current).clone();
+        let segments = Arc::make_mut(&mut state.segments);
+        segments.pop();
+        segments.push(Arc::new(Segment::Frozen(frozen)));
+        self.state.store(Arc::new(state));
+        Ok(true)
+    }
+
+    /// The frozen segments to merge next, oldest first, or `None`:
+    /// segments that are at least half dead (rebound or retired entries) go
+    /// first, rewritten with only their live entries (Lucene's
+    /// deletes-aware merging); otherwise up to [`MERGE_FACTOR`] segments of
+    /// the lowest full size tier. A merge never builds more than
+    /// `max_entries` live entries (the build budget): a tier too
+    /// large to merge stays as it is.
+    pub(crate) fn merge_candidates(
+        &self,
+        base_size: usize,
+        max_entries: usize,
+    ) -> Option<Vec<u64>> {
+        let state = self.state.load();
+        let mut dead_heavy = Vec::new();
+        let mut tiers: std::collections::BTreeMap<u32, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for (segment, id) in state.segments.iter().zip(state.ids.iter()) {
+            if let Segment::Frozen(frozen) = segment.as_ref() {
+                let size = frozen.entries.len().max(1);
+                let live = state.live_counts.get(id).copied().unwrap_or(0);
+                if live * 2 <= size {
+                    dead_heavy.push(*id);
+                    continue;
+                }
+                let mut tier = 0u32;
+                let mut bound = base_size.max(1) * MERGE_FACTOR;
+                while live >= bound {
+                    tier += 1;
+                    bound = bound.saturating_mul(MERGE_FACTOR);
+                }
+                tiers.entry(tier).or_default().push(*id);
+            }
+        }
+        let live_of = |id: &u64| state.live_counts.get(id).copied().unwrap_or(0);
+        let mut budgeted = |ids: Vec<u64>| -> Vec<u64> {
+            let mut total = 0usize;
+            ids.into_iter()
+                .take(MERGE_FACTOR)
+                .take_while(|id| {
+                    total = total.saturating_add(live_of(id));
+                    total <= max_entries
+                })
+                .collect()
+        };
+        if !dead_heavy.is_empty() {
+            let picked = budgeted(dead_heavy);
+            return (!picked.is_empty()).then_some(picked);
+        }
+        tiers
+            .into_values()
+            .filter(|ids| ids.len() >= MERGE_FACTOR)
+            .map(&mut budgeted)
+            .find(|picked| picked.len() >= MERGE_FACTOR)
+    }
+
+    /// The live entries held by the segments `ids`, in segment order.
+    pub(crate) fn live_entries_in(&self, ids: &[u64]) -> Vec<SegmentEntry> {
+        let state = self.state.load();
+        let mut out = Vec::new();
+        for (segment, id) in state.segments.iter().zip(state.ids.iter()) {
+            if !ids.contains(id) {
+                continue;
+            }
+            for (index, entry) in segment.entries().iter().enumerate() {
+                if state.live.get(&source_key(entry.source)) == Some(&(*id, index)) {
+                    out.push(entry.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Replace the segments `ids` (all still present) by `merged` (`None`
+    /// when they hold no live entry), which
+    /// holds exactly their live entries ([`Self::live_entries_in`]) in that
+    /// order. Entries rebound or retired since are left to the live map, so
+    /// a concurrent absorb is never undone. Whoever publishes the result
+    /// supersedes the replaced segments ([`Self::supersede_absent_from`]);
+    /// a discarded result must not delete files its source still uses.
+    /// Returns `false` (and changes nothing) when a segment is gone.
+    pub(crate) fn replace_merged(&self, ids: &[u64], merged: Option<Segment>) -> bool {
+        let current = self.state.load_full();
