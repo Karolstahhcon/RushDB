@@ -299,3 +299,304 @@ pub fn prune_archive(
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some((from, to)) = name
             .strip_prefix("wal-")
+            .and_then(|rest| rest.strip_suffix(".seg"))
+            .and_then(|stem| stem.split_once('-'))
+            .and_then(|(from, to)| Some((from.parse::<u64>().ok()?, to.parse::<u64>().ok()?)))
+        else {
+            continue;
+        };
+        let meta = entry.metadata().map_err(|e| format!("stat {name}: {e}"))?;
+        let modified_ms = meta
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |at| u64::try_from(at.as_millis()).unwrap_or(u64::MAX));
+        segments.push((from, to, entry.path(), meta.len(), modified_ms));
+    }
+    segments.sort_by_key(|segment| segment.0);
+    let bases = read_bases(dir)?;
+    // Replay for the window starts after this commit.
+    let needed_after = bases
+        .iter()
+        .filter(|base| base.taken_at_ms <= window_start)
+        .map(|base| base.commit_index)
+        .max()
+        .or_else(|| {
+            bases
+                .iter()
+                .filter(|base| base.taken_at_ms > window_start)
+                .map(|base| base.commit_index)
+                .min()
+        });
+    let mut total: u64 = segments.iter().map(|segment| segment.3).sum();
+    let mut report = ArchivePrune::default();
+    for (_, to, path, bytes, modified_ms) in &segments {
+        let expired = *modified_ms < window_start && needed_after.is_none_or(|after| *to <= after);
+        let over_cap = max_bytes.is_some_and(|max| total > max);
+        if !expired && !over_cap {
+            break;
+        }
+        std::fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+        total -= bytes;
+        report.segments += 1;
+        report.bytes += bytes;
+        if !expired {
+            report.forced += 1;
+        }
+    }
+    // Bases whose replay start was pruned can no longer be restored.
+    let oldest_kept = segments.get(report.segments).map(|segment| segment.0);
+    let kept: Vec<ArchivedBase> = bases
+        .iter()
+        .copied()
+        .filter(|base| oldest_kept.is_none_or(|from| base.commit_index >= from))
+        .collect();
+    if kept.len() != bases.len() {
+        let encoded = serde_json::to_vec(&kept).map_err(|e| format!("encode bases: {e}"))?;
+        atomic_write(dir, BASES_NAME, &encoded)?;
+    }
+    Ok(report)
+}
+
+/// Take a physical base backup of `data_dir` into `out_dir`: copy every
+/// `rushdb*.redb` file and write a CRC manifest pinned at `commit_index`.
+/// Intended to run offline (`rushdb serve --backup-base`).
+///
+/// # Errors
+/// Returns a message when the data directory has no store file, or a copy/CRC
+/// write fails.
+pub fn backup_base(
+    data_dir: &Path,
+    out_dir: &Path,
+    commit_index: u64,
+) -> Result<BaseManifest, String> {
+    let layout_shards = validate_layout_inventory(data_dir)?;
+    if out_dir.exists() {
+        return Err(format!(
+            "refusing to overwrite existing backup target `{}`",
+            out_dir.display()
+        ));
+    }
+    let staging = out_dir.with_extension(format!("backup-{}", uuid::Uuid::now_v7()));
+    let base_dir = staging.join(BASE_SUBDIR);
+    std::fs::create_dir_all(&base_dir).map_err(|e| format!("create base dir: {e}"))?;
+    let mut files = Vec::new();
+    let mut found = false;
+    for entry in std::fs::read_dir(data_dir).map_err(|e| format!("read data dir: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The store file(s) plus `config.yml` (needed to bootstrap the restored
+        // directory; it holds no secrets).
+        let is_store = layout_shards.iter().any(|shard| shard == &name);
+        let is_layout = name.starts_with("rushdb") && name.ends_with(".layout.json");
+        let is_config = name == "config.yml";
+        if !is_store && !is_layout && !is_config {
+            continue;
+        }
+        found |= is_store;
+        let src = entry.path();
+        let dst = base_dir.join(&name);
+        copy_file_streaming(&src, &dst).map_err(|e| format!("copy {name}: {e}"))?;
+        let (bytes, checksum) = file_size_crc32(&dst)?;
+        files.push(BaseFile {
+            name,
+            bytes,
+            crc32: checksum,
+        });
+    }
+    if !found {
+        return Err(format!(
+            "no `rushdb*.redb` store file in `{}`",
+            data_dir.display()
+        ));
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let manifest = BaseManifest {
+        format_version: BASE_FORMAT_VERSION,
+        command_version: BASE_COMMAND_VERSION,
+        protocol_version: BASE_PROTOCOL_VERSION,
+        commit_index,
+        files,
+    };
+    let encoded =
+        serde_json::to_vec_pretty(&manifest).map_err(|e| format!("encode manifest: {e}"))?;
+    atomic_write(&staging, MANIFEST_NAME, &encoded)?;
+    if let Err(error) = std::fs::rename(&staging, out_dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("publish backup target: {error}"));
+    }
+    if let Some(parent) = out_dir.parent() {
+        sync_directory(parent, "backup publication")?;
+    }
+    Ok(manifest)
+}
+
+/// Online counterpart of [`backup_base`]: runs in-process against the live,
+/// already-open store instead of a second `Database::open`, which redb's
+/// exclusive file lock would refuse while the server is running. The store
+/// files are copied while quiescent (publication held, every shard's redb
+/// pausing its writers, readers continuing), so the copy is consistent at
+/// the commit index the manifest names; commits wait for the copy.
+///
+/// # Errors
+/// Returns a message when the checkpoint, a file copy, or the manifest write
+/// fails.
+pub fn backup_base_online(
+    store: &Store,
+    data_dir: &Path,
+    out_dir: &Path,
+) -> Result<BaseManifest, String> {
+    let layout_shards = validate_layout_inventory(data_dir)?;
+    if out_dir.exists() {
+        return Err(format!(
+            "refusing to overwrite existing backup target `{}`",
+            out_dir.display()
+        ));
+    }
+    let staging = out_dir.with_extension(format!("backup-{}", uuid::Uuid::now_v7()));
+    let base_dir = staging.join(BASE_SUBDIR);
+    std::fs::create_dir_all(&base_dir).map_err(|e| format!("create base dir: {e}"))?;
+    // The store files are copied while quiescent at a durable commit, so the
+    // copy holds exactly the commit index the manifest names.
+    let copied = store
+        .with_quiescent_files(|commit_index| {
+            copy_base_files(data_dir, &base_dir, &layout_shards).map(|files| (commit_index, files))
+        })
+        .map_err(|e| e.to_string())
+        .and_then(std::convert::identity);
+    let (commit_index, files) = match copied {
+        Ok(copied) => copied,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    let manifest = BaseManifest {
+        format_version: BASE_FORMAT_VERSION,
+        command_version: BASE_COMMAND_VERSION,
+        protocol_version: BASE_PROTOCOL_VERSION,
+        commit_index,
+        files,
+    };
+    let encoded =
+        serde_json::to_vec_pretty(&manifest).map_err(|e| format!("encode manifest: {e}"))?;
+    atomic_write(&staging, MANIFEST_NAME, &encoded)?;
+    if let Err(error) = std::fs::rename(&staging, out_dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("publish backup target: {error}"));
+    }
+    if let Some(parent) = out_dir.parent() {
+        sync_directory(parent, "backup publication")?;
+    }
+    Ok(manifest)
+}
+
+/// Copy the store file(s), layout manifests and `config.yml` of `data_dir`
+/// into `base_dir`, with their sizes and CRCs, sorted by name.
+fn copy_base_files(
+    data_dir: &Path,
+    base_dir: &Path,
+    layout_shards: &[String],
+) -> Result<Vec<BaseFile>, String> {
+    let mut files = Vec::new();
+    let mut found = false;
+    for entry in std::fs::read_dir(data_dir).map_err(|e| format!("read data dir: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_store = layout_shards.iter().any(|shard| shard == &name);
+        let is_layout = name.starts_with("rushdb") && name.ends_with(".layout.json");
+        let is_config = name == "config.yml";
+        if !is_store && !is_layout && !is_config {
+            continue;
+        }
+        found |= is_store;
+        let dst = base_dir.join(&name);
+        copy_file_streaming(&entry.path(), &dst).map_err(|e| format!("copy {name}: {e}"))?;
+        let (bytes, checksum) = file_size_crc32(&dst)?;
+        files.push(BaseFile {
+            name,
+            bytes,
+            crc32: checksum,
+        });
+    }
+    if !found {
+        return Err(format!(
+            "no `rushdb*.redb` store file in `{}`",
+            data_dir.display()
+        ));
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
+}
+
+/// Validate the persisted layout manifest and return the exact physical files
+/// that belong to the store. Backups must not infer shard membership from a
+/// filename glob: a stale or foreign shard would otherwise be silently copied.
+fn validate_layout_inventory(data_dir: &Path) -> Result<Vec<String>, String> {
+    let mut manifests = Vec::new();
+    for entry in std::fs::read_dir(data_dir).map_err(|e| format!("read data dir: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("rushdb") && name.ends_with(".layout.json") {
+            manifests.push(entry.path());
+        }
+    }
+    if manifests.len() != 1 {
+        return Err(format!(
+            "expected exactly one storage layout manifest, found {}",
+            manifests.len()
+        ));
+    }
+    if !std::fs::symlink_metadata(&manifests[0])
+        .map_err(|e| format!("stat layout manifest: {e}"))?
+        .file_type()
+        .is_file()
+    {
+        return Err("storage layout manifest must be a regular file".into());
+    }
+    let raw = std::fs::read(&manifests[0]).map_err(|e| format!("read layout manifest: {e}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| format!("corrupt storage layout manifest: {e}"))?;
+    let shard_count = manifest
+        .get("shard_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "storage layout manifest has no shard_count".to_string())?;
+    let shard_files = manifest
+        .get("shard_files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "storage layout manifest has no shard_files".to_string())?;
+    if shard_files.is_empty()
+        || shard_count == 0
+        || usize::try_from(shard_count).ok() != Some(shard_files.len())
+    {
+        return Err("storage layout manifest has no shards".into());
+    }
+    let mut listed = std::collections::BTreeSet::new();
+    for file in shard_files {
+        let name = file
+            .as_str()
+            .ok_or_else(|| "storage layout shard file is not a string".to_string())?;
+        if name.contains('/') || name.contains('\\') || name.is_empty() {
+            return Err(format!("unsafe storage shard file `{name}`"));
+        }
+        if !listed.insert(name.to_owned()) {
+            return Err(format!("duplicate storage layout shard `{name}`"));
+        }
+        let shard = data_dir.join(name);
+        let metadata = std::fs::symlink_metadata(&shard)
+            .map_err(|e| format!("stat storage shard `{name}`: {e}"))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("storage layout is missing shard `{name}`"));
+        }
+    }
+    for entry in std::fs::read_dir(data_dir).map_err(|e| format!("read data dir: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("rushdb")
+            && name.contains(".redb")
+            && !name.ends_with(".layout.json")
+            && entry
+                .file_type()
+                .map_err(|e| format!("stat data file: {e}"))?
+                .is_file()
+            && !listed.contains(&name)

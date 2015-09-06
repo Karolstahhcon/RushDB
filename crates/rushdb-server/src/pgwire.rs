@@ -432,3 +432,437 @@ impl QueryParser for SqlQueryParser {
 
 fn pg_type(data_type: &rushdb_sql::SqlType) -> Type {
     use rushdb_sql::SqlType;
+    match data_type {
+        SqlType::Boolean => Type::BOOL,
+        SqlType::Int16 | SqlType::UInt16 => Type::INT2,
+        SqlType::Int32 | SqlType::UInt32 => Type::INT4,
+        SqlType::Int64 | SqlType::UInt64 => Type::INT8,
+        SqlType::Float32 => Type::FLOAT4,
+        SqlType::Float64 => Type::FLOAT8,
+        SqlType::Utf8 => Type::TEXT,
+        SqlType::Binary => Type::BYTEA,
+        SqlType::Date => Type::DATE,
+        SqlType::Time => Type::TIME,
+        SqlType::Timestamp => Type::TIMESTAMP,
+        SqlType::Json => Type::JSONB,
+        SqlType::Unknown => Type::UNKNOWN,
+    }
+}
+
+fn prepared_fields(fields: &[(String, Type)], format: &Format) -> Vec<FieldInfo> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, (name, data_type))| {
+            FieldInfo::new(
+                name.clone(),
+                None,
+                None,
+                data_type.clone(),
+                format.format_for(index),
+            )
+        })
+        .collect()
+}
+fn err(c: &str, m: impl Into<String>) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), c.into(), m.into())))
+}
+
+/// Answer a session-settings statement: `SHOW` returns its value,
+/// `SET`/`RESET` their command tags.
+fn setting_response<C: ClientInfo>(
+    c: &mut C,
+    command: settings::Command,
+    format: &Format,
+) -> PgWireResult<Response> {
+    let tag = match command {
+        settings::Command::Set(_, Some(_)) => "SET",
+        _ => "RESET",
+    };
+    Ok(match settings::apply(c.metadata_mut(), command)? {
+        Some(rows) => {
+            let f = Arc::new(fields(&rows, format));
+            Response::Query(QueryResponse::new(f.clone(), encode(rows, f)))
+        }
+        None => Response::Execution(Tag::new(tag)),
+    })
+}
+fn scope<C: ClientInfo>(c: &C, tenant: bool) -> Option<String> {
+    tenant
+        .then(|| c.metadata().get("database").cloned())
+        .flatten()
+}
+fn perr(e: ProtocolError) -> PgWireError {
+    let c = sqlstate(e.code);
+    err(c, e.message)
+}
+
+/// Shared pgwire SQLSTATE taxonomy: the same `ErrorCode` maps to the same
+/// SQLSTATE on every adapter. Add below — do not reorder.
+fn sqlstate(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::UnsupportedVersion | ErrorCode::LanguageDisabled | ErrorCode::Unsupported => {
+            "0A000"
+        }
+        ErrorCode::ProtocolViolation => "08P01",
+        ErrorCode::InvalidRequest => "42601",
+        ErrorCode::Unauthorized => "42501",
+        ErrorCode::MissingScope | ErrorCode::ScopeMismatch => "3D000",
+        ErrorCode::NotFound => "42P01",
+        ErrorCode::Conflict => "23505",
+        ErrorCode::WriteConflict => "40001",
+        ErrorCode::Cancelled => "57014",
+        ErrorCode::ResourceExhausted => "53200",
+        ErrorCode::Unavailable => "57P03",
+        ErrorCode::ExecutionFailed => "XX000",
+    }
+}
+fn builtin(sql: &str, tenant: Option<&str>, user: &str) -> Option<Vec<Map<String, Value>>> {
+    let normalized = normalized_sql(sql);
+    let entry = match normalized.as_str() {
+        "select 1" => Some(("?column?", serde_json::json!(1))),
+        "select version()" => Some(("version", serde_json::json!("RushDB pgwire 0.40"))),
+        "show server_version" => Some(("server_version", serde_json::json!("16.0-rushdb"))),
+        "select current_database()" => Some((
+            "current_database",
+            serde_json::json!(tenant.unwrap_or("rushdb")),
+        )),
+        "select current_user" | "select current_user()" => {
+            Some(("current_user", serde_json::json!(user)))
+        }
+        _ => None,
+    };
+    entry.map(|(name, value)| {
+        let mut row = Map::new();
+        row.insert(name.into(), value);
+        vec![row]
+    })
+}
+
+fn normalized_sql(s: &str) -> String {
+    s.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn builtin_result_fields(sql: &str) -> Option<Vec<(String, Type)>> {
+    match normalized_sql(sql).as_str() {
+        "select 1" => Some(vec![("?column?".into(), Type::INT4)]),
+        "select version()" => Some(vec![("version".into(), Type::TEXT)]),
+        "show server_version" => Some(vec![("server_version".into(), Type::TEXT)]),
+        "select current_database()" => Some(vec![("current_database".into(), Type::TEXT)]),
+        "select current_user" | "select current_user()" => {
+            Some(vec![("current_user".into(), Type::TEXT)])
+        }
+        _ => None,
+    }
+}
+async fn run_async(
+    node: Arc<Node>,
+    tenant: Option<String>,
+    statement: String,
+    parameters: Option<Value>,
+    request_timeout_ms: u64,
+    session: settings::SessionLimits,
+) -> Result<PgExecution, ProtocolError> {
+    tokio::task::spawn_blocking(move || {
+        run(
+            &node,
+            tenant.as_deref(),
+            &statement,
+            "rushdb",
+            parameters,
+            request_timeout_ms,
+            session,
+        )
+    })
+    .await
+    .map_err(|error| ProtocolError::new(ErrorCode::Unavailable, error.to_string()))?
+}
+
+fn run(
+    node: &Arc<Node>,
+    tenant: Option<&str>,
+    sql: &str,
+    user: &str,
+    parameters: Option<Value>,
+    request_timeout_ms: u64,
+    session: settings::SessionLimits,
+) -> Result<PgExecution, ProtocolError> {
+    let statement = sql.trim().trim_end_matches(';');
+    // The session's `statement_timeout` may only shorten the server's.
+    let timeout_ms =
+        crate::protocol::effective_deadline_ms(session.timeout_ms, request_timeout_ms).unwrap_or(0);
+    if is_transaction_control(statement) {
+        return Err(ProtocolError::new(
+            ErrorCode::Unsupported,
+            TRANSACTIONS_UNSUPPORTED,
+        ));
+    }
+    if let Some(rows) = builtin(statement, tenant, user) {
+        return Ok(PgExecution::Rows(rows));
+    }
+    let mutation = mutation_tag(statement);
+    let envelope = RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: None,
+        context: RequestContext {
+            scope: tenant.map(str::to_string),
+            deadline_ms: (timeout_ms > 0).then_some(timeout_ms),
+            query_memory_max_bytes: session.query_memory_max_bytes,
+            unindexed_walk_max_owners: session.unindexed_walk_max_owners,
+        },
+        operation: if mutation.is_some() {
+            Operation::Mutate {
+                mutation: rushdb_protocol::Mutation::Statement {
+                    language: rushdb_protocol::StatementLanguage::Sql,
+                    statement: statement.trim().trim_end_matches(';').into(),
+                    parameters,
+                },
+            }
+        } else {
+            Operation::Query {
+                query: Query::Statement {
+                    language: rushdb_protocol::StatementLanguage::Sql,
+                    statement: statement.trim().trim_end_matches(';').into(),
+                    parameters,
+                },
+            }
+        },
+    };
+    let started = std::time::Instant::now();
+    // Deadline-derived cancellation (same as the HTTP path): a long-running
+    // pgwire query aborts with a structured Cancelled error (SQLSTATE 57014).
+    let is_cancelled = move || {
+        timeout_ms > 0
+            && u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) >= timeout_ms
+    };
+    let scope_for_job = tenant.map(str::to_string);
+    let tenant_id = node.schedule_key(tenant);
+    let node_for_job = Arc::clone(node);
+    let result = node
+        .schedule_for_tenant(tenant_id, move || {
+            let result = crate::protocol::ProtocolExecutor::new(&node_for_job, scope_for_job)
+                .execute_cancellable(envelope, &is_cancelled);
+            result
+        })
+        .map_err(crate::protocol::scheduler_error_to_protocol_error)?;
+    let seconds = started.elapsed().as_secs_f64();
+    node.observe("pgwire.execute", seconds);
+    match result?.response {
+        RushResponse::Rows { rows, .. } => {
+            node.observe_rows("pgwire.execute", rows.len() as u64);
+            Ok(PgExecution::Rows(
+                rows.into_iter()
+                    .filter_map(|row| row.as_object().cloned())
+                    .collect(),
+            ))
+        }
+        RushResponse::StatementMutation { affected, .. } => {
+            let tag = mutation.expect("statement mutation must originate from a mutation tag");
+            Ok(PgExecution::Command(if tag.ends_with("INDEX") {
+                Tag::new(tag)
+            } else {
+                Tag::new(tag).with_rows(usize::try_from(affected).unwrap_or(usize::MAX))
+            }))
+        }
+        response => Err(ProtocolError::new(
+            ErrorCode::ProtocolViolation,
+            format!("unexpected SQL response over pgwire: {response:?}"),
+        )),
+    }
+}
+
+const TRANSACTIONS_UNSUPPORTED: &str =
+    "explicit transactions are not supported over the PostgreSQL wire: \
+     every statement commits on its own; use the client's autocommit mode";
+
+/// Whether a statement opens, ends, or marks a transaction. Each pgwire
+/// statement commits on its own, so these are refused rather than ignored.
+fn is_transaction_control(sql: &str) -> bool {
+    let first = sql
+        .split(|character: char| character.is_whitespace() || character == ';')
+        .find(|word| !word.is_empty())
+        .map(str::to_ascii_uppercase);
+    matches!(
+        first.as_deref(),
+        Some("BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE")
+    )
+}
+
+/// The command tag of a SQL statement that runs as a mutation: the DML
+/// subset backed by the native atomic SQL mutation path, and index DDL
+/// (`CREATE [VECTOR] INDEX`, `DROP INDEX`). More complicated SQL remains a
+/// typed engine error; this classifier only chooses the canonical protocol
+/// operation.
+fn mutation_tag(sql: &str) -> Option<&'static str> {
+    let mut words = sql
+        .split(|character: char| character.is_whitespace() || character == ';')
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_uppercase);
+    let first = words.next()?;
+    let second = words.next();
+    match (first.as_str(), second.as_deref()) {
+        ("INSERT", _) => Some("INSERT"),
+        ("UPDATE", _) => Some("UPDATE"),
+        ("DELETE", _) => Some("DELETE"),
+        ("CREATE", Some("INDEX")) => Some("CREATE INDEX"),
+        ("CREATE", Some("VECTOR")) if words.next().as_deref() == Some("INDEX") => {
+            Some("CREATE INDEX")
+        }
+        ("DROP", Some("INDEX")) => Some("DROP INDEX"),
+        _ => None,
+    }
+}
+
+fn portal_parameters(portal: &Portal<PreparedSql>) -> PgWireResult<Option<Value>> {
+    if portal.parameter_len() == 0 {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(portal.parameter_len());
+    for index in 0..portal.parameter_len() {
+        let data_type = portal
+            .statement
+            .parameter_types
+            .get(index)
+            .and_then(Clone::clone)
+            .or_else(|| {
+                portal
+                    .statement
+                    .statement
+                    .parameter_types
+                    .get(index)
+                    .cloned()
+            })
+            .unwrap_or(Type::UNKNOWN);
+        let value = portal_parameter(portal, index, &data_type)?;
+        values.push(value);
+    }
+    Ok(Some(Value::Array(values)))
+}
+
+fn portal_parameter(
+    portal: &Portal<PreparedSql>,
+    index: usize,
+    data_type: &Type,
+) -> PgWireResult<Value> {
+    macro_rules! decode {
+        ($ty:ty) => {
+            portal
+                .parameter::<$ty>(index, data_type)
+                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+        };
+    }
+    match *data_type {
+        Type::BOOL => decode!(bool),
+        Type::INT2 => decode!(i16),
+        Type::INT4 => decode!(i32),
+        Type::INT8 => decode!(i64),
+        Type::FLOAT4 => decode!(f32),
+        Type::FLOAT8 => decode!(f64),
+        Type::JSON | Type::JSONB => decode!(Value),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => decode!(String),
+        _ if portal.parameter_format.is_text(index) => {
+            let value = portal
+                .parameters
+                .get(index)
+                .ok_or(PgWireError::ParameterIndexOutOfBound(index))?;
+            Ok(value.as_ref().map_or(Value::Null, |bytes| {
+                Value::String(String::from_utf8_lossy(bytes).into_owned())
+            }))
+        }
+        _ => Err(err(
+            "0A000",
+            format!(
+                "binary parameter type {} is not supported",
+                data_type.name()
+            ),
+        )),
+    }
+}
+fn fields(rows: &[Map<String, Value>], f: &Format) -> Vec<FieldInfo> {
+    // Rows keep the statement's column order; a column first seen in a later
+    // row follows the ones before it.
+    let mut ns = Vec::<String>::new();
+    for name in rows.iter().flat_map(Map::keys) {
+        if !ns.contains(name) {
+            ns.push(name.clone());
+        }
+    }
+    ns.into_iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let ty = rows
+                .iter()
+                .filter_map(|r| r.get(&n))
+                .find(|v| !v.is_null())
+                .map_or(Type::TEXT, |v| match v {
+                    Value::Bool(_) => Type::BOOL,
+                    Value::Number(x) if x.is_i64() || x.is_u64() => Type::INT8,
+                    Value::Number(_) => Type::FLOAT8,
+                    Value::String(_) => Type::TEXT,
+                    _ => Type::JSONB,
+                });
+            FieldInfo::new(n, None, None, ty, f.format_for(i))
+        })
+        .collect()
+}
+fn encode(
+    rows: Vec<Map<String, Value>>,
+    s: Arc<Vec<FieldInfo>>,
+) -> impl futures::Stream<Item = PgWireResult<pgwire::messages::data::DataRow>> {
+    let columns = s
+        .iter()
+        .map(|field| (field.name().to_string(), field.datatype().clone()))
+        .collect::<Vec<_>>();
+    stream::iter(rows.into_iter().map(move |r| {
+        let mut e = DataRowEncoder::new(s.clone());
+        for (name, data_type) in &columns {
+            encode_value(&mut e, r.get(name).unwrap_or(&Value::Null), data_type)?;
+        }
+        Ok(e.take_row())
+    }))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "FLOAT4 columns are PostgreSQL single precision; the JSON f64 representation is deliberately narrowed for that column type"
+)]
+fn encode_value(encoder: &mut DataRowEncoder, value: &Value, data_type: &Type) -> PgWireResult<()> {
+    if value.is_null() {
+        return encoder.encode_field(&None::<String>);
+    }
+
+    let mismatch = || {
+        err(
+            "22P02",
+            format!("cannot encode JSON value {value} as {}", data_type.name()),
+        )
+    };
+    match *data_type {
+        Type::BOOL => encoder.encode_field(&value.as_bool().ok_or_else(mismatch)?),
+        Type::INT2 => encoder.encode_field(
+            &i16::try_from(value.as_i64().ok_or_else(mismatch)?).map_err(|_| mismatch())?,
+        ),
+        Type::INT4 => encoder.encode_field(
+            &i32::try_from(value.as_i64().ok_or_else(mismatch)?).map_err(|_| mismatch())?,
+        ),
+        Type::INT8 => {
+            let integer = value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .ok_or_else(mismatch)?;
+            encoder.encode_field(&integer)
+        }
+        Type::FLOAT4 => encoder.encode_field(&(value.as_f64().ok_or_else(mismatch)? as f32)),
+        Type::FLOAT8 => encoder.encode_field(&value.as_f64().ok_or_else(mismatch)?),
+        Type::JSON | Type::JSONB => encoder.encode_field(value),
+        Type::BYTEA => {
+            let bytes = value
+                .as_array()
+                .ok_or_else(mismatch)?
+                .iter()
+                .map(|value| {
