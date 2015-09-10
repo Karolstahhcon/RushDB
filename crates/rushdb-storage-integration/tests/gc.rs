@@ -65,36 +65,3 @@ fn gc_reclaims_superseded_versions_keeps_current_state() {
         reclaimed > 0,
         "50 updates must produce reclaimable version entries"
     );
-    assert_eq!(store.gc_watermark(), watermark);
-
-    // current state unchanged after GC
-    let snap = lmpg.store.read_view().unwrap();
-    let rebuilt = rushdb_lmpg::reconstruct::reconstruct_record(&snap, lmpg.tenant, rec.ordinal)
-        .unwrap()
-        .unwrap();
-    assert_eq!(rebuilt.get("v"), Some(&json!(50)));
-
-    // reads at/after the watermark remain correct
-    let live = store.read_view().unwrap().get(&key).unwrap();
-    assert_eq!(live, store.try_get(&key).unwrap());
-
-    // a second GC with no new versions reclaims nothing new
-    let again = store.gc(watermark + 1).unwrap();
-    assert_eq!(again, 0, "nothing superseded between watermark and ci+1");
-}
-
-#[test]
-fn gc_after_redb_compaction_reopen_restores_watermark_and_data() {
-    let dir = rushdb_storage::TempPath::dir("gc-reopen");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let db = dir.join("rushdb.redb");
-    let store = Arc::new(Store::open(&db).unwrap());
-    let lmpg = Lmpg::new(store.clone(), TenantId::from_ordinal(91));
-    let rec = lmpg
-        .create_record("Doc", None, vec![("v".into(), FieldChange::Set(json!(1)))])
-        .unwrap();
-    for i in 2..=20 {
-        lmpg.update_fields(
-            rushdb_lmpg::RecordRef {
