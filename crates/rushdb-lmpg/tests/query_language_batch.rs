@@ -50,3 +50,21 @@ fn relationship_can_reference_records_created_in_the_same_atomic_batch() {
     )
     .unwrap();
     let relationship = relationship.unwrap();
+    assert_eq!(relationship.source_id, source_id);
+    assert_eq!(relationship.target_id, target_id);
+}
+
+#[test]
+fn derived_batch_rejects_a_stale_snapshot_version() {
+    let store = Arc::new(Store::new_in_memory());
+    let graph = Lmpg::new(store, TenantId::from_ordinal(9));
+    let snapshot_version = graph.store.committed_version();
+
+    graph
+        .create_record(
+            "Person",
+            None,
+            vec![("name".into(), FieldChange::Set(json!("concurrent")))],
+        )
+        .unwrap();
+

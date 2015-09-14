@@ -13,3 +13,19 @@ use crate::{
     check_walk_budget, index_candidates_with_budget, working_set_budget, Expr, QueryError,
     QuerySnapshot, SearchRequest,
 };
+
+/// The index plan's candidate ordinals, ascending. A superset of the
+/// records matching the conditions it was planned for, or exactly them.
+pub struct PlannedCandidates {
+    ords: roaring::treemap::IntoIter,
+    exact: bool,
+}
+
+impl PlannedCandidates {
+    /// Every candidate is a live record matching every condition: none
+    /// needs checking.
+    #[must_use]
+    pub fn exact(&self) -> bool {
+        self.exact
+    }
+}
