@@ -159,3 +159,165 @@ impl Node {
         Ok((records, relationships, manifest.tenant_count as usize))
     }
 
+    /// P17: export a consistent snapshot AT an explicit commit index (offline
+    /// point-in-time backup). Reads the retained view for that CI, so a backup
+    /// captures exactly the state as of that commit. Manifest
+    /// `from_lsn == to_lsn == the requested CI`. A CI older than the history
+    /// floor or newer than the committed version is rejected by the read path.
+    ///
+    /// **Internal, not a client contract:** this is not exposed through
+    /// the protocol or CLI; arbitrary "as of commit N" reads are not a product
+    /// feature. PITR remains an offline WAL operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    #[doc(hidden)]
+    pub fn export_snapshot_at<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        commit_index: u64,
+        scopes: &[String],
+    ) -> Result<u64, String> {
+        let snap = self
+            .store
+            .read_at(commit_index)
+            .map_err(|e| e.to_string())?;
+
+        let tenants = self.export_tenants(&snap, scopes)?;
+
+        let mut chunks: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(tenants.len());
+        for (tenant, scope) in tenants {
+            let (jsonl, _records, _relationships) =
+                rushdb_backup::export_tenant_jsonl(&snap, tenant)
+                    .map_err(|e| format!("export tenant {tenant:?}: {e}"))?;
+            chunks.push((scope.0.to_vec(), jsonl.into_bytes()));
+        }
+        rushdb_storage::wal::write_snapshot(writer, 0, commit_index, commit_index, &chunks)
+            .map_err(|e| format!("write snapshot stream: {e}"))?;
+        Ok(commit_index)
+    }
+
+    /// Export the committed logical WAL as a checksummed segment stream
+    /// (manifest + framed records) for the given LSN range. Foundation for
+    /// PITR / CDC / incremental backups.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn export_wal_segments<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        from_lsn: u64,
+        to_lsn: u64,
+    ) -> Result<u64, String> {
+        self.store
+            .export_wal_segments(writer, from_lsn, to_lsn)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Export an incremental snapshot: the WAL delta `(base_ci, to_ci]` as a
+    /// checksummed segment stream (V2 PITR). Combine with a base at `base_ci`
+    /// (a physical checkpoint or an equivalent store) to reconstruct `to_ci`.
+    /// # Errors
+    ///
+    /// Returns an error message when `base_ci > to_ci` or `to_ci` is newer than
+    /// the committed version, or the export fails.
+    pub fn export_incremental_snapshot<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        base_ci: u64,
+        to_ci: u64,
+    ) -> Result<u64, String> {
+        let committed = self.store.committed_version();
+        if base_ci > to_ci {
+            return Err(format!("base commit {base_ci} exceeds target {to_ci}"));
+        }
+        if to_ci > committed {
+            return Err(format!(
+                "target commit {to_ci} exceeds committed version {committed}"
+            ));
+        }
+        self.store
+            .export_wal_segments(writer, base_ci.saturating_add(1), to_ci)
+            .map_err(|e| e.to_string())?;
+        Ok(to_ci)
+    }
+
+    /// Restore an incremental snapshot onto this node: replay the WAL delta
+    /// produced by [`Self::export_incremental_snapshot`] over the base state.
+    /// Returns the final commit index.
+    /// # Errors
+    ///
+    /// Returns an error message when the segment is corrupt or a batch cannot
+    /// be applied.
+    pub fn restore_incremental_snapshot<R: std::io::Read>(
+        &self,
+        reader: &mut R,
+    ) -> Result<u64, String> {
+        self.store
+            .replay_wal_segments(reader)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Archive the committed WAL range since the last archived LSN into `dir`
+    /// (durability A1). Returns the new watermark, or `None` when nothing is
+    /// new.
+    /// # Errors
+    ///
+    /// Returns a message when the export or the durable write fails.
+    pub fn archive_wal(&self, dir: &std::path::Path) -> Result<Option<u64>, String> {
+        crate::archive::archive_once(&self.store, dir)
+    }
+
+    /// Force a durability checkpoint: fsync the materialization and durably
+    /// record the committed LSN. Under log-first this must run before an
+    /// offline physical base backup (`--backup-base`) copies the store file.
+    ///
+    /// # Errors
+    /// Returns a message when the checkpoint fails.
+    pub fn checkpoint(&self) -> Result<(), String> {
+        self.store.checkpoint().map_err(|e| e.to_string())
+    }
+
+    /// Offline physical base backup into `out_dir`: the caller owns the
+    /// store exclusively (no server running). Opening the store replays the
+    /// WAL into the store file, so the copy holds every commit even after an
+    /// unclean stop.
+    ///
+    /// # Errors
+    /// Returns a message when the node has no data directory, or the copy or
+    /// retention bookkeeping fails.
+    pub fn backup_base_offline(
+        &self,
+        out_dir: &std::path::Path,
+    ) -> Result<crate::archive::BaseManifest, String> {
+        let Some(data_dir) = self.data_dir.clone() else {
+            return Err("base backup requires a data directory".into());
+        };
+        let ci = self.committed_version();
+        let manifest = crate::archive::backup_base(&data_dir, out_dir, ci)?;
+        // The base artifact is fully published before acknowledging its
+        // coverage. Persisting this marker earlier would create a new commit
+        // and could make the copied store no longer match the advertised
+        // commit index.
+        self.acknowledge_retention_consumer("backup", manifest.commit_index)
+            .map_err(|error| error.to_string())?;
+        if let Some(dir) = &self.wal_archive_dir {
+            crate::archive::register_base(dir, manifest.commit_index, crate::retention::unix_ms())?;
+        }
+        Ok(manifest)
+    }
+
+    /// Online physical base backup: the running-server counterpart of the
+    /// offline `--backup-base` CLI flag (`POST /internal/backup/base`). The
+    /// store files are copied while quiescent at a durable commit (readers
+    /// continue, commits wait for the copy), then a `"backup"` retention
+    /// consumer is registered at that commit. Combine with
+    /// `--wal-archive-dir` for a point-in-time-restorable backup window.
+    ///
+    /// # Errors
+    /// Returns a message when there is no data directory (memory store),
+    /// the checkpoint fails, or the copy/manifest write fails.
+    pub fn backup_base_online(
+        &self,
+        out_dir: &std::path::Path,
