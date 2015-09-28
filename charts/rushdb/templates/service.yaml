@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rushdb.fullname" . }}
+  labels:
+    {{- include "rushdb.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "rushdb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.server.httpPort }}
+      targetPort: http
+    {{- if .Values.server.pgwirePort }}
+    - name: pgwire
+      port: {{ .Values.server.pgwirePort }}
+      targetPort: pgwire
+    {{- end }}
+    {{- if .Values.server.grpcPort }}
