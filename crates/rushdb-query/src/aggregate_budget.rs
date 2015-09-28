@@ -42,3 +42,48 @@ pub(super) fn bucket_bytes(bucket: &GroupBucket) -> usize {
         &bucket.keys,
         &bucket.sums,
         &bucket.counts,
+        &bucket.mins,
+        &bucket.maxs,
+    ]
+    .into_iter()
+    .fold(std::mem::size_of::<GroupBucket>(), |sum, map| {
+        sum.saturating_add(object_bytes(map))
+    })
+    .saturating_add(
+        bucket
+            .derived_outputs
+            .iter()
+            .fold(0usize, |sum, (key, value)| {
+                sum.saturating_add(96)
+                    .saturating_add(key.len())
+                    .saturating_add(value_bytes(value))
+            }),
+    )
+}
+
+/// Charge reads before JSON decoding. The factor includes decoded scalar,
+/// occurrence, family-cache and tree-node overhead. Each record gets its own
+/// allowance, released when its reconstruction session is dropped.
+pub(super) struct RecordReader {
+    view: QuerySnapshot,
+    remaining: Cell<Option<usize>>,
+}
+
+impl RecordReader {
+    pub(super) fn new(view: &QuerySnapshot, limit: Option<usize>) -> Self {
+        Self {
+            view: Arc::clone(view),
+            remaining: Cell::new(limit),
+        }
+    }
+
+    fn view(&self) -> QuerySnapshot {
+        self.remaining.get().map_or_else(
+            || Arc::clone(&self.view),
+            |bytes| self.view.with_materialization_limit(bytes / 16),
+        )
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), StorageError> {
+        if let Some(remaining) = self.remaining.get() {
+            let charge = bytes.saturating_mul(16).saturating_add(128);
