@@ -49,3 +49,20 @@ fn default_deny_narrows_and_masks() {
     let scope = SecurityScope::compile(&policy, AuthorizationMode::PolicyEnforced);
 
     let page = rushdb_authz::find_records_authorized(&lmpg, &SearchRequest::default(), &scope)
+        .expect("boundary-only default request must pass");
+
+    // Secret label row masked to empty and dropped; salary field masked out.
+    assert_eq!(page.total_matched, 1);
+    let rec = &page.records[0];
+    assert_eq!(rec.get("name"), Some(&json!("ok")));
+    assert!(rec.get("salary").is_none(), "masked properties vanish");
+}
+
+#[test]
+fn mutations_rejected_outside_domain() {
+    let policy = policy_default_deny();
+    let scope = SecurityScope::compile(&policy, AuthorizationMode::PolicyEnforced);
+
+    assert!(
+        authorize_mutation(&scope, "Public").is_ok(),
+        "granted labels pass"

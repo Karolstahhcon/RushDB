@@ -22,3 +22,15 @@ spec:
       targetPort: pgwire
     {{- end }}
     {{- if .Values.server.grpcPort }}
+    - name: grpc
+      port: {{ .Values.server.grpcPort }}
+      targetPort: grpc
+    {{- end }}
+    {{- if .Values.server.boltPort }}
+    - name: bolt
+      port: {{ .Values.server.boltPort }}
+      targetPort: bolt
+    {{- end }}
+---
+# Stable network identity for the StatefulSet's pod.
+apiVersion: v1
