@@ -265,3 +265,137 @@ impl ProtocolExecutor<'_> {
             }
             Mutation::PutRecord {
                 mode,
+                id,
+                label,
+                properties,
+                vectors,
+                options,
+            } => {
+                rushdb_lmpg::import::ImportOptions::validate_json(&options)
+                    .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error))?;
+                scalar_properties(&properties)?;
+                // A supplied id is part of the request contract: a
+                // malformed one is the caller's error, not an engine fault.
+                if let Some(id) = id.as_deref() {
+                    let compact: String = id.chars().filter(|c| *c != '-').collect();
+                    if compact.len() != 32 || rushdb_query::hex_decode_16(&compact).is_none() {
+                        return Err(ProtocolError::new(
+                            ErrorCode::InvalidRequest,
+                            format!("invalid record id `{id}`: expected a UUID or 32 hex digits"),
+                        ));
+                    }
+                }
+                let record = match mode {
+                    // An upsert without a label only updates; the
+                    // engine never invents a label.
+                    PutMode::Create if label.is_none() && upsert_requested(&options) => {
+                        use crate::node::UnlabeledUpsert;
+                        match self
+                            .node
+                            .upsert_unlabeled_with_execution_context(
+                                execution_context,
+                                &properties,
+                                &vectors,
+                                &options,
+                            )
+                            .map_err(execution_failed)?
+                        {
+                            UnlabeledUpsert::Updated(record) => Ok(record),
+                            UnlabeledUpsert::NoMatch => Err(ProtocolError::new(
+                                ErrorCode::InvalidRequest,
+                                "no record matches the mergeBy keys and no label is given; \
+                                 an upsert without a label only updates",
+                            )),
+                            UnlabeledUpsert::Ambiguous(labels) => Err(ProtocolError::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "the mergeBy keys match records labelled {}; give a label",
+                                    labels.join(", ")
+                                ),
+                            )),
+                        }
+                    }
+                    PutMode::Create
+                        if id.as_deref().is_some_and(|id| {
+                            self.node
+                                .record_exists(execution_context, id)
+                                .unwrap_or(false)
+                        }) =>
+                    {
+                        Err(ProtocolError::new(
+                            ErrorCode::Conflict,
+                            format!(
+                                "record {} already exists",
+                                id.as_deref().unwrap_or_default()
+                            ),
+                        ))
+                    }
+                    PutMode::Create => self
+                        .node
+                        .create_record_with_execution_context(
+                            execution_context,
+                            id.as_deref(),
+                            label.as_deref().ok_or_else(|| {
+                                ProtocolError::new(
+                                    ErrorCode::InvalidRequest,
+                                    "create requires label",
+                                )
+                            })?,
+                            &properties,
+                            &vectors,
+                            &options,
+                        )
+                        .map_err(execution_failed),
+                    PutMode::Merge => {
+                        let id = id.as_deref().ok_or_else(|| {
+                            ProtocolError::new(ErrorCode::InvalidRequest, "merge requires id")
+                        })?;
+                        if label.is_none()
+                            && !self
+                                .node
+                                .record_exists(execution_context, id)
+                                .map_err(execution_failed)?
+                        {
+                            return Err(ProtocolError::new(
+                                ErrorCode::InvalidRequest,
+                                "no record has this id and no label is given; \
+                                 merge creates a missing record only when `label` is given",
+                            ));
+                        }
+                        self.node
+                            .merge_record_with_execution_context(
+                                execution_context,
+                                id,
+                                label.as_deref(),
+                                &properties,
+                                &vectors,
+                            )
+                            .map_err(execution_failed)
+                    }
+                    PutMode::Replace => self
+                        .node
+                        .replace_record_with_execution_context(
+                            execution_context,
+                            id.as_deref().ok_or_else(|| {
+                                ProtocolError::new(ErrorCode::InvalidRequest, "replace requires id")
+                            })?,
+                            &properties,
+                            &vectors,
+                        )
+                        .map_err(execution_failed),
+                }?;
+                Ok(Response::Record { record })
+            }
+            Mutation::DeleteRecord { id } => {
+                self.node
+                    .delete_record_with_execution_context(execution_context, &id)
+                    .map_err(execution_failed)?;
+                Ok(Response::Mutation { affected: 1 })
+            }
+            Mutation::RetypeRecord {
+                id,
+                from_label,
+                to_label,
+            } => {
+                let record = self
+                    .node
