@@ -369,3 +369,188 @@ pub(crate) fn mark_structural_pending(
             let held = labels.contains(&def.label) || current.as_deref() == Some(&def.label);
             if held && def.state.covers(*owner) {
                 txn.put(k::index_pending_key(t, def.id, *owner), ci.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Read API
+// ---------------------------------------------------------------------------
+
+/// Every index of a tenant, in id order.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a definition is corrupt.
+pub fn definitions<R: TryRead + ?Sized>(r: &R, t: TenantId) -> Result<Vec<IndexDef>, StorageError> {
+    r.range_prefix(&k::index_def_prefix(t))?
+        .iter()
+        .map(|(_, raw)| decode_def(raw))
+        .collect()
+}
+
+/// The index called `name`, if any.
+///
+/// # Errors
+/// Returns [`StorageError`] if a read fails or a row is corrupt.
+pub fn by_name<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    name: &str,
+) -> Result<Option<IndexDef>, StorageError> {
+    let Some(raw) = r.get(&k::index_name_key(t, name))? else {
+        return Ok(None);
+    };
+    let id = <[u8; 4]>::try_from(raw.as_slice())
+        .map(u32::from_be_bytes)
+        .map_err(|_| StorageError::CorruptLog)?;
+    r.get(&k::index_def_key(t, id))?
+        .map(|raw| decode_def(&raw))
+        .transpose()
+}
+
+/// The `Ready` ordered index on `(label, property)` (normalized), if any.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a definition is corrupt.
+pub fn ready_ordered<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    label: &str,
+    property: &str,
+) -> Result<Option<IndexDef>, StorageError> {
+    Ok(definitions(r, t)?.into_iter().find(|def| {
+        def.kind == IndexKind::Ordered
+            && def.state == IndexState::Ready
+            && def.label == label
+            && def.property == property
+    }))
+}
+
+/// `(entry, owner)` rows of index `id` with `start <= entry < end` (entry is
+/// `tag ‖ order-preserving payload`; an empty `end` is unbounded).
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a key is malformed.
+pub fn entries<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    id: u32,
+    start: &[u8],
+    end: &[u8],
+) -> Result<Vec<(Vec<u8>, u64)>, StorageError> {
+    let mut rows = Vec::new();
+    for_each_entry(r, t, id, start, end, &mut |entry, owner| {
+        rows.push((entry.to_vec(), owner));
+        true
+    })?;
+    Ok(rows)
+}
+
+/// Streams the `(entry, owner)` rows of index `id` with
+/// `start <= entry < end` to `visit` in entry order (owners ascending within
+/// one entry) until it returns `false`, without collecting them.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a key is malformed.
+pub fn for_each_entry<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    id: u32,
+    start: &[u8],
+    end: &[u8],
+    visit: &mut dyn FnMut(&[u8], u64) -> bool,
+) -> Result<(), StorageError> {
+    let prefix = k::index_entry_prefix(t, id);
+    let mut lo = prefix.clone();
+    lo.extend_from_slice(start);
+    let hi = if end.is_empty() {
+        rushdb_storage::prefix_range(&prefix).1
+    } else {
+        let mut hi = prefix.clone();
+        hi.extend_from_slice(end);
+        hi
+    };
+    let mut corrupt = false;
+    r.for_each_key(&lo, &hi, &mut |key| {
+        if let Some((entry, owner)) = k::parse_index_entry_key(key, &prefix) {
+            visit(entry, owner)
+        } else {
+            corrupt = true;
+            false
+        }
+    })?;
+    if corrupt {
+        return Err(StorageError::CorruptLog);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Apply-time maintenance
+// ---------------------------------------------------------------------------
+
+/// What one commit touched that can change index entries.
+#[derive(Default)]
+pub(crate) struct IndexWork {
+    /// `(tenant, record ordinal, pid)` whose occurrences changed.
+    pub(crate) occurrences: BTreeSet<(TenantId, u64, u64)>,
+    /// `(tenant, record ordinal)` whose header (label) changed.
+    pub(crate) headers: BTreeSet<(TenantId, u64)>,
+    /// `(tenant, index id)` whose definition changed.
+    pub(crate) definitions: BTreeSet<(TenantId, u32)>,
+}
+
+impl IndexWork {
+    fn tenants(&self) -> BTreeSet<TenantId> {
+        self.occurrences
+            .iter()
+            .map(|(t, _, _)| *t)
+            .chain(self.headers.iter().map(|(t, _)| *t))
+            .chain(self.definitions.iter().map(|(t, _)| *t))
+            .collect()
+    }
+}
+
+/// Typed definition ids of property `norm` (record scope), read from `r`.
+fn property_pids(
+    r: &dyn DeriveRead,
+    t: TenantId,
+    norm: &str,
+) -> Result<BTreeSet<u64>, StorageError> {
+    Ok(typed_pids(&|key| r.get(key), t, norm)?
+        .into_iter()
+        .map(|(_, pid)| pid)
+        .collect())
+}
+
+/// `(type, pid)` of every typed definition of record property `name`.
+///
+/// # Errors
+/// Returns [`StorageError`] if a read fails or a row is corrupt.
+pub fn record_property_types<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    name: &str,
+) -> Result<Vec<(LogicalType, u64)>, StorageError> {
+    typed_pids(
+        &|key| r.get(key),
+        t,
+        &rushdb_types::value::normalize_name(name),
+    )
+}
+
+type Get<'a> = dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, StorageError> + 'a;
+
+fn typed_pids(
+    get: &Get<'_>,
+    t: TenantId,
+    norm: &str,
+) -> Result<Vec<(LogicalType, u64)>, StorageError> {
+    let Some(raw) = get(&keys_ext::family_sig_key(
+        t,
+        crate::plan::DEFAULT_NAMESPACE,
+        OwnerKind::Record,
+        norm,
+    ))?
