@@ -184,3 +184,189 @@ impl ProtocolExecutor<'_> {
                 .labels_in_view(execution_context.read_view())
                 .map_err(execution_failed)?;
         }
+        query.labels.retain(|label| access.label(label));
+        Ok((!query.labels.is_empty()).then_some(query))
+    }
+
+    /// Drops what `access` hides from a catalog response: labels outside
+    /// its allow-list, masked properties, denied relationship types,
+    /// relationship shapes touching a hidden label, and, under a small-count
+    /// threshold, groups over fewer records and the samples and extremes
+    /// that are often one record's value.
+    fn mask_catalog(
+        response: Response,
+        access: &rushdb_lmpg::CatalogAccess,
+        label_counts: &std::collections::BTreeMap<String, u64>,
+    ) -> Response {
+        let label_visible =
+            |label: &str| access.label_listed(label, label_counts.get(label).copied().unwrap_or(0));
+        let property_visible = |property: &rushdb_protocol::PropertyDescription| {
+            property.label.as_deref().is_some_and(|label| {
+                access.column_listed(label, &property.name, property.records_count)
+            })
+        };
+        let shape_visible = |shape: &rushdb_protocol::RelationshipDescription| {
+            access.shape_listed(
+                &shape.relationship_type,
+                &shape.source_label,
+                &shape.target_label,
+                shape.count,
+            )
+        };
+        let withhold_extremes = |properties: &mut Vec<rushdb_protocol::PropertyDescription>| {
+            if !access.shows_extremes() {
+                for property in properties {
+                    property.sample_values.clear();
+                    property.min = None;
+                    property.max = None;
+                }
+            }
+        };
+        match response {
+            Response::Schema { mut schema } => {
+                schema.labels.retain(|label| label_visible(&label.name));
+                schema.properties.retain(property_visible);
+                withhold_extremes(&mut schema.properties);
+                schema.relationships.retain(shape_visible);
+                Response::Schema { schema }
+            }
+            Response::Labels { mut labels } => {
+                labels.retain(|label| label_visible(label));
+                Response::Labels { labels }
+            }
+            Response::Properties { mut properties } => {
+                properties.retain(property_visible);
+                withhold_extremes(&mut properties);
+                Response::Properties { properties }
+            }
+            other => other,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single linear operation/reader; splitting it would scatter shared borrows and hurt auditability"
+    )]
+    fn describe_visible(
+        &self,
+        describe: Describe,
+        access: &rushdb_lmpg::CatalogAccess,
+        is_cancelled: &dyn Fn() -> bool,
+        execution_context: &mut rushdb_engine::ExecutionContext,
+    ) -> Result<Response, ProtocolError> {
+        match describe {
+            Describe::Schema {
+                query,
+                detail,
+                skip,
+                limit,
+            } => {
+                let mut property_document = query_document_to_parser_input(&query);
+                if detail.is_some_and(|d| d == rushdb_protocol::PropertyDetail::Catalog) {
+                    // As `describe.properties` answers: a request error, not
+                    // an internal one from the catalog read below.
+                    if query
+                        .predicate
+                        .as_object()
+                        .is_some_and(|predicate| !predicate.is_empty())
+                    {
+                        return Err(ProtocolError::new(
+                            ErrorCode::InvalidRequest,
+                            "catalog detail does not support a predicate; use full detail or a label filter",
+                        ));
+                    }
+                    property_document["detail"] = serde_json::Value::String("catalog".into());
+                }
+                if let Some(skip) = skip {
+                    property_document["entry_skip"] = serde_json::Value::from(skip);
+                }
+                if let Some(limit) = limit {
+                    property_document["entry_limit"] = serde_json::Value::from(limit);
+                }
+                let unscoped = query.labels.is_empty()
+                    && query
+                        .predicate
+                        .as_object()
+                        .is_some_and(serde_json::Map::is_empty);
+                // One match set feeds both the label and property facets.
+                let matched = self.facet_matches(&query, is_cancelled, execution_context)?;
+                let labels: Vec<LabelDescription> = if unscoped {
+                    self.node
+                        .label_counts_in_view(execution_context.read_view())
+                        .map_err(execution_failed)?
+                        .into_iter()
+                        .map(|(name, records_count)| LabelDescription {
+                            name,
+                            records_count,
+                        })
+                        .collect()
+                } else {
+                    self.facet_label_counts(
+                        &query,
+                        matched.as_deref(),
+                        is_cancelled,
+                        execution_context,
+                    )?
+                    .into_iter()
+                    .map(|(name, records_count)| LabelDescription {
+                        name,
+                        records_count,
+                    })
+                    .collect()
+                };
+                let properties = self
+                    .node
+                    .describe_properties_in_view(
+                        execution_context.read_view(),
+                        &property_document,
+                        matched.as_deref(),
+                        is_cancelled,
+                    )
+                    .map_err(execution_failed)?;
+                // Relationships narrow like every other facet: over the match
+                // set when filtered; from the catalog otherwise, keeping the
+                // shapes that touch a requested label (each edge is in
+                // exactly one shape, so the counts stay exact).
+                let relationships = match matched.as_deref() {
+                    Some(ords) => self.node.facet_relationships(
+                        execution_context.read_view().as_ref(),
+                        ords,
+                        is_cancelled,
+                    ),
+                    None => self
+                        .node
+                        .describe_relationships_in_view(execution_context.read_view())
+                        .map(|mut shapes| {
+                            if !query.labels.is_empty() {
+                                shapes.retain(|shape| {
+                                    query.labels.contains(&shape.source_label)
+                                        || query.labels.contains(&shape.target_label)
+                                });
+                            }
+                            shapes
+                        }),
+                }
+                .map_err(execution_failed)?;
+                Ok(Response::Schema {
+                    schema: SchemaDescription {
+                        labels,
+                        properties,
+                        relationships,
+                    },
+                })
+            }
+            Describe::Labels { query } => {
+                if query.labels.is_empty()
+                    && query
+                        .predicate
+                        .as_object()
+                        .is_some_and(serde_json::Map::is_empty)
+                {
+                    return Ok(Response::Labels {
+                        labels: self
+                            .node
+                            .labels_in_view(execution_context.read_view())
+                            .map_err(execution_failed)?,
+                    });
+                }
+                let matched = self.facet_matches(&query, is_cancelled, execution_context)?;
