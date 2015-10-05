@@ -88,3 +88,93 @@ pub(crate) trait StorageReadView: Send + Sync {
     /// Oldest commit for which this view still retains history.
     fn history_floor(&self) -> Result<u64, StorageError>;
 
+    /// Whether this view is a physically pinned snapshot, so the `current`
+    /// fast path (ignore `ci`, read the live table) stays valid after later
+    /// commits. Redb read transactions pin pages (true); the live in-memory
+    /// maps do not (false), so a view must resolve reads by `ci`.
+    fn snapshot_pinned(&self) -> bool {
+        false
+    }
+}
+
+/// Backend-loaded state used to bootstrap a store.
+#[derive(Debug, Default)]
+pub struct LoadedState {
+    /// Current key/value data.
+    pub data: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Creation commit index per live key.
+    pub created: BTreeMap<Vec<u8>, u64>,
+    /// Retained superseded versions per key.
+    pub history: BTreeMap<Vec<u8>, Vec<VersionEntry>>,
+    /// Durable GC floor.
+    pub gc_watermark: u64,
+}
+
+/// [`StorageBackend::compact`]'s error when a read transaction is open: the
+/// caller retries with every lock released.
+pub(crate) const COMPACT_BUSY: &str = "compaction busy: read transactions open";
+
+/// Write/durability contract of the physical storage substrate.
+///
+/// Implementations must make `apply`/`apply_many` atomic and, when the
+/// configured durability is `Local`, durable before returning. `retire_before`
+/// reclaims retained versions; `compact` releases freed pages.
+///
+/// Visibility is `pub(crate)` in W3: the seam already isolates the write/read
+/// surface so a future async backend (`io_uring` / direct IO) or `RushDB`
+/// `PageStore` can be swapped in without touching LMPG/query/search. The trait
+/// becomes `pub` once an external backend implementation needs to name it.
+pub(crate) trait StorageBackend: Send + Sync {
+    /// Load the full current state (data, MVCC metadata, GC watermark).
+    fn load(&self) -> Result<LoadedState, String>;
+
+    /// Read only the durable-LSN watermark and GC floor: startup needs
+    /// these to restore the committed version WITHOUT materializing the full
+    /// dataset into the RAM mirror. Implementations should read only the two
+    /// metadata keys; the default falls back to a full `load`.
+    fn load_watermark(&self) -> Result<(u64, u64), String> {
+        let state = self.load()?;
+        let lsn = match state.data.get(crate::LAST_APPLIED_KEY) {
+            Some(value) => crate::wal::decode_last_applied(value)
+                .map_err(|error| format!("corrupt last-applied watermark: {error}"))?,
+            None => 0,
+        };
+        Ok((lsn, state.gc_watermark))
+    }
+
+    /// Apply one logical op-set at `commit_index`.
+    fn apply(&self, ops: &[Op], commit_index: u64) -> Result<(), String>;
+
+    /// Apply many op-sets (ascending commit-index order) in ONE write
+    /// transaction: a single durable acknowledgement covers the whole batch.
+    fn apply_many(&self, batches: &[(u64, &[Op])]) -> Result<(), String>;
+
+    /// Reclaim retained versions superseded before `watermark`.
+    fn retire_before(&self, watermark: u64) -> Result<(), String>;
+
+    /// Reclaim a bounded batch of history keys superseded before `watermark`,
+    /// resuming after `cursor`. Returns the next key to resume from, or `None`
+    /// when the walk is complete. Each call is one write transaction, so GC is
+    /// bounded and resumable instead of one monolithic txn.
+    fn retire_before_batch(
+        &self,
+        watermark: u64,
+        _cursor: Option<Vec<u8>>,
+        _max_keys: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        // Default: fall back to the monolithic reclamation. Implementations
+        // that support bounded GC override this.
+        self.retire_before(watermark)?;
+        Ok(None)
+    }
+
+    /// Signal in-flight maintenance scans to stop promptly (shutdown). Backends
+    /// with no long scans treat this as a no-op.
+    fn begin_shutdown(&self) {}
+
+    /// Force queued writes durable (fsync) without changing logical state, and
+    /// durably record `durable_lsn` as the materialization checkpoint. Under
+    /// log-first the WAL is the durable truth and the backend is buffered, so a
+    /// checkpoint is what makes the materialization durable and lets WAL
+    /// segments at or below `durable_lsn` be truncated. Backends with no
+    /// buffered writes treat this as a no-op.
