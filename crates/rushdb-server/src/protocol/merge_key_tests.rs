@@ -39,24 +39,3 @@ fn assert_invalid(error: &ProtocolError, expected: &str) {
 #[test]
 fn reserved_names_and_unindexed_upserts_over_the_limit_are_invalid_requests() {
     let mut config = super::tests::config(false);
-    config.resources.unindexed_walk_max_owners = 2;
-    let node = Node::bootstrap(&mut config).unwrap();
-
-    for name in ["__score", "__label"] {
-        let error = put(&node, &create(&serde_json::json!({ name: 1 }), &[])).unwrap_err();
-        assert_invalid(&error, "invalid property name");
-    }
-    let error = put(&node, &create(&serde_json::json!({ "a": 1 }), &["__a"])).unwrap_err();
-    assert_invalid(&error, "invalid merge key");
-
-    for i in 0..3 {
-        put(
-            &node,
-            &create(&serde_json::json!({ "email": format!("u{i}") }), &[]),
-        )
-        .unwrap();
-    }
-    let error = put(
-        &node,
-        &create(&serde_json::json!({ "email": "u1" }), &["email"]),
-    )
