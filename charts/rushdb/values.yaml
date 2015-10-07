@@ -31,19 +31,3 @@ persistence:
   size: 10Gi
   storageClass: ''
   accessMode: ReadWriteOnce
-
-service:
-  type: ClusterIP
-  annotations: {}
-
-# Exposes the HTTP API only. The PostgreSQL wire, gRPC and Bolt listeners are
-# plaintext; keep them on the cluster network.
-ingress:
-  enabled: false
-  className: ''
-  annotations: {}
-  hosts:
-    - host: rushdb.example.com
-      paths:
-        - path: /
-          pathType: Prefix

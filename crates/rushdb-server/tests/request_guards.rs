@@ -30,36 +30,3 @@ fn head_only(port: u16, token: &str, content_length: usize) -> (TcpStream, Strin
     .unwrap();
     let mut buf = [0u8; 256];
     let n = stream.read(&mut buf).unwrap_or(0);
-    let status = String::from_utf8_lossy(&buf[..n])
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    (stream, status)
-}
-
-#[test]
-fn unauthenticated_request_is_refused_before_its_body_is_read() {
-    let port = start(ServerConfig {
-        port: 0,
-        pgwire_port: 0,
-        ..Default::default()
-    });
-    // The 1 MiB body is never sent: a 401 can only arrive if the server
-    // rejected the request from its headers alone.
-    let (_stream, status) = head_only(port, "wrong-token", 1024 * 1024);
-    assert!(status.contains("401"), "got {status:?}");
-}
-
-#[test]
-fn oversized_declared_body_is_refused_up_front() {
-    let port = start(ServerConfig {
-        port: 0,
-        pgwire_port: 0,
-        max_request_bytes: 1024 * 1024,
-        ..Default::default()
-    });
-    let (_stream, status) = head_only(port, "local-token", 2 * 1024 * 1024);
-    assert!(status.contains("413"), "got {status:?}");
-}
-
