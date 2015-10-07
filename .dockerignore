@@ -2,3 +2,8 @@ target
 .git
 .github
 .rushdb
+.rushdb-*
+data
+docs
+benchmarks/**/results
+**/*.redb
