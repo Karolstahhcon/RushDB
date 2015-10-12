@@ -488,3 +488,494 @@ pub async fn execute_sql_async_with_budget_in_view(
     max_result_bytes: Option<usize>,
 ) -> Result<Vec<Row>, SqlError> {
     execute_sql_async_with_budget_in_view_cancellable(
+        lmpg,
+        snapshot,
+        sql,
+        parameters,
+        max_result_bytes,
+        &|| false,
+        None,
+    )
+    .await
+}
+
+/// Cancellation-aware async form of
+/// [`execute_sql_async_with_budget_in_view`].
+///
+/// # Errors
+///
+/// Returns the same errors as [`execute_sql_async_with_budget_in_view`], plus
+/// [`SqlError::Cancelled`].
+pub async fn execute_sql_async_with_budget_in_view_cancellable(
+    lmpg: &Lmpg,
+    snapshot: Arc<ReadView>,
+    sql: &str,
+    parameters: Option<&Json>,
+    max_result_bytes: Option<usize>,
+    is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    text: Option<&Arc<TextIndexes>>,
+) -> Result<Vec<Row>, SqlError> {
+    execute_read(
+        lmpg,
+        snapshot,
+        sql,
+        parameters,
+        max_result_bytes,
+        is_cancelled,
+        text,
+        &CatalogAccess::default(),
+    )
+    .await
+}
+
+/// Execute read-only SQL under a tenant's data-access policy: the
+/// statement sees tables for the policy's allowed labels only, columns for
+/// their visible properties only, and edge tables for allowed relationship
+/// types holding only relationships between allowed labels. A hidden table
+/// or column fails like one that does not exist. A policy that is not
+/// enforced reads like [`execute_sql_with_parameters_budget_in_view_cancellable`].
+///
+/// # Errors
+///
+/// Returns the same errors as
+/// [`execute_sql_with_parameters_budget_in_view_cancellable`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the cancellable read entry point plus the policy"
+)]
+pub fn execute_sql_under_policy_in_view(
+    lmpg: &Lmpg,
+    snapshot: Arc<ReadView>,
+    sql: &str,
+    parameters: Option<&Json>,
+    max_result_bytes: Option<usize>,
+    is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    text: Option<&Arc<TextIndexes>>,
+    policy: Arc<rushdb_types::security::ActivePolicy>,
+) -> Result<Vec<Row>, SqlError> {
+    ensure_sync_context()?;
+    futures::executor::block_on(execute_read(
+        lmpg,
+        snapshot,
+        sql,
+        parameters,
+        max_result_bytes,
+        is_cancelled,
+        text,
+        &CatalogAccess::new(Some(policy)),
+    ))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the cancellable read entry point plus what the catalog shows"
+)]
+async fn execute_read(
+    lmpg: &Lmpg,
+    snapshot: Arc<ReadView>,
+    sql: &str,
+    parameters: Option<&Json>,
+    max_result_bytes: Option<usize>,
+    is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    text: Option<&Arc<TextIndexes>>,
+    visible: &CatalogAccess,
+) -> Result<Vec<Row>, SqlError> {
+    validate_read_only(sql)?;
+    if is_cancelled() {
+        return Err(SqlError::Cancelled);
+    }
+
+    let mut context = context_in_view_visible(lmpg, &snapshot, max_result_bytes, text, visible)?;
+
+    let mut dataframe = context
+        .context
+        .sql(sql)
+        .await
+        .map_err(|error| with_table_hint(planning_error(error), &context.context))?;
+    if let Some(parameters) = parameters {
+        dataframe = match parameters {
+            Json::Array(values) => dataframe
+                .with_param_values(
+                    values
+                        .iter()
+                        .map(json_to_scalar)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+                .map_err(|error| SqlError::Engine(error.to_string()))?,
+            Json::Object(values) => dataframe
+                .with_param_values(
+                    values
+                        .iter()
+                        .map(|(name, value)| Ok((name.clone(), json_to_scalar(value)?)))
+                        .collect::<Result<Vec<_>, SqlError>>()?,
+                )
+                .map_err(|error| SqlError::Engine(error.to_string()))?,
+            _ => {
+                return Err(SqlError::Parse(
+                    "SQL parameters must be a JSON array or object".into(),
+                ))
+            }
+        };
+    }
+    let mut stream = dataframe
+        .execute_stream()
+        .await
+        .map_err(|error| map_stream_error(&error, max_result_bytes, memory_cap(lmpg)))?;
+    let mut rows = Vec::new();
+    let mut retained_bytes = 0usize;
+    while let Some(batch) = stream.next().await {
+        if is_cancelled() {
+            return Err(SqlError::Cancelled);
+        }
+        let batch =
+            batch.map_err(|error| map_stream_error(&error, max_result_bytes, memory_cap(lmpg)))?;
+        append_batch_rows_with_budget(&batch, &mut rows, &mut retained_bytes, max_result_bytes)?;
+    }
+    // Now that every batch is drained, DataFusion's own
+    // memory pool has reached its final peak for this query — resize the
+    // phase reservation to that real number instead of the flat estimate.
+    context.record_real_memory_peak();
+    Ok(rows)
+}
+
+/// A statement that failed to plan: a failed `text_search` call keeps its
+/// own class, anything else is the engine's.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a `map_err` adapter, which supplies the owned error value"
+)]
+fn planning_error(error: datafusion::error::DataFusionError) -> SqlError {
+    if let datafusion::error::DataFusionError::External(inner) = error.find_root() {
+        if let Some(failed) = inner.downcast_ref::<text_search::TextSearchError>() {
+            return SqlError::TextSearch(failed.to_string());
+        }
+    }
+    scan_error(&error).unwrap_or_else(|| SqlError::Engine(error.to_string()))
+}
+
+/// A "table not found" planning failure, with the closest table names of
+/// the schema it was looked up in. `DataFusion` already suggests
+/// close column names; it does not for tables.
+fn with_table_hint(error: SqlError, context: &SessionContext) -> SqlError {
+    let SqlError::Engine(message) = &error else {
+        return error;
+    };
+    let Some(name) = message
+        .split_once("table '")
+        .and_then(|(_, rest)| rest.split_once("' not found"))
+        .map(|(name, _)| name)
+    else {
+        return error;
+    };
+    let mut parts = name.rsplitn(2, '.');
+    let wanted = parts.next().unwrap_or(name);
+    let schema_name = parts
+        .next()
+        .and_then(|qualifier| qualifier.rsplit('.').next())
+        .unwrap_or("public");
+    let Some(schema) = context
+        .catalog("datafusion")
+        .and_then(|catalog| catalog.schema(schema_name))
+    else {
+        return error;
+    };
+    let tables = schema.table_names();
+    let closest = rushdb_types::names::closest(wanted, tables.iter().map(String::as_str), 3);
+    if closest.is_empty() {
+        return error;
+    }
+    let quoted: Vec<String> = closest.iter().map(|table| format!("'{table}'")).collect();
+    SqlError::Engine(format!("{message}. Did you mean {}?", quoted.join(" or ")))
+}
+
+/// A label scan refused or stopped like a records read (SQL-2, QRY-3)
+/// keeps its class.
+fn scan_error(error: &datafusion::error::DataFusionError) -> Option<SqlError> {
+    let datafusion::error::DataFusionError::External(inner) = error.find_root() else {
+        return None;
+    };
+    match inner.downcast_ref::<rushdb_query::QueryError>()? {
+        rushdb_query::QueryError::UnindexedWalk(message) => {
+            Some(SqlError::UnindexedWalk(message.clone()))
+        }
+        rushdb_query::QueryError::Cancelled => Some(SqlError::Cancelled),
+        _ => None,
+    }
+}
+
+fn map_stream_error(
+    error: &datafusion::error::DataFusionError,
+    max_result_bytes: Option<usize>,
+    memory_cap: Option<usize>,
+) -> SqlError {
+    if let Some(stopped) = scan_error(error) {
+        return stopped;
+    }
+    let message = error.to_string();
+    // The pool's refusal, however an operator wrapped it (an external sort
+    // reports "Not enough memory to continue external sort").
+    if matches!(
+        error.find_root(),
+        datafusion::error::DataFusionError::ResourcesExhausted(_)
+    ) {
+        // The pool is the tighter of the result budget and the memory cap.
+        match (max_result_bytes, memory_cap) {
+            (budget, Some(cap))
+                if budget.is_none_or(|budget| {
+                    cap < budget.saturating_add(DATAFUSION_PHASE_OVERHEAD)
+                }) =>
+            {
+                return SqlError::MemoryLimit(cap);
+            }
+            (Some(budget), _) => return SqlError::ResourceLimit(budget),
+            _ => {}
+        }
+    }
+    SqlError::Engine(message)
+}
+
+/// The working-memory cap of a statement run on `lmpg`: `query-memory-max`,
+/// tightened by the request.
+fn memory_cap(lmpg: &Lmpg) -> Option<usize> {
+    lmpg.limits()
+        .query_memory_max_bytes()
+        .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
+}
+
+/// Execute one relational DML statement against an isolated `DataFusion`
+/// `MemTable` catalog and atomically publish the resulting row delta to LMPG.
+/// `DataFusion` owns SQL parsing, binding, expressions, filters, and affected-row
+/// semantics. `RushDB` only validates stable record identity and commits the
+/// already-computed delta with optimistic snapshot protection.
+///
+/// # Errors
+///
+/// Returns [`SqlError::UnsupportedMutation`] when `sql` is not a single
+/// supported `INSERT`, `UPDATE`, or `DELETE` against a record table,
+/// [`SqlError::InvalidIdentity`] when the resulting delta breaks stable row
+/// identity, and other [`SqlError`] variants for parse, storage, engine, or
+/// commit failures.
+pub fn execute_sql_mutation(
+    lmpg: &Lmpg,
+    sql: &str,
+    parameters: Option<&Json>,
+) -> Result<SqlMutationResult, SqlError> {
+    ensure_sync_context()?;
+    futures::executor::block_on(execute_sql_mutation_async(lmpg, sql, parameters))
+}
+
+/// Async form of [`execute_sql_mutation`].
+///
+/// # Errors
+///
+/// Returns the same errors as [`execute_sql_mutation`].
+///
+/// # Panics
+///
+/// Panics if the validated DML target is absent from the mutable catalog; this
+/// cannot occur because the target is checked immediately before the lookup.
+pub async fn execute_sql_mutation_async(
+    lmpg: &Lmpg,
+    sql: &str,
+    parameters: Option<&Json>,
+) -> Result<SqlMutationResult, SqlError> {
+    let snapshot = Arc::new(lmpg.store.read_view()?);
+    execute_sql_mutation_async_in_view(lmpg, snapshot, sql, parameters, None, None).await
+}
+
+/// Execute a SQL mutation against a caller-owned pinned view and cumulative
+/// result budget. The commit remains optimistic against that pinned version.
+///
+/// # Errors
+/// Returns the same parse, storage, resource, identity, and commit errors as
+/// [`execute_sql_mutation`].
+pub fn execute_sql_mutation_in_view_with_budget(
+    lmpg: &Lmpg,
+    snapshot: Arc<ReadView>,
+    sql: &str,
+    parameters: Option<&Json>,
+    max_result_bytes: Option<usize>,
+    text: Option<&Arc<TextIndexes>>,
+) -> Result<SqlMutationResult, SqlError> {
+    ensure_sync_context()?;
+    futures::executor::block_on(execute_sql_mutation_async_in_view(
+        lmpg,
+        snapshot,
+        sql,
+        parameters,
+        max_result_bytes,
+        text,
+    ))
+}
+
+/// Async form of [`execute_sql_mutation_in_view_with_budget`].
+///
+/// # Errors
+/// Returns the same errors as [`execute_sql_mutation_in_view_with_budget`].
+pub async fn execute_sql_mutation_async_in_view(
+    lmpg: &Lmpg,
+    snapshot: Arc<ReadView>,
+    sql: &str,
+    parameters: Option<&Json>,
+    max_result_bytes: Option<usize>,
+    text: Option<&Arc<TextIndexes>>,
+) -> Result<SqlMutationResult, SqlError> {
+    dml::execute(lmpg, snapshot, sql, parameters, max_result_bytes, text).await
+}
+
+/// Describe a read-only statement's parameter types and result columns.
+///
+/// # Errors
+///
+/// Returns the same errors as [`execute_sql`].
+pub fn describe_sql(lmpg: &Lmpg, sql: &str) -> Result<SqlDescription, SqlError> {
+    ensure_sync_context()?;
+    futures::executor::block_on(describe_sql_async(lmpg, sql, None))
+}
+
+/// Describe parameter types for the supported atomic DML subset. Pgwire uses
+/// this during Parse so standard PostgreSQL clients can encode bound values
+/// before the statement is executed. It does not make DML a read query and it
+/// intentionally exposes no result columns.
+///
+/// # Errors
+///
+/// Returns [`SqlError::UnsupportedMutation`] when `sql` is not a supported DML
+/// statement, and other [`SqlError`] variants for storage or engine failures.
+pub fn describe_sql_mutation(lmpg: &Lmpg, sql: &str) -> Result<SqlDescription, SqlError> {
+    ensure_sync_context()?;
+    futures::executor::block_on(describe_sql_mutation_async(lmpg, sql, None))
+}
+
+/// Async form of [`describe_sql_mutation`].
+///
+/// # Errors
+///
+/// Returns the same errors as [`describe_sql_mutation`].
+pub async fn describe_sql_mutation_async(
+    lmpg: &Lmpg,
+    sql: &str,
+    text: Option<&Arc<TextIndexes>>,
+) -> Result<SqlDescription, SqlError> {
+    let plan = dml::plan(sql)?;
+    let snapshot = Arc::new(lmpg.store.read_view()?);
+    dml::target_label(lmpg, &snapshot, &plan.target)?;
+    let context = context_in_view_with_budget(lmpg, &snapshot, None, text)?;
+    let dataframe = context
+        .context
+        .sql(&plan.query)
+        .await
+        .map_err(|error| with_table_hint(planning_error(error), &context.context))?;
+    let mut parameters = dataframe
+        .logical_plan()
+        .get_parameter_types()
+        .map_err(|error| SqlError::Engine(error.to_string()))?
+        .into_iter()
+        .map(|(name, data_type)| {
+            (
+                name,
+                data_type
+                    .as_ref()
+                    .map_or(SqlType::Unknown, sql_type_from_arrow),
+            )
+        })
+        .collect::<Vec<_>>();
+    parameters.sort_by(|(left, _), (right, _)| parameter_order(left).cmp(&parameter_order(right)));
+    // The rewritten read carries only values (`VALUES ($1, $2)`), so a bare
+    // parameter has no type of its own. Resolve it from the target column, as
+    // PostgreSQL does for INSERT/UPDATE.
+    if !plan.parameter_columns.is_empty() {
+        if let Ok(provider) = context.context.table_provider(&plan.target).await {
+            let schema = provider.schema();
+            for (index, target) in &plan.parameter_columns {
+                let field = match target {
+                    dml::ParameterTarget::Column(name) => schema.field_with_name(name).ok(),
+                    dml::ParameterTarget::Position(position) => schema
+                        .fields()
+                        .get(*position)
+                        .map(std::convert::AsRef::as_ref),
+                };
+                let Some(field) = field else { continue };
+                let Some((_, data_type)) = parameters.iter_mut().find(|(name, _)| {
+                    name.strip_prefix('$')
+                        .and_then(|value| value.parse::<u64>().ok())
+                        == Some(*index)
+                }) else {
+                    continue;
+                };
+                *data_type = sql_type_from_arrow(field.data_type());
+            }
+        }
+    }
+    Ok(SqlDescription {
+        parameters,
+        columns: Vec::new(),
+    })
+}
+
+/// Async form of [`describe_sql`], describing a statement without executing it.
+///
+/// # Errors
+///
+/// Returns the same errors as [`describe_sql`].
+pub async fn describe_sql_async(
+    lmpg: &Lmpg,
+    sql: &str,
+    text: Option<&Arc<TextIndexes>>,
+) -> Result<SqlDescription, SqlError> {
+    validate_read_only(sql)?;
+    let context = context_for_lmpg(lmpg, text)?;
+    let dataframe = context
+        .sql(sql)
+        .await
+        .map_err(|error| with_table_hint(planning_error(error), &context))?;
+
+    let mut parameters = dataframe
+        .logical_plan()
+        .get_parameter_types()
+        .map_err(|error| SqlError::Engine(error.to_string()))?
+        .into_iter()
+        .map(|(name, data_type)| {
+            let data_type = data_type
+                .as_ref()
+                .map_or(SqlType::Unknown, sql_type_from_arrow);
+            (name, data_type)
+        })
+        .collect::<Vec<_>>();
+    parameters.sort_by(|(left, _), (right, _)| parameter_order(left).cmp(&parameter_order(right)));
+
+    let columns = dataframe
+        .schema()
+        .iter()
+        .map(|(_, field)| SqlColumn {
+            name: field.name().clone(),
+            data_type: sql_type_from_arrow(field.data_type()),
+            nullable: field.is_nullable(),
+        })
+        .collect();
+    Ok(SqlDescription {
+        parameters,
+        columns,
+    })
+}
+
+fn context_for_lmpg(
+    lmpg: &Lmpg,
+    text: Option<&Arc<TextIndexes>>,
+) -> Result<SessionContext, SqlError> {
+    let snapshot = Arc::new(lmpg.store.read_view()?);
+    Ok(context_in_view(lmpg, &snapshot, text)?.context)
+}
+
+struct DataFusionContext {
+    context: SessionContext,
+    // Keeps the shared store-level phase reservation alive for the complete
+    // DataFusion query, including planning and stream execution. Resized to
+    // the real measured peak (`record_real_memory_peak`) once execution
+    // finishes, so a dropped-but-not-yet-resized reservation still charges
+    // the conservative flat estimate rather than nothing.
+    phase_reservation: Option<ByteReservation>,
+    // `DataFusion`'s real memory-pool peak for this query, when a budget
+    // was configured (`None` otherwise — an unbounded context has no
+    // `GreedyMemoryPool` to track).
+    peak_pool: Option<Arc<PeakTrackingMemoryPool>>,

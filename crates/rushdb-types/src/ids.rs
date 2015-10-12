@@ -85,3 +85,90 @@ mod tests {
 macro_rules! dense_id {
     ($name:ident) => {
         #[doc = concat!("Dense monotonic ", stringify!($name), " identifier.")]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
+            Default,
+        )]
+        pub struct $name(#[doc = "Wrapped ordinal value."] pub u64);
+
+        impl $name {
+            /// Return the identifier that follows this one.
+            #[must_use]
+            pub fn next(self) -> Self {
+                $name(self.0 + 1)
+            }
+        }
+    };
+}
+
+dense_id!(RecordOrdinal);
+dense_id!(RelationshipOrdinal);
+dense_id!(OccurrenceOrdinal);
+dense_id!(FamilyId);
+dense_id!(PropertyId);
+dense_id!(ValueSeq);
+dense_id!(SpaceId);
+
+/// Lexical token identifier.
+pub type TokenId = u32;
+
+/// Stable 128-bit public identity of a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RecordId(pub [u8; 16]);
+
+impl RecordId {
+    /// Generate a new time-ordered (`UUIDv7`) record id.
+    #[must_use]
+    pub fn generate() -> Self {
+        RecordId(*Uuid::now_v7().as_bytes())
+    }
+
+    /// The all-zero record id, used as a sentinel.
+    #[must_use]
+    pub fn nil() -> Self {
+        RecordId([0u8; 16])
+    }
+
+    /// View this id as a [`Uuid`].
+    #[must_use]
+    pub fn to_uuid(&self) -> Uuid {
+        Uuid::from_bytes(self.0)
+    }
+}
+
+impl From<Uuid> for RecordId {
+    fn from(u: Uuid) -> Self {
+        RecordId(*u.as_bytes())
+    }
+}
+
+impl fmt::Display for RecordId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_uuid().simple())
+    }
+}
+
+/// Stable 128-bit public identity of a relationship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RelationshipId(pub [u8; 16]);
+
+impl RelationshipId {
+    /// Generate a new time-ordered (`UUIDv7`) relationship id.
+    #[must_use]
+    pub fn generate() -> Self {
+        RelationshipId(*Uuid::now_v7().as_bytes())
+    }
+
+    /// View this id as a [`Uuid`].
+    #[must_use]
+    pub fn to_uuid(&self) -> Uuid {
+        Uuid::from_bytes(self.0)
