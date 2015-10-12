@@ -166,3 +166,87 @@ fn sql_text_search_reports_bad_calls() {
 #[test]
 fn cypher_and_gql_filter_and_rank_with_text_functions() {
     let node = articles();
+    for language in [StatementLanguage::Cypher, StatementLanguage::Gql] {
+        // A boolean filter on a property index.
+        let found = rows(
+            &node,
+            language,
+            "MATCH (a:Article) WHERE text_match(a.title, 'graph') RETURN a.title AS title",
+        );
+        assert_eq!(titles(&found), vec!["Graph databases"], "{language:?}");
+        // Ranked top-k on the whole-record index: `*` names it.
+        let ranked = rows(
+            &node,
+            language,
+            "MATCH (a:Article) RETURN a.title AS title, text_score(a.`*`, 'graph') AS score \
+             ORDER BY text_score(a.`*`, 'graph') DESC LIMIT 2",
+        );
+        assert_eq!(
+            titles(&ranked),
+            vec!["Graph databases", "Database internals"],
+            "{language:?}: {ranked:?}"
+        );
+        assert!(ranked[0]["score"].as_f64().unwrap() > 0.0, "{language:?}");
+    }
+}
+
+#[test]
+fn a_text_function_needs_an_index_and_a_parsable_query() {
+    let node = articles();
+    // `body` has no index of its own (only the `*` one covers it).
+    for (statement, expected) in [
+        (
+            "MATCH (a:Article) WHERE text_match(a.body, 'graph') RETURN a.title AS title",
+            "no ready text index on :Article(body)",
+        ),
+        (
+            "MATCH (a:Article) WHERE text_match(a.title, 'title:(') RETURN a",
+            "text search failed",
+        ),
+    ] {
+        let error = run(
+            &node,
+            Operation::Query {
+                query: Query::Statement {
+                    language: StatementLanguage::Cypher,
+                    statement: statement.into(),
+                    parameters: None,
+                },
+            },
+        )
+        .expect_err(statement);
+        assert_eq!(error.code, ErrorCode::InvalidRequest, "{error:?}");
+        assert!(error.message.contains(expected), "{statement}: {error:?}");
+    }
+}
+
+/// One `immediate` text index on `Doc`, for Mongo's one-per-collection rule.
+fn documents() -> Node {
+    let node = articles();
+    for (title, year) in [
+        ("graph basics", 2019),
+        ("graph graph graph", 2022),
+        ("cooking", 2023),
+    ] {
+        node.scope()
+            .create_record(
+                "Doc",
+                &serde_json::json!({ "title": title, "year": year }),
+                &[],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    mutate(
+        &node,
+        StatementLanguage::Mongo,
+        r#"{"createIndex": {"collection": "Doc", "property": "title", "kind": "text", "name": "doc_titles", "consistency": "immediate"}}"#,
+    );
+    while node.step_index_builds(std::time::Duration::from_secs(5)) > 0 {}
+    node
+}
+
+#[test]
+fn mongo_text_filters_scores_and_sorts() {
+    let node = documents();
+    let found = rows(
