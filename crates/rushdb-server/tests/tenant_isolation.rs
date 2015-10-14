@@ -162,3 +162,167 @@ fn tenant_a_writes_are_invisible_to_tenant_b() {
     let a = find_text(&node, "tenant-a");
     assert_eq!(a, vec![serde_json::json!("safe")]);
     let b = find_text(&node, "tenant-b");
+    assert_eq!(b, vec![serde_json::json!("other")]);
+}
+
+#[test]
+fn direct_record_lookup_cannot_cross_tenant_scope() {
+    let node = multitenant();
+    let id = RequestScope::new(&node, Some("tenant-a".to_string()))
+        .create_record(
+            "NOTE",
+            &serde_json::json!({ "text": "private-a" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap()
+        .get("id")
+        .and_then(|value| value.as_str())
+        .expect("created record id")
+        .to_owned();
+    let response =
+        rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-b".to_string()))
+            .execute(RequestEnvelope {
+                protocol_version: 1,
+                request_id: Some("cross-tenant-record-id".into()),
+                context: RequestContext {
+                    scope: Some("tenant-b".into()),
+                    deadline_ms: None,
+                    ..Default::default()
+                },
+                operation: Operation::Query {
+                    query: Query::Record { id },
+                },
+            })
+            .expect_err("foreign record id must not be visible");
+    assert_eq!(response.code, ErrorCode::NotFound);
+    assert!(response.message.contains("record not found"));
+}
+
+#[test]
+fn backup_is_scoped_to_requested_tenants() {
+    let node = multitenant();
+    put(&node, "tenant-a", "NOTE", "a-secret");
+    put(&node, "tenant-b", "NOTE", "b-secret");
+    let envelope = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("backup".into()),
+        context: RequestContext {
+            scope: Some("tenant-a".to_string()),
+            deadline_ms: None,
+            ..Default::default()
+        },
+        operation: Operation::Backup {
+            request: rushdb_protocol::BackupRequest {
+                scopes: vec!["tenant-a".to_string()],
+            },
+        },
+    };
+    let res = rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-a".to_string()))
+        .execute(envelope)
+        .unwrap();
+    let Response::Backup { tenants, .. } = res.response else {
+        panic!("expected backup response");
+    };
+    assert_eq!(tenants.len(), 1, "backup must contain only tenant-a");
+    let jsonl = tenants[0].jsonl.as_str();
+    assert!(jsonl.contains("a-secret"));
+    assert!(!jsonl.contains("b-secret"), "tenant-b must not leak");
+}
+
+#[test]
+fn tenant_scoped_backup_cannot_select_or_enumerate_other_tenants() {
+    let node = multitenant();
+    put(&node, "tenant-a", "NOTE", "a-secret");
+    put(&node, "tenant-b", "NOTE", "b-secret");
+
+    // An empty list is tenant A's own backup, not an all-tenant export.
+    let own = rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-a".to_string()))
+        .execute(RequestEnvelope {
+            protocol_version: 1,
+            request_id: Some("backup-default-scope".into()),
+            context: RequestContext {
+                scope: Some("tenant-a".into()),
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Backup {
+                request: rushdb_protocol::BackupRequest { scopes: vec![] },
+            },
+        })
+        .expect("tenant A's own backup must be allowed");
+    let Response::Backup { tenants, .. } = own.response else {
+        panic!("expected backup response");
+    };
+    assert_eq!(tenants.len(), 1);
+    assert!(tenants[0].jsonl.contains("a-secret"));
+    assert!(!tenants[0].jsonl.contains("b-secret"));
+
+    let rejected =
+        rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-a".to_string()))
+            .execute(RequestEnvelope {
+                protocol_version: 1,
+                request_id: Some("backup-cross-tenant".into()),
+                context: RequestContext {
+                    scope: Some("tenant-a".into()),
+                    deadline_ms: None,
+                    ..Default::default()
+                },
+                operation: Operation::Backup {
+                    request: rushdb_protocol::BackupRequest {
+                        scopes: vec!["tenant-b".into()],
+                    },
+                },
+            });
+    assert_eq!(rejected.unwrap_err().code, ErrorCode::ScopeMismatch);
+}
+
+#[test]
+fn staged_transaction_writes_never_leak_tenant_boundary() {
+    let node = multitenant();
+    put(&node, "tenant-a", "NOTE", "committed-a");
+    let begin = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("tx-begin".into()),
+        context: RequestContext {
+            scope: Some("tenant-a".to_string()),
+            deadline_ms: None,
+            ..Default::default()
+        },
+        operation: Operation::Transaction {
+            transaction: TransactionOperation::Begin {
+                ttl_ms: None,
+                autocommit: false,
+            },
+        },
+    };
+    let res = rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-a".to_string()))
+        .execute(begin)
+        .unwrap();
+    let Response::TransactionBegun { transaction_id } = res.response else {
+        panic!("expected begun transaction");
+    };
+
+    // Stage a write inside tenant-a's transaction.
+    let stage = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("tx-stage".into()),
+        context: RequestContext {
+            scope: Some("tenant-a".to_string()),
+            deadline_ms: None,
+            ..Default::default()
+        },
+        operation: Operation::Transaction {
+            transaction: TransactionOperation::Stage {
+                transaction_id,
+                mutation: TransactionMutation::CreateRecord {
+                    label: "NOTE".to_string(),
+                    id: None,
+                    properties: serde_json::json!({ "text": "staged-a" }),
+                    options: serde_json::json!({}),
+                },
+            },
+        },
+    };
+    rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-a".to_string()))
+        .execute(stage)

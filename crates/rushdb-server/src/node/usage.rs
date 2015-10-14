@@ -58,3 +58,33 @@ impl Node {
                 "tenants must list at least one tenant scope".into(),
             ));
         }
+        let view = self
+            .store
+            .read_view()
+            .map_err(|e| UsageError::Store(e.to_string()))?;
+        let mut rows = Vec::with_capacity(scopes.len().max(1));
+        let mut total = TenantUsage::default();
+        let mut total_vectors = 0u64;
+        let targets: Vec<Option<&str>> = if self.multitenant() {
+            scopes.iter().map(|scope| Some(scope.as_str())).collect()
+        } else {
+            vec![None]
+        };
+        for scope in targets {
+            let tenant = match scope {
+                None => Some(self.base_tenant),
+                Some(scope) => self
+                    .store
+                    .resolve_tenant(&TenantScope::of(scope))
+                    .map_err(|e| UsageError::Store(e.to_string()))?,
+            };
+            let usage = match tenant {
+                Some(tenant) => {
+                    tenant_usage(&view, tenant).map_err(|e| UsageError::Store(e.to_string()))?
+                }
+                None => TenantUsage::default(),
+            };
+            let vectors: u64 = usage.vectors.iter().map(|space| space.vectors).sum();
+            total.records += usage.records;
+            total.relationships += usage.relationships;
+            total.labels += usage.labels;
