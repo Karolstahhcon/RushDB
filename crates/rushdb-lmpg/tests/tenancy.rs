@@ -23,29 +23,3 @@ fn registration_assigns_dense_ordinals_and_is_idempotent() {
     let b = tenancy::resolve_or_register_scope(&store, "project-b").unwrap();
     assert_eq!(a, TenantId(TenantId::FIRST_ASSIGNED));
     assert_eq!(b, TenantId(TenantId::FIRST_ASSIGNED + 1));
-    assert_eq!(
-        tenancy::resolve_or_register_scope(&store, "project-a").unwrap(),
-        a
-    );
-    let version = store.committed_version();
-    assert_eq!(
-        tenancy::resolve_or_register_scope(&store, "project-b").unwrap(),
-        b
-    );
-    assert_eq!(
-        store.committed_version(),
-        version,
-        "resolving a registered scope never commits"
-    );
-}
-
-#[test]
-fn concurrent_registration_of_one_scope_yields_one_ordinal() {
-    let store = Arc::new(Store::new_in_memory());
-    let mut handles = Vec::new();
-    for _ in 0..16 {
-        let store = Arc::clone(&store);
-        handles.push(std::thread::spawn(move || {
-            tenancy::resolve_or_register_scope(&store, "shared").unwrap()
-        }));
-    }

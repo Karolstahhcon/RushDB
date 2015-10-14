@@ -44,3 +44,97 @@ impl AggregateUDFImpl for CheckedSumUdaf {
         "checked_sum"
     }
 
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int64)
+    }
+
+    fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(CheckedSumAccumulator { sum: None }))
+    }
+
+    /// Present exactly as the built-in `SUM` so a rewritten plan's output
+    /// column names are unchanged; downstream projections (and
+    /// `optimize_projections`) still resolve `sum(<expr>)`.
+    fn schema_name(&self, params: &AggregateFunctionParams) -> Result<String> {
+        Ok(udaf_default_schema_name(self, params)?.replacen("checked_sum(", "sum(", 1))
+    }
+
+    fn display_name(&self, params: &AggregateFunctionParams) -> Result<String> {
+        Ok(udaf_default_display_name(self, params)?.replacen("checked_sum(", "sum(", 1))
+    }
+}
+
+#[derive(Debug)]
+struct CheckedSumAccumulator {
+    /// `None` until the first non-null input, so `SUM` of all-null stays null.
+    sum: Option<i64>,
+}
+
+impl CheckedSumAccumulator {
+    fn add(&mut self, value: i64) -> Result<()> {
+        let current = self.sum.unwrap_or(0);
+        self.sum =
+            Some(current.checked_add(value).ok_or_else(|| {
+                DataFusionError::Execution("integer SUM overflowed i64".to_string())
+            })?);
+        Ok(())
+    }
+}
+
+impl Accumulator for CheckedSumAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let values = values[0].as_primitive::<Int64Type>();
+        for index in 0..values.len() {
+            if !values.is_null(index) {
+                self.add(values.value(index))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        let values = states[0].as_primitive::<Int64Type>();
+        for index in 0..values.len() {
+            if !values.is_null(index) {
+                self.add(values.value(index))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(vec![self.evaluate()?])
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        Ok(ScalarValue::Int64(self.sum))
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self)
+    }
+}
+
+/// Rewrite `sum(<int64-expression>)` to `checked_sum(<int64-expression>)`.
+#[derive(Debug)]
+pub(crate) struct CheckedSumRule {
+    udaf: Arc<AggregateUDF>,
+}
+
+impl CheckedSumRule {
+    pub(crate) fn new(udaf: Arc<AggregateUDF>) -> Self {
+        Self { udaf }
+    }
+}
+
+impl OptimizerRule for CheckedSumRule {
+    fn name(&self) -> &'static str {
+        "rushdb_checked_sum"
+    }
+
+    fn rewrite(
+        &self,
