@@ -42,18 +42,3 @@
   {"traversal": "g.V().hasLabel('Person').has('name', 'alice').out('KNOWS').out('KNOWS').values('name')", "rows": 1},
   {"traversal": "g.V().hasLabel('Person').label().dedup()", "rows": 1},
   {"traversal": "g.V().hasLabel('Person').has('name', 'alice').valueMap('name', 'age')", "rows": 1},
-  {"traversal": "g.V().hasLabel('Person').values('name').fold()", "rows": 1},
-  {"traversal": "g.V().hasLabel('Person').hasNot('missing').count()", "rows": 1},
-  {"traversal": "g.E().hasLabel('KNOWS').count()", "rows": 1},
-  {"traversal": "g.V().hasLabel('Person').limit(1).constant('x')", "rows": 1}
- ],
- "writes": [
-  {"traversal": "g.addV('Person').property('name', 'eve').property('age', 40)", "affected": 1},
-  {"traversal": "g.V().hasLabel('Person').has('name', 'alice').property('age', 30)", "affected": 1},
-  {"traversal": "g.V().hasLabel('Person').has('name', 'dave').drop()", "affected": 1},
-  {"traversal": "g.E().hasLabel('CREATED').drop()", "affected": 2},
-  {"traversal": "g.V().has('name', 'alice').as('a').V().has('name', 'dave').addE('LIKES').from('a').property('weight', 3)", "affected": 1}
- ],
- "bytecode": [
-  {
-   "bytecode": {"@type": "g:Bytecode", "@value": {"step": [["V"], ["hasLabel", "Person"], ["has", "age", {"@type": "g:P", "@value": {"predicate": "gt", "value": {"@type": "g:Int32", "@value": 30}}}], ["order"], ["by", "name", {"@type": "g:Order", "@value": "desc"}], ["limit", {"@type": "g:Int64", "@value": 2}], ["values", "name"]]}},
