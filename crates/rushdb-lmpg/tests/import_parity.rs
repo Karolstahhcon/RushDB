@@ -92,3 +92,97 @@ fn bfs_nested_import_applies_per_key_relationship_types() {
             ]
         }),
         "Company",
+        &options,
+    );
+    assert_eq!(plan.records.len(), 4);
+    let mut types: Vec<&str> = plan.relations.iter().map(|r| r.rel_type.as_str()).collect();
+    types.sort_unstable();
+    assert_eq!(
+        types,
+        vec![
+            "HAS_NEST_ADDRESS",
+            "HAS_NEST_DEPARTMENT",
+            "HAS_NEST_DEPARTMENT"
+        ]
+    );
+    // Unmapped keys still fall back to the default.
+    let defaulted = serialize_bfs(
+        &json!({"name": "Acme", "note": {"body": "hi"}}),
+        "Company",
+        &options,
+    );
+    assert!(defaulted
+        .relations
+        .iter()
+        .all(|r| r.rel_type == RUSHDB_RELATION_DEFAULT));
+
+    import_bfs(&lmpg, &plan, &options).unwrap();
+    let snap = lmpg.store.read_view().unwrap();
+    let company_ord = try_access::label_members(&snap, lmpg.tenant, "Company").unwrap()[0];
+    let mut observed = adj_rel_types(&lmpg, company_ord);
+    observed.sort();
+    assert_eq!(
+        observed,
+        vec![
+            "HAS_NEST_ADDRESS",
+            "HAS_NEST_DEPARTMENT",
+            "HAS_NEST_DEPARTMENT"
+        ]
+    );
+}
+
+#[test]
+fn repeated_upsert_import_does_not_duplicate_nested_relationships() {
+    let lmpg = setup();
+    let payload = json!({
+        "name": "Acme",
+        "department": [{ "name": "Engineering" }]
+    });
+    let options = ImportOptions {
+        merge_by: Some(vec!["name".to_string()]),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let plan = serialize_bfs(&payload, "Company", &options);
+        import_bfs(&lmpg, &plan, &options).unwrap();
+    }
+
+    let snap = lmpg.store.read_view().unwrap();
+    let company = try_access::label_members(&snap, lmpg.tenant, "Company").unwrap()[0];
+    assert_eq!(
+        try_access::adj_out(&snap, lmpg.tenant, company, Some(RUSHDB_RELATION_DEFAULT))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn upsert_nested_linking_reuses_child_and_relinks_new_parent() {
+    let lmpg = setup();
+    let opts = ImportOptions {
+        merge_by: Some(vec![]),
+        ..Default::default()
+    };
+
+    let payload_a = json!({
+        "name": "Abshire - Farrell",
+        "rating": 1.9,
+        "department": [{ "name": "Sports", "description": "gloves" }]
+    });
+    let plan_a = serialize_bfs(&payload_a, "Company", &ImportOptions::default());
+    import_bfs(&lmpg, &plan_a, &opts).unwrap();
+    assert_eq!(label_count(&lmpg, "Company"), 1);
+    assert_eq!(label_count(&lmpg, "department"), 1);
+
+    // payload B differs only in `rating`: new parent, same child reused+relinked
+    let payload_b = json!({
+        "name": "Abshire - Farrell",
+        "rating": 2.0,
+        "department": [{ "name": "Sports", "description": "gloves" }]
+    });
+    let plan_b = serialize_bfs(&payload_b, "Company", &ImportOptions::default());
+    let idmap_b = import_bfs(&lmpg, &plan_b, &opts).unwrap();
+
+    assert_eq!(label_count(&lmpg, "Company"), 2, "new parent created");
+    assert_eq!(
