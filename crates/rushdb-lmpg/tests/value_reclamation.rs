@@ -17,23 +17,3 @@ fn occurrence_rows(eng: &Lmpg) -> usize {
 }
 
 fn dictionary_entries(eng: &Lmpg) -> usize {
-    let mut prefix = rushdb_types::keys::tenant_prefix(eng.tenant).to_vec();
-    prefix.push(rushdb_types::keys::F_VALUE_DICT);
-    eng.store.try_range_prefix(&prefix).unwrap().len()
-}
-
-fn updated_twenty_times(eng: &Lmpg) -> rushdb_lmpg::RecordRef {
-    let rec = eng
-        .create_record("Doc", None, vec![("n".into(), FieldChange::Set(json!(0)))])
-        .unwrap();
-    for i in 1..20 {
-        eng.update_fields(rec, vec![("n".into(), FieldChange::Set(json!(i)))])
-            .unwrap();
-    }
-    rec
-}
-
-#[test]
-fn updating_a_scalar_leaves_one_occurrence_and_one_dictionary_entry() {
-    let eng = Lmpg::new(Arc::new(Store::new_in_memory()), TenantId::from_ordinal(1));
-    updated_twenty_times(&eng);
