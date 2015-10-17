@@ -57,3 +57,62 @@ fn record(node: &Node, id: &str) -> Option<serde_json::Value> {
     )
     .ok()
     .and_then(|response| response.get("record").cloned())
+    .filter(|record| !record.is_null())
+}
+
+fn links(node: &Node, relation_type: &str) -> usize {
+    let response = run(
+        node,
+        &serde_json::json!({"kind": "query", "query": {"kind": "relationships", "query": {
+            "relationType": relation_type,
+        }}}),
+    )
+    .unwrap();
+    response["relationships"].as_array().unwrap().len()
+}
+
+fn committed_person(node: &Node, name: &str) -> String {
+    let created = node
+        .scope()
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": name }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    created["id"].as_str().unwrap().to_owned()
+}
+
+const STAGED: &str = "00000000-0000-0000-0000-0000000000aa";
+
+#[test]
+fn update_delete_and_link_committed_and_staged_records_by_id() {
+    let node = Node::bootstrap(&mut super::tests::config(false)).unwrap();
+    let ada = committed_person(&node, "Ada");
+    let alan = committed_person(&node, "Alan");
+    let tx = begin(&node);
+
+    stage(
+        &node,
+        &tx,
+        &serde_json::json!({"kind": "createRecord", "label": "Person", "id": STAGED,
+            "properties": {"name": "Grace"}}),
+    )
+    .unwrap();
+    stage(
+        &node,
+        &tx,
+        &serde_json::json!({"kind": "updateRecord", "record": {"id": ada},
+            "properties": {"name": "Ada Lovelace"}}),
+    )
+    .unwrap();
+    stage(
+        &node,
+        &tx,
+        &serde_json::json!({"kind": "createRelationship", "relationType": "KNOWS",
+            "source": {"id": ada}, "target": {"id": STAGED}}),
+    )
+    .unwrap();
+    stage(
+        &node,

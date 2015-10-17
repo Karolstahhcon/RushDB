@@ -8,3 +8,14 @@ description = "Internal component of the RushDB server: vector indexes. No stabl
 homepage.workspace = true
 repository.workspace = true
 documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rushdb-types = { workspace = true }
+rushdb-storage = { workspace = true }
+rushdb-lmpg = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
