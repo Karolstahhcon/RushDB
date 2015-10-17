@@ -142,3 +142,148 @@ pub(crate) fn plan(sql: &str) -> Result<DmlPlan, SqlError> {
                 || insert.or.is_some()
                 || insert.ignore
                 || insert.overwrite
+                || insert.replace_into
+                || !insert.assignments.is_empty()
+                || insert.partitioned.is_some()
+            {
+                return Err(unsupported(
+                    "INSERT supports a column list with VALUES or SELECT only",
+                ));
+            }
+            let source = insert
+                .source
+                .as_ref()
+                .ok_or_else(|| unsupported("INSERT needs VALUES or a SELECT"))?;
+            let columns: Vec<String> = insert
+                .columns
+                .iter()
+                .map(|name| last_ident(name).map(column_name))
+                .collect::<Result<_, _>>()?;
+            let mut parameter_columns = Vec::new();
+            if let SetExpr::Values(values) = source.body.as_ref() {
+                for row in &values.rows {
+                    for (index, expression) in row.iter().enumerate() {
+                        let Expr::Value(value) = expression else {
+                            continue;
+                        };
+                        let Value::Placeholder(placeholder) = &value.value else {
+                            continue;
+                        };
+                        let Some(position) = placeholder
+                            .strip_prefix('$')
+                            .and_then(|value| value.parse::<u64>().ok())
+                        else {
+                            continue;
+                        };
+                        let target = if columns.is_empty() {
+                            Some(ParameterTarget::Position(index))
+                        } else {
+                            columns
+                                .get(index)
+                                .map(|column| ParameterTarget::Column(column.clone()))
+                        };
+                        let Some(target) = target else { continue };
+                        if !parameter_columns.iter().any(|(seen, _)| *seen == position) {
+                            parameter_columns.push((position, target));
+                        }
+                    }
+                }
+            }
+            Ok(DmlPlan {
+                kind: DmlKind::Insert,
+                target,
+                query: source.to_string(),
+                columns,
+                parameter_columns,
+            })
+        }
+        Statement::Update(update) => {
+            if !update.table.joins.is_empty() {
+                return Err(unsupported("UPDATE target joins are unsupported"));
+            }
+            if update.returning.is_some()
+                || update.output.is_some()
+                || update.or.is_some()
+                || !update.order_by.is_empty()
+                || update.limit.is_some()
+            {
+                return Err(unsupported(
+                    "UPDATE with RETURNING, OR, ORDER BY or LIMIT is unsupported",
+                ));
+            }
+            let relation = &update.table.relation;
+            let target = crate::table_factor_name(relation)?;
+            let q = qualifier(relation);
+            let mut select = vec![format!("{q}.\"{ID_FIELD}\" AS \"{ROW_ID}\"")];
+            let mut columns = Vec::new();
+            let mut parameter_columns = Vec::new();
+            for (i, assignment) in update.assignments.iter().enumerate() {
+                let AssignmentTarget::ColumnName(name) = &assignment.target else {
+                    return Err(unsupported("tuple assignments are unsupported"));
+                };
+                let ident = last_ident(name)?;
+                let column = column_name(ident);
+                if column == ID_FIELD {
+                    return Err(SqlError::InvalidIdentity(
+                        "UPDATE cannot change the stable __id column".into(),
+                    ));
+                }
+                if let Expr::Value(value) = &assignment.value {
+                    if let Value::Placeholder(placeholder) = &value.value {
+                        if let Some(position) = placeholder
+                            .strip_prefix('$')
+                            .and_then(|value| value.parse::<u64>().ok())
+                        {
+                            parameter_columns
+                                .push((position, ParameterTarget::Column(column.clone())));
+                        }
+                    }
+                }
+                select.push(format!("{q}.{ident} AS \"{OLD}{i}\""));
+                select.push(format!("({}) AS \"{NEW}{i}\"", assignment.value));
+                columns.push(column);
+            }
+            let mut from = relation.to_string();
+            if let Some(
+                UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables),
+            ) = &update.from
+            {
+                for table in tables {
+                    from.push_str(", ");
+                    from.push_str(&table.to_string());
+                }
+            }
+            let mut query = format!("SELECT {} FROM {from}", select.join(", "));
+            if let Some(selection) = &update.selection {
+                let _ = write!(query, " WHERE {selection}");
+            }
+            Ok(DmlPlan {
+                kind: DmlKind::Update,
+                target,
+                query,
+                columns,
+                parameter_columns,
+            })
+        }
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+            };
+            if tables.len() != 1 || !tables[0].joins.is_empty() || !delete.tables.is_empty() {
+                return Err(unsupported("DELETE must target one record table"));
+            }
+            if delete.using.is_some()
+                || delete.returning.is_some()
+                || delete.output.is_some()
+                || !delete.order_by.is_empty()
+                || delete.limit.is_some()
+            {
+                return Err(unsupported(
+                    "DELETE with USING, RETURNING, ORDER BY or LIMIT is unsupported",
+                ));
+            }
+            let relation = &tables[0].relation;
+            let target = crate::table_factor_name(relation)?;
+            let q = qualifier(relation);
+            let mut query = format!("SELECT {q}.\"{ID_FIELD}\" AS \"{ROW_ID}\" FROM {relation}");
+            if let Some(selection) = &delete.selection {

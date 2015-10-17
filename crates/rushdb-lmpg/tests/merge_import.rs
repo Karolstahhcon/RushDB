@@ -158,3 +158,83 @@ fn merge_duplicate_keys_within_one_import_upsert_once() {
     let opts = import::ImportOptions {
         merge_by: Some(vec!["id".to_string()]),
         merge_strategy: Some("append".into()),
+        ..Default::default()
+    };
+    let plan = import::serialize_bfs(&dataset, "", &opts);
+    import::import_bfs(&lmpg, &plan, &opts).unwrap();
+    assert_eq!(
+        count_label(&lmpg, "Hero"),
+        2,
+        "duplicate merge key must upsert, not create a second record"
+    );
+}
+
+#[test]
+fn merge_reimport_is_idempotent_across_type_coercions() {
+    // Regression: the planner widens an Int64 write to an existing Float64
+    // definition (storing the value's Int64 encoding under the Float64
+    // definition id) and coerces date/datetime strings to DateTime. The merge
+    // matcher must treat the incoming JSON shape and the stored canonical form
+    // as the same key, or re-importing duplicates every such row.
+    let store = Arc::new(Store::new_in_memory());
+    let lmpg = Lmpg::new(store, TenantId::from_ordinal(97));
+    let dataset = json!({
+        "Item": [
+            { "id": "a", "ratio": 12.5, "at": "1977-05-25T00:00:00Z", "tags": ["x", "y"], "note": null },
+            { "id": "b", "ratio": 43, "at": "1999-05-19T00:00:00Z", "tags": [], "note": "n" },
+            { "id": "c", "ratio": 7, "at": "1980-05-21T00:00:00Z", "tags": ["z"], "note": null }
+        ]
+    });
+    let opts = import::ImportOptions {
+        merge_by: Some(vec![]),
+        merge_strategy: Some("append".into()),
+        ..Default::default()
+    };
+    import::import_bfs(&lmpg, &import::serialize_bfs(&dataset, "", &opts), &opts).unwrap();
+    let before = count_label(&lmpg, "Item");
+    import::import_bfs(&lmpg, &import::serialize_bfs(&dataset, "", &opts), &opts).unwrap();
+    assert_eq!(before, 3);
+    assert_eq!(
+        count_label(&lmpg, "Item"),
+        before,
+        "re-import must not duplicate widened/coerced keys"
+    );
+}
+
+#[test]
+fn merge_duplicate_key_spanning_chunks_upserts_once() {
+    // A duplicate of the first key positioned past the batch boundary must
+    // still find the earlier chunk's committed record.
+    let store = Arc::new(Store::new_in_memory());
+    let lmpg = Lmpg::new(store, TenantId::from_ordinal(96));
+    let n = 1025usize;
+    let mut rows: Vec<serde_json::Value> =
+        (0..n).map(|i| json!({ "id": format!("k{i}") })).collect();
+    rows.push(json!({ "id": "k0", "extra": "x" }));
+    let dataset = json!({ "Thing": rows });
+    let opts = import::ImportOptions {
+        merge_by: Some(vec!["id".to_string()]),
+        merge_strategy: Some("append".into()),
+        ..Default::default()
+    };
+    let plan = import::serialize_bfs(&dataset, "", &opts);
+    import::import_bfs(&lmpg, &plan, &opts).unwrap();
+    assert_eq!(
+        count_label(&lmpg, "Thing"),
+        n as u64,
+        "cross-chunk duplicate must upsert, not duplicate"
+    );
+}
+
+/// Presence and occurrence reads the calling thread made since the last call.
+fn presence_and_occurrence_reads() -> u64 {
+    rushdb_storage::read_accounting::take_local()
+        .iter()
+        .filter(|((_, family), _)| family == "presence" || family == "occurrence")
+        .map(|(_, count)| count)
+        .sum()
+}
+
+#[test]
+fn merge_by_an_indexed_key_reads_the_index_not_the_label() {
+    // MERGE-1: without a declared index a merge lookup walks every record of
