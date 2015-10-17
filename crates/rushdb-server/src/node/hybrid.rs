@@ -81,3 +81,87 @@ impl RequestScope<'_> {
             }
         }
         let limit = usize::try_from(query.limit).unwrap_or(usize::MAX).max(1);
+        let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
+        let lmpg = self.lmpg();
+
+        // One predicate resolution shared by both legs. Ordinals come
+        // straight from the cardinality planner, not from reconstructing and
+        // re-decoding records the way a naive composition would.
+        let mut filter_document = serde_json::json!({ "labels": query.labels });
+        if !query.predicate.is_null() {
+            filter_document["where"] = query.predicate.clone();
+        }
+        let parsed =
+            rushdb_query::document::parse_document(&filter_document).map_err(|e| e.to_string())?;
+        let ords =
+            rushdb_query::matching_ordinals(&lmpg, &parsed.search, &|| false, Arc::clone(snap))
+                .map_err(|e| e.to_string())?;
+        let allowed: HashSet<u64> = ords.into_iter().collect();
+
+        // Over-fetch before fusion/truncation so RRF has enough of each
+        // ranking to actually combine rather than just echoing whichever leg
+        // happened to return first. A tunable, not a correctness bound: RRF
+        // itself is well-defined for any k. Sized from `offset + limit`, not
+        // bare `limit`, so a deep page's over-fetch still covers the whole
+        // page instead of only ever gathering enough for page one.
+        let page_end = offset.saturating_add(limit);
+        let default_prefetch = page_end.saturating_mul(4).max(page_end);
+        let prefetch = |limit: Option<u64>| {
+            limit.map_or(default_prefetch, |n| {
+                usize::try_from(n).unwrap_or(usize::MAX)
+            })
+        };
+
+        let mut vector_report = None;
+        let vec_hits: Vec<rushdb_vector::ScoredSource> = match &query.vector {
+            Some(leg) => {
+                if leg.vector.is_empty() {
+                    return Err("hybrid vector leg requires a non-empty vector".to_string());
+                }
+                let label = query.labels.first().cloned().unwrap_or_default();
+                let dims = leg.vector.len();
+                let alias = match leg.index.as_deref() {
+                    Some(index) => index.to_string(),
+                    None if self.require_vector_index_name => {
+                        return Err("hybrid vector leg requires an explicit `index` \
+                             (resources.require-vector-index-name is on)"
+                            .into());
+                    }
+                    None => rushdb_lmpg::import::external_space_alias(
+                        &label,
+                        &leg.property,
+                        &leg.similarity,
+                        dims,
+                    ),
+                };
+                let vectors = self.vector_engine()?;
+                let space = vectors
+                    .lookup_space_in_view(snap, &alias)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "embedding index not found for label `{label}` and property `{}`",
+                            leg.property
+                        )
+                    })?;
+                let candidate = |source: rushdb_vector::SourceRef| {
+                    source.kind == OwnerKind::Record && allowed.contains(&source.owner_ord)
+                };
+                let (hits, report) = self.run_vector_search(
+                    &vectors,
+                    snap,
+                    &space,
+                    &super::vector_mode::VectorSearch {
+                        query: &leg.vector,
+                        k: prefetch(leg.prefetch_limit),
+                        mode: leg.mode,
+                        ef: leg.ef,
+                        min_score: leg.score_threshold,
+                    },
+                    Some(&candidate),
+                )?;
+                vector_report = Some(report);
+                hits
+            }
+            None => Vec::new(),
+        };

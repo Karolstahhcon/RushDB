@@ -14,8 +14,3 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "rushdb.labels" -}}
 {{ include "rushdb.selectorLabels" . }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
-helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
-{{- end -}}
-
-{{- define "rushdb.secretName" -}}
