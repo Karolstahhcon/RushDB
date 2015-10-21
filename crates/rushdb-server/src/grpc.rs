@@ -45,27 +45,3 @@ impl EnvelopeHandler for NodeEnvelopeHandler {
         let tenant = self.node.schedule_key(scope.as_deref());
         let started = std::time::Instant::now();
         let node = Arc::clone(&self.node);
-        let result = self
-            .node
-            .schedule_for_tenant(tenant, move || {
-                let result =
-                    crate::protocol::ProtocolExecutor::new(&node, scope_for_job).execute(envelope);
-                result
-            })
-            .map_err(scheduler_error_to_protocol_error)?;
-        let seconds = started.elapsed().as_secs_f64();
-        // gRPC and Bolt share this handler: observe latency + rows returned.
-        self.node.observe("transport.execute", seconds);
-        if let Ok(resp) = &result {
-            let rows = match &resp.response {
-                rushdb_protocol::Response::Records { records, .. } => records.len() as u64,
-                rushdb_protocol::Response::Rows { rows, .. }
-                | rushdb_protocol::Response::TextHits { rows, .. } => rows.len() as u64,
-                _ => 0,
-            };
-            self.node.observe_rows("transport.execute", rows);
-        }
-        result
-    }
-
-    fn shutdown_requested(&self) -> bool {
