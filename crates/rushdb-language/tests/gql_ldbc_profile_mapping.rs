@@ -44,3 +44,19 @@ fn gql_profile_classifies_and_executes_the_ldbc_corpus() {
     assert_eq!(cases.len(), 29);
 
     let reads = fixture(&mapping);
+    for case in cases {
+        let id = &case["id"];
+        match case["status"].as_str() {
+            Some("typedUnsupported") => {
+                assert!(
+                    case["reason"].as_str().is_some_and(|r| !r.is_empty()),
+                    "{id}"
+                );
+                continue;
+            }
+            Some("accepted") => {}
+            other => panic!("{id}: unknown status {other:?}"),
+        }
+        let statement = case["statement"].as_str().expect("mapped statement");
+        let parameters = case["parameters"].clone();
+        if case["kind"] == "write" {

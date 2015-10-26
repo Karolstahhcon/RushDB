@@ -386,3 +386,391 @@ pub(crate) fn node_of(id: NodeId, record: &Json) -> Result<Option<Node>, Storage
                 key.as_str(),
                 json_to_value_checked(value).map_err(|()| StorageError::CorruptLog)?,
             );
+        }
+    }
+    Ok(Some(node))
+}
+
+impl LmpgGraphStore {
+    fn edge(&self, id: EdgeId) -> Option<Edge> {
+        self.read(|| self.try_edge(id))
+    }
+
+    pub(crate) fn try_edge(&self, id: EdgeId) -> Result<Option<Edge>, StorageError> {
+        let Some(header) = access::relationship_by_ord(&self.view, self.tenant, id.as_u64())?
+        else {
+            return Ok(None);
+        };
+        let raw = reconstruct_relationship(&self.view, self.tenant, id.as_u64())?
+            .ok_or(StorageError::CorruptLog)?;
+        let mut edge = Edge::new(
+            id,
+            NodeId::new(header.source_ord),
+            NodeId::new(header.target_ord),
+            header.rel_type,
+        );
+        if let Some(object) = raw.as_object() {
+            for (key, value) in object {
+                if !rushdb_types::value::is_reserved_name(key) {
+                    edge.set_property(
+                        key.as_str(),
+                        json_to_value_checked(value).map_err(|()| StorageError::CorruptLog)?,
+                    );
+                }
+            }
+        }
+        Ok(Some(edge))
+    }
+
+    fn edge_ids(&self) -> Vec<EdgeId> {
+        self.read(|| self.try_edge_ids())
+    }
+
+    pub(crate) fn try_node_ids(&self) -> Result<Vec<NodeId>, StorageError> {
+        let prefix = rushdb_types::keys::record_hdr_prefix(self.tenant);
+        self.view
+            .range_prefix(&prefix)?
+            .into_iter()
+            .map(|(key, _)| {
+                rushdb_types::keys::parse_record_hdr_key(&key)
+                    .map(NodeId::new)
+                    .ok_or(StorageError::CorruptLog)
+            })
+            .collect()
+    }
+
+    pub(crate) fn try_edge_ids(&self) -> Result<Vec<EdgeId>, StorageError> {
+        Ok(self
+            .ordinals(P_REL_BY_ORD)?
+            .into_iter()
+            .map(EdgeId::new)
+            .collect())
+    }
+
+    fn ordinals(&self, table: &[u8]) -> Result<Vec<u64>, StorageError> {
+        let prefix = key(self.tenant, &[table]);
+        self.view
+            .range_prefix(&prefix)?
+            .into_iter()
+            .map(|(key, _)| {
+                if key.len() != prefix.len() + 9 || key[prefix.len()] != b'/' {
+                    return Err(StorageError::CorruptLog);
+                }
+                let ordinal = key[prefix.len() + 1..]
+                    .try_into()
+                    .map_err(|_| StorageError::CorruptLog)?;
+                Ok(u64::from_be_bytes(ordinal))
+            })
+            .collect()
+    }
+
+    pub(crate) fn property_matches_range(
+        value: &Value,
+        min: Option<&Value>,
+        max: Option<&Value>,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) -> bool {
+        if let Some(minimum) = min {
+            match compare_values(value, minimum) {
+                Some(Ordering::Equal) if !min_inclusive => return false,
+                Some(Ordering::Less) | None => return false,
+                _ => {}
+            }
+        }
+        if let Some(maximum) = max {
+            match compare_values(value, maximum) {
+                Some(Ordering::Equal) if !max_inclusive => return false,
+                Some(Ordering::Greater) | None => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+}
+
+impl GraphStore for LmpgGraphStore {
+    fn get_node(&self, id: NodeId) -> Option<Node> {
+        self.node(id)
+    }
+
+    fn get_edge(&self, id: EdgeId) -> Option<Edge> {
+        self.edge(id)
+    }
+
+    fn get_node_versioned(
+        &self,
+        id: NodeId,
+        _epoch: EpochId,
+        _transaction_id: TransactionId,
+    ) -> Option<Node> {
+        self.node(id)
+    }
+
+    fn get_edge_versioned(
+        &self,
+        id: EdgeId,
+        _epoch: EpochId,
+        _transaction_id: TransactionId,
+    ) -> Option<Edge> {
+        self.edge(id)
+    }
+
+    fn get_node_at_epoch(&self, id: NodeId, _epoch: EpochId) -> Option<Node> {
+        self.node(id)
+    }
+
+    fn get_edge_at_epoch(&self, id: EdgeId, _epoch: EpochId) -> Option<Edge> {
+        self.edge(id)
+    }
+
+    fn get_node_property(&self, id: NodeId, key: &PropertyKey) -> Option<Value> {
+        self.read(|| self.try_node_property(id, key.as_str()))
+    }
+
+    fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value> {
+        self.edge(id)?.get_property(key.as_str()).cloned()
+    }
+
+    fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>> {
+        ids.iter()
+            .map(|id| self.get_node_property(*id, key))
+            .collect()
+    }
+
+    fn get_nodes_properties_batch(&self, ids: &[NodeId]) -> Vec<FxHashMap<PropertyKey, Value>> {
+        ids.iter()
+            .map(|id| {
+                self.node(*id)
+                    .map(|node| {
+                        node.properties
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn get_nodes_properties_selective_batch(
+        &self,
+        ids: &[NodeId],
+        keys: &[PropertyKey],
+    ) -> Vec<FxHashMap<PropertyKey, Value>> {
+        ids.iter()
+            .map(|id| {
+                keys.iter()
+                    .filter_map(|key| {
+                        self.get_node_property(*id, key)
+                            .map(|value| (key.clone(), value))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn get_edges_properties_selective_batch(
+        &self,
+        ids: &[EdgeId],
+        keys: &[PropertyKey],
+    ) -> Vec<FxHashMap<PropertyKey, Value>> {
+        ids.iter()
+            .map(|id| {
+                keys.iter()
+                    .filter_map(|key| {
+                        self.get_edge_property(*id, key)
+                            .map(|value| (key.clone(), value))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
+        self.edges_from(node, direction)
+            .into_iter()
+            .map(|(other, _)| other)
+            .collect()
+    }
+
+    fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
+        self.read(|| {
+            let outgoing = || access::adj_out(&self.view, self.tenant, node.as_u64(), None);
+            let incoming = || access::adj_in(&self.view, self.tenant, node.as_u64(), None);
+            let mut edges = match direction {
+                Direction::Outgoing => outgoing()?,
+                Direction::Incoming => incoming()?,
+                Direction::Both => {
+                    let mut result = outgoing()?;
+                    result.extend(incoming()?);
+                    result
+                }
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .map(|(_, other, edge)| (NodeId::new(other), EdgeId::new(edge)))
+            .collect::<Vec<_>>();
+            edges.sort_unstable();
+            edges.dedup();
+            Ok(edges)
+        })
+    }
+
+    fn out_degree(&self, node: NodeId) -> usize {
+        self.read(|| Ok(access::adj_out(&self.view, self.tenant, node.as_u64(), None)?.len()))
+    }
+
+    fn in_degree(&self, node: NodeId) -> usize {
+        self.read(|| Ok(access::adj_in(&self.view, self.tenant, node.as_u64(), None)?.len()))
+    }
+
+    fn has_backward_adjacency(&self) -> bool {
+        true
+    }
+
+    fn node_ids(&self) -> Vec<NodeId> {
+        self.read(|| self.try_node_ids())
+    }
+
+    fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+        self.read(|| {
+            Ok(access::label_members(&self.view, self.tenant, label)?
+                .into_iter()
+                .map(NodeId::new)
+                .collect())
+        })
+    }
+
+    // Counts come from the on-disk catalogs at the view's snapshot (one
+    // counter row per label / relationship group), never an id walk.
+    fn node_count(&self) -> usize {
+        usize::try_from(self.catalog_totals().0).unwrap_or(usize::MAX)
+    }
+
+    fn nodes_by_label_count(&self, label: &str) -> usize {
+        self.read(|| rushdb_lmpg::derived::label_count(&self.view, self.tenant, label))
+            .try_into()
+            .unwrap_or(usize::MAX)
+    }
+
+    fn edge_count(&self) -> usize {
+        usize::try_from(self.catalog_totals().1).unwrap_or(usize::MAX)
+    }
+
+    fn edge_type(&self, id: EdgeId) -> Option<grafeo_common::types::ArcStr> {
+        self.read(|| {
+            Ok(
+                access::relationship_by_ord(&self.view, self.tenant, id.as_u64())?
+                    .map(|header| header.rel_type.into()),
+            )
+        })
+    }
+
+    fn has_property_index(&self, property: &str) -> bool {
+        self.equality_indexes(property).is_some()
+    }
+
+    fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
+        self.matching_nodes(&[(property, value.clone())])
+    }
+
+    fn find_nodes_by_properties(&self, conditions: &[(&str, Value)]) -> Vec<NodeId> {
+        self.matching_nodes(conditions)
+    }
+
+    fn find_nodes_in_range(
+        &self,
+        property: &str,
+        min: Option<&Value>,
+        max: Option<&Value>,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) -> Vec<NodeId> {
+        let key = PropertyKey::new(property);
+        self.node_ids()
+            .into_iter()
+            .filter(|id| {
+                self.get_node_property(*id, &key).is_some_and(|value| {
+                    Self::property_matches_range(&value, min, max, min_inclusive, max_inclusive)
+                })
+            })
+            .collect()
+    }
+
+    fn node_property_might_match(
+        &self,
+        _property: &PropertyKey,
+        _op: CompareOp,
+        _value: &Value,
+    ) -> bool {
+        true
+    }
+
+    fn edge_property_might_match(
+        &self,
+        _property: &PropertyKey,
+        _op: CompareOp,
+        _value: &Value,
+    ) -> bool {
+        true
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "planner statistics are approximate average degrees"
+    )]
+    fn statistics(&self) -> Arc<Statistics> {
+        let labels = self.read(|| access::label_counts(&self.view, self.tenant));
+        let rels = self.read(|| access::relationship_catalog(&self.view, self.tenant));
+        let total_nodes: u64 = labels.iter().map(|(_, count)| count).sum();
+        let mut statistics = Statistics {
+            total_nodes,
+            total_edges: rels.iter().map(|(_, _, _, count)| count).sum(),
+            ..Statistics::default()
+        };
+        for (label, count) in labels {
+            statistics
+                .labels
+                .insert(label, grafeo_core::statistics::LabelStatistics::new(count));
+        }
+        let mut by_type: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for (rel_type, _, _, count) in rels {
+            *by_type.entry(rel_type).or_default() += count;
+        }
+        for (rel_type, count) in by_type {
+            let degree = if total_nodes == 0 {
+                0.0
+            } else {
+                count as f64 / total_nodes as f64
+            };
+            statistics.edge_types.insert(
+                rel_type,
+                grafeo_core::statistics::EdgeTypeStatistics::new(count, degree, degree),
+            );
+        }
+        Arc::new(statistics)
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "planner statistics are approximate cardinalities, not exact counts"
+    )]
+    fn estimate_label_cardinality(&self, label: &str) -> f64 {
+        self.nodes_by_label_count(label) as f64
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "planner statistics are approximate average degrees, not exact counts"
+    )]
+    fn estimate_avg_degree(&self, edge_type: &str, _outgoing: bool) -> f64 {
+        // Every edge has one source and one target, so the average out- and
+        // in-degree over all nodes are both `edges of type / nodes`.
+        let nodes = self.catalog_totals().0;
+        if nodes == 0 {
+            return 0.0;
+        }
+        let edges: u64 = self
+            .read(|| access::relationship_catalog(&self.view, self.tenant))
