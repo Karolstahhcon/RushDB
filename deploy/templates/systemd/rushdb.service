@@ -1,0 +1,10 @@
+[Unit]
+Description=RushDB database server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rushdb
+Group=rushdb
+EnvironmentFile=/etc/rushdb/rushdb.env
