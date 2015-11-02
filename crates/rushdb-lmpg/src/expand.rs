@@ -502,3 +502,171 @@ pub fn expand_commit(ci: u64, batch: &CommitBatch, txn: &mut Txn) -> Result<(), 
                         rushdb_types::keys::tenant_by_ord_key(tenant),
                         tenant_dir::encode_by_ord(scope, TenantState::Active),
                     );
+                    let after = next.checked_add(1).ok_or_else(|| {
+                        StorageError::ResourceExhausted("tenant ordinals exhausted".into())
+                    })?;
+                    txn.set(seq_key.to_vec(), after.to_be_bytes().to_vec());
+                }
+            }
+            Mutation::DefineIndex { .. }
+            | Mutation::IndexBackfill { .. }
+            | Mutation::DropIndex { .. }
+            | Mutation::IndexDrop { .. }
+            | Mutation::IndexApplied { .. } => crate::index::expand(t, ci, m, txn)?,
+            Mutation::RetireTenant => {
+                use rushdb_storage::tenant_dir::{self, TenantState};
+                let by_ord = rushdb_types::keys::tenant_by_ord_key(t);
+                if let Some(raw) = txn.get(&by_ord)? {
+                    let (scope, _) = tenant_dir::decode_by_ord(&raw)?;
+                    txn.put(
+                        by_ord,
+                        tenant_dir::encode_by_ord(&scope, TenantState::Purged),
+                    );
+                    txn.put(
+                        rushdb_types::keys::tenant_by_scope_key(&scope),
+                        tenant_dir::encode_by_scope(t, TenantState::Purged),
+                    );
+                }
+            }
+            Mutation::PurgeTenantChunk { max_keys } => {
+                // Bounded purge step: erase at most `max_keys` of the smallest
+                // remaining purgeable keys without retaining MVCC history (the
+                // values are intentionally destroyed, and retaining versions
+                // for them is what ballooned storage). The driver loops
+                // commits; `purge_batch_keys` is shared with the driver so the
+                // decision to stop matches what this arm actually deletes.
+                let max_keys = usize::try_from((*max_keys).max(1)).unwrap_or(usize::MAX);
+                for k in purge_batch_keys(txn, t, max_keys)? {
+                    txn.purge(k);
+                }
+            }
+            Mutation::EnsureEmbeddingSpace { alias, info, new } => {
+                if *new {
+                    txn.put(
+                        rushdb_types::keys::emb_alias_key(t, alias),
+                        u64be(info.space_id).to_vec(),
+                    );
+                }
+                txn.put(
+                    rushdb_types::keys::emb_space_key(t, info.space_id),
+                    serde_json::to_vec(info).map_err(ser_err)?,
+                );
+                ensure_counter(txn, t, "space", info.space_id + 1)?;
+            }
+            Mutation::UpsertEmbeddingBinding {
+                binding,
+                vector,
+                expect_live_hash,
+            } => {
+                let bkey = rushdb_types::keys::emb_binding_key(
+                    t,
+                    binding.space_id,
+                    binding.owner_kind,
+                    binding.owner_ord,
+                    binding.pid,
+                    binding.elem,
+                );
+                let previous: Option<rushdb_types::occurrence::EmbeddingBinding> = txn
+                    .get(&bkey)?
+                    .map(|raw| serde_json::from_slice(&raw).map_err(ser_err))
+                    .transpose()?;
+                if let Some(vec) = vector {
+                    // Re-binding allocates a fresh slot; the superseded slot's
+                    // bytes stay readable by pinned views until the GC
+                    // watermark passes this commit, so defer its deletion.
+                    if let Some(old) = &previous {
+                        if old.vector_slot != binding.vector_slot {
+                            txn.put(
+                                emb_reclaim_key(t, ci, binding.space_id, old.vector_slot),
+                                emb_reclaim_value(ci, binding.space_id, old.vector_slot),
+                            );
+                        }
+                    }
+                    txn.put(
+                        emb_vector_key(t, binding.space_id, binding.vector_slot),
+                        vec.iter()
+                            .flat_map(|f| f.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                    );
+                    ensure_counter(
+                        txn,
+                        t,
+                        &format!("vecslot/{}", binding.space_id),
+                        binding.vector_slot + 1,
+                    )?;
+                }
+                let status = if *expect_live_hash {
+                    match lookup_live_hash(txn, t, binding)? {
+                        None => rushdb_types::occurrence::BindingStatus::Retired,
+                        Some(h) if h != binding.source_hash => {
+                            rushdb_types::occurrence::BindingStatus::Stale
+                        }
+                        Some(_) => rushdb_types::occurrence::BindingStatus::Ready,
+                    }
+                } else {
+                    binding.status
+                };
+                let mut to_store = binding.clone();
+                to_store.status = status;
+                txn.put(bkey, serde_json::to_vec(&to_store).map_err(ser_err)?);
+                bump_space_version(txn, t, binding.space_id, ci)?;
+                let ready = rushdb_types::occurrence::BindingStatus::Ready;
+                let was_ready = previous.is_some_and(|old| old.status == ready);
+                adjust_ready_count(txn, t, binding.space_id, was_ready, status == ready)?;
+            }
+        }
+    }
+    crate::index::mark_text_pending(t, ci, &text_owners, txn)?;
+    crate::index::mark_structural_pending(t, ci, &topology, txn)?;
+    Ok(())
+}
+
+/// Record that commit `ci` changed `space`'s bindings. Several
+/// binds in one commit keep the version from before the commit as `prev`.
+fn bump_space_version(
+    txn: &mut Txn<'_>,
+    t: TenantId,
+    space: u64,
+    ci: u64,
+) -> Result<(), StorageError> {
+    let key = rushdb_types::keys::emb_space_version_key(t, space);
+    let current = match txn.get(&key)? {
+        Some(raw) => {
+            rushdb_types::keys::parse_emb_space_version(&raw).ok_or(StorageError::CorruptLog)?
+        }
+        None => (0, 0),
+    };
+    if current.1 != ci {
+        txn.put(
+            key,
+            rushdb_types::keys::emb_space_version_value(current.1, ci),
+        );
+    }
+    Ok(())
+}
+
+/// Keep `space`'s ready-vector count equal to its `Ready` bindings across a
+/// binding write that moves one binding from `was_ready` to `is_ready`.
+fn adjust_ready_count(
+    txn: &mut Txn<'_>,
+    t: TenantId,
+    space: u64,
+    was_ready: bool,
+    is_ready: bool,
+) -> Result<(), StorageError> {
+    let key = rushdb_types::keys::emb_ready_count_key(t, space);
+    let Some(raw) = txn.get(&key)? else {
+        // A space bound before the count existed: count its bindings once.
+        // The scan already sees this commit's write, so no delta applies.
+        let mut ready = 0u64;
+        for (_, value) in txn.range_prefix(&emb_bindings_prefix(t, space))? {
+            let binding: rushdb_types::occurrence::EmbeddingBinding =
+                serde_json::from_slice(&value).map_err(ser_err)?;
+            if binding.status == rushdb_types::occurrence::BindingStatus::Ready {
+                ready += 1;
+            }
+        }
+        txn.put(key, ready.to_be_bytes().to_vec());
+        return Ok(());
+    };
+    if was_ready == is_ready {
