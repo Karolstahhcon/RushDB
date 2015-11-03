@@ -20,14 +20,3 @@ fn jsonl_stream_imports_each_line() {
     let bytes = b"{\"a\":1}\n\n{\"b\":\"x\",\"c\":null}\n";
     let refs = import_jsonl(&lmpg, "Row", &bytes[..]).unwrap();
     assert_eq!(refs.len(), 2);
-
-    let snap = lmpg.store.read_view().unwrap();
-    let r0 = reconstruct_record(&snap, lmpg.tenant, 0).unwrap().unwrap();
-    assert_eq!(r0.get("a"), Some(&json_from_i64(1)));
-    let r1 = reconstruct_record(&snap, lmpg.tenant, 1).unwrap().unwrap();
-    assert_eq!(r1.get("b"), Some(&serde_json::json!("x")));
-    assert_eq!(r1.get("c"), Some(&serde_json::Value::Null));
-}
-
-fn json_from_i64(v: i64) -> serde_json::Value {
-    serde_json::json!(v)
