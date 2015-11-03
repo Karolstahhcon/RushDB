@@ -22,27 +22,3 @@ fn graph(tenant: u64) -> Lmpg {
     )
 }
 
-fn count(graph: &Lmpg, sql: &str) -> i64 {
-    execute_sql(graph, sql).unwrap()[0]["n"].as_i64().unwrap()
-}
-
-#[test]
-fn label_prefix_does_not_leak_other_labels() {
-    let graph = graph(31);
-    for _ in 0..3 {
-        graph
-            .create_record("user", None, vec![("v".into(), FieldChange::Set(json!(1)))])
-            .unwrap();
-    }
-    for _ in 0..5 {
-        graph
-            .create_record(
-                "user_admin",
-                None,
-                vec![("v".into(), FieldChange::Set(json!(2)))],
-            )
-            .unwrap();
-    }
-    assert_eq!(count(&graph, "SELECT COUNT(*) AS n FROM user"), 3);
-    assert_eq!(count(&graph, "SELECT COUNT(*) AS n FROM user_admin"), 5);
-    assert_eq!(
