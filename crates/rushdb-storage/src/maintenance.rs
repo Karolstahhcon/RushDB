@@ -109,3 +109,336 @@ impl Store {
             match backends.split_first() {
                 None => {
                     run();
+                    Ok(())
+                }
+                Some((first, rest)) => {
+                    let mut inner = Ok(());
+                    first.while_writes_paused(&mut || inner = paused(rest, run))?;
+                    inner
+                }
+            }
+        }
+        self.check_health()?;
+        let _guard = self.health.guard(self.publish_lock.lock())?;
+        self.drain_and_publish();
+        let durable_lsn = self.committed_version();
+        self.for_each_backend_parallel(|backend| backend.checkpoint(durable_lsn))?;
+        self.checkpoints.fetch_add(1, Ordering::Relaxed);
+        let mut copy = Some(copy);
+        let mut result = None;
+        paused(&self.all_backends(), &mut || {
+            if let Some(copy) = copy.take() {
+                result = Some(copy(durable_lsn));
+            }
+        })
+        .map_err(StorageError::Durability)?;
+        Ok(result.unwrap_or_else(|| Err("store file copy did not run".into())))
+    }
+
+    /// Drop WAL segments fully covered by the durable materialization at
+    /// `durable_lsn`, additionally clamped to the durable retention cursor
+    ///: outcome-payload retention derives each old commit's
+    /// payload key from the WAL's embedded command, so a segment must not be
+    /// reclaimed before that sweep has consumed it, or the payload key
+    /// becomes unrecoverable. A sealed segment whose last record is at or
+    /// below `min(durable_lsn, retention_cursor)` is both recoverable from
+    /// redb and already retention-consumed, so it can be reclaimed; the
+    /// active segment is always retained.
+    fn truncate_log(&self, durable_lsn: u64) -> Result<(), StorageError> {
+        let cursor = self.retention_cursor()?;
+        let target = durable_lsn.min(cursor);
+        let mut guard = self.health.guard(self.log.lock())?;
+        if let Some(log) = guard.as_mut() {
+            // Make appended-but-unsynced records durable before reclaiming any
+            // segment (`Async` durability relies on this checkpoint fsync).
+            log.sync()
+                .map_err(|error| StorageError::Durability(format!("WAL sync: {error}")))?;
+            log.truncate_before(target.saturating_add(1))
+                .map_err(|error| StorageError::Durability(format!("truncate WAL: {error}")))?;
+        }
+        Ok(())
+    }
+
+    /// The durable watermark up to which outcome-payload retention has
+    /// consumed the WAL. `0` when retention has never run (or this
+    /// store is non-durable), meaning no segment may yet be reclaimed on that
+    /// basis — [`Self::truncate_log`]'s clamp.
+    fn retention_cursor(&self) -> Result<u64, StorageError> {
+        let Some(backend) = self.primary_backend() else {
+            return Ok(0);
+        };
+        let view = backend.read_view()?;
+        match view.read_value(
+            RETENTION_CURSOR_KEY,
+            0,
+            true,
+            ReadLimits::default(),
+            ScanProjection::KeyValue,
+        )? {
+            Some(raw) => wal::decode_last_applied(&raw).map_err(|_| StorageError::CorruptLog),
+            None => Ok(0),
+        }
+    }
+
+    /// Durably advance the retention cursor to `lsn`. Applied directly
+    /// against the primary backend (commit index `0`, like other
+    /// out-of-band maintenance writes) — this is housekeeping, not a logical
+    /// commit, so it never touches admission/publication.
+    fn advance_retention_cursor(&self, lsn: u64) -> Result<(), StorageError> {
+        let Some(backend) = self.primary_backend() else {
+            return Ok(());
+        };
+        backend
+            .apply(
+                &[Op::Set(
+                    RETENTION_CURSOR_KEY.to_vec(),
+                    wal::encode_last_applied(0, lsn),
+                )],
+                0,
+            )
+            .map_err(StorageError::Durability)
+    }
+
+    /// Like [`Store::compact`], but a store with protected read views returns
+    /// `Ok(None)` ("not now") instead of an error, so a background compactor
+    /// can simply retry on the next tick. redb itself refuses to compact while
+    /// any read transaction is live (`TransactionInProgress`); such a refusal
+    /// surfaces as `Err` and is equally retryable by the caller.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if reclamation or compaction fails.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn compact_if_idle(&self) -> Result<Option<u64>, StorageError> {
+        self.check_health()?;
+        let _guard = self.health.guard(self.publish_lock.lock())?;
+        if !self.health.guard(self.read_pins.lock())?.is_empty() {
+            return Ok(None);
+        }
+        self.drain_and_publish();
+        let commit_index = self.committed_version();
+        self.retire_before_locked(commit_index)?;
+        // Compact every shard file concurrently (independent files).
+        self.for_each_backend_parallel(|backend| backend.compact())?;
+        self.compactions.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(commit_index))
+    }
+
+    /// Idle compaction gated by quiescence and a growth ratio. This is what
+    /// the background worker uses; its ticker is the rate limit (a cooldown
+    /// here, stamped when a compaction finished, refused every other tick:
+    /// effective period 2× the interval, measured 2026-10-10). It never
+    /// rewrites the file while commits are flowing (quiescence), and only
+    /// once the file has grown by `growth_percent` since the last
+    /// compaction or at least [`PURGED_KEYS_TO_COMPACT`] keys were purged
+    /// (a tenant purge frees space without growing the file). Returns why it
+    /// deferred, or the commit index it compacted at.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if reclamation or compaction fails.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn compact_if_needed(
+        &self,
+        quiesce: std::time::Duration,
+        growth_percent: u32,
+    ) -> Result<CompactOutcome, StorageError> {
+        self.check_health()?;
+        let now = wal::now_ms();
+        let quiesce_ms = u64::try_from(quiesce.as_millis()).unwrap_or(u64::MAX);
+        let last_commit = self.last_commit_ms.load(Ordering::Relaxed);
+        if last_commit != 0 && now.saturating_sub(last_commit) < quiesce_ms {
+            return Ok(CompactOutcome::CommitsRecent);
+        }
+        let Some(file) = self.storage_file_bytes() else {
+            return Ok(CompactOutcome::NotDurable);
+        };
+        let last_file = self.last_compacted_file_bytes.load(Ordering::Relaxed);
+        let grown = last_file == 0
+            || file.saturating_mul(100) >= last_file.saturating_mul(u64::from(growth_percent));
+        // A purge frees pages without growing the file.
+        let purged = self.purged_since_compaction.load(Ordering::Relaxed) >= PURGED_KEYS_TO_COMPACT;
+        if !grown && !purged {
+            return Ok(CompactOutcome::BelowThreshold);
+        }
+        let deadline = std::time::Instant::now() + COMPACT_BUSY_RETRY;
+        let compacted = loop {
+            let attempt = self.compact_if_idle();
+            let reader_open = match &attempt {
+                Ok(None) => true,
+                Err(StorageError::Durability(error)) => error == crate::backend::COMPACT_BUSY,
+                _ => false,
+            };
+            if reader_open && std::time::Instant::now() < deadline {
+                // Retry with every lock released: waiting under the publish
+                // or database lock would stall the reader we wait for.
+                std::thread::sleep(COMPACT_BUSY_PAUSE);
+                continue;
+            }
+            break attempt?;
+        };
+        match compacted {
+            Some(ci) => {
+                self.purged_since_compaction.store(0, Ordering::Relaxed);
+                self.last_compacted_file_bytes
+                    .store(self.storage_file_bytes().unwrap_or(file), Ordering::Relaxed);
+                Ok(CompactOutcome::Compacted(ci))
+            }
+            None => Ok(CompactOutcome::ReadersPinned),
+        }
+    }
+
+    /// Apparent size of the primary durable file, if this store is
+    /// disk-backed. Operator metric only; not a durability or capacity input.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn storage_file_bytes(&self) -> Option<u64> {
+        let path = self.health.cleanup(self.data_path.lock()).clone()?;
+        std::fs::metadata(path).ok().map(|meta| meta.len())
+    }
+
+    /// Durable byte accounting by key family (see [`StorageStatistics`]).
+    /// Aggregates every shard. Scans the key space once, so callers should
+    /// sample it on a maintenance schedule, not per request.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Durability`] if a shard cannot be read.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn storage_stats(&self) -> Result<StorageStatistics, StorageError> {
+        self.check_health()?;
+        // Every store aggregates its backend(s); the in-memory backend computes
+        // the same accounting from its maps.
+        let mut total = StorageStatistics::default();
+        for backend in self.all_backends() {
+            if self.maintenance_aborted() {
+                return Err(StorageError::Cancelled);
+            }
+            let s = match backend.storage_stats() {
+                Ok(stats) => stats,
+                Err(error) if error == "maintenance cancelled" => {
+                    return Err(StorageError::Cancelled);
+                }
+                Err(error) => return Err(StorageError::Durability(error)),
+            };
+            total.data_keys += s.data_keys;
+            total.data_bytes += s.data_bytes;
+            total.history_keys += s.history_keys;
+            total.history_bytes += s.history_bytes;
+            total.log_keys += s.log_keys;
+            total.log_bytes += s.log_bytes;
+            total.receipt_keys += s.receipt_keys;
+            total.receipt_bytes += s.receipt_bytes;
+        }
+        total.admission_waits = self.admission_waits.load(Ordering::Relaxed);
+        total.admission_wait_ms = self.admission_wait_ms.load(Ordering::Relaxed);
+        total.checkpoints = self.checkpoints.load(Ordering::Relaxed);
+        total.checkpoint_wait_ms = self.checkpoint_wait_ms.load(Ordering::Relaxed);
+        Ok(total)
+    }
+
+    /// Lowest LSN that a byte-target retention policy must retire (via
+    /// [`Self::retire_commit_metadata_before`], which advances the retention
+    /// cursor) so the WAL's own retained bytes can shrink to `max_bytes` once
+    /// [`Self::truncate_log`] next runs. `0` means "nothing to do" (disabled,
+    /// non-durable, or already within budget).
+    ///
+    /// Segment-granular: a whole sealed WAL segment is dropped at a
+    /// time (the log's actual reclamation unit), never a row — the WAL has no
+    /// row-level accounting to scan. The always-open active segment is never
+    /// counted as droppable.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the WAL cannot be read.
+    pub fn log_byte_floor(&self, max_bytes: u64) -> Result<u64, StorageError> {
+        self.check_health()?;
+        if !self.is_durable() || max_bytes == 0 {
+            return Ok(0);
+        }
+        let total = self.retained_log_bytes()?;
+        if total == 0 || total <= max_bytes {
+            return Ok(0);
+        }
+        let excess = total - max_bytes;
+        let guard = self.health.guard(self.log.lock())?;
+        let Some(log) = guard.as_ref() else {
+            return Ok(0);
+        };
+        let segments = log.segments();
+        if segments.len() <= 1 {
+            // Only the active segment exists; nothing sealed to drop.
+            return Ok(0);
+        }
+        let mut removed = 0u64;
+        let mut floor = 0u64;
+        for segment in &segments[..segments.len() - 1] {
+            removed = removed.saturating_add(segment.bytes);
+            floor = segment.last_lsn.saturating_add(1);
+            if removed >= excess {
+                break;
+            }
+        }
+        if removed == 0 {
+            return Ok(0);
+        }
+        Ok(floor)
+    }
+
+    /// Total bytes retained by the segmented WAL: the sum of every
+    /// segment's valid bytes, including the active segment. `0` for a
+    /// non-durable store (no WAL file).
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if a storage lock is poisoned.
+    pub fn retained_log_bytes(&self) -> Result<u64, StorageError> {
+        self.check_health()?;
+        let guard = self.health.guard(self.log.lock())?;
+        Ok(guard
+            .as_ref()
+            .map_or(0, |log| log.segments().iter().map(|s| s.bytes).sum()))
+    }
+
+    /// Retention counters: (commits retired, receipts swept, compactions).
+    pub fn maintenance_counters(&self) -> (u64, u64, u64) {
+        (
+            self.log_rows_pruned.load(Ordering::Relaxed),
+            self.receipts_swept.load(Ordering::Relaxed),
+            self.compactions.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Number of group-commit redb write transactions persisted (one fsync each
+    /// under `Local`). With a linger configured, concurrent commits coalesce
+    /// into fewer transactions.
+    #[must_use]
+    pub fn group_commit_count(&self) -> u64 {
+        self.group_commits.load(Ordering::Relaxed)
+    }
+
+    /// Bounded, resumable retention step: advance the durable retention
+    /// cursor (which clamps WAL truncation at the next checkpoint) by at most
+    /// `max_keys` commits towards `committed - keep_commits`. Per-commit
+    /// response bodies are no longer kept here: they live in retry receipts,
+    /// which expire by time ([`Self::sweep_receipts`]).
+    ///
+    /// No-op for in-memory stores (no WAL). Returns the number of commits
+    /// retired this call; callers loop until it returns 0.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the publisher has failed or the cursor
+    /// cannot be read or written.
+    pub fn retire_commit_metadata(
+        &self,
+        keep_commits: u64,
+        max_keys: usize,
+    ) -> Result<usize, StorageError> {
+        self.check_health()?;
+        let floor = self.committed_version().saturating_sub(keep_commits);
+        self.retire_commit_metadata_before(floor, max_keys)
+    }
+
+    /// [`Self::retire_commit_metadata`] with an explicit floor LSN, so a
+    /// retention policy (`keep_all` / `keep_none` / `N commits`) can drive it.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the publisher has failed or the cursor

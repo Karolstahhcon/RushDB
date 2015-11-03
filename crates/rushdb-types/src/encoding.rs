@@ -99,3 +99,53 @@ pub fn encode_order_preserving(
         },
         Int64 => match s {
             Scalar::Int64(i) => int_encode(*i).to_vec(),
+            _ => return Err(err()),
+        },
+        DateTime => match s {
+            Scalar::DateTime(ms) => int_encode(*ms).to_vec(),
+            _ => return Err(err()),
+        },
+        Float64 => match s {
+            Scalar::Float64(f) if !f.is_nan() => float_encode(*f).to_vec(),
+            _ => return Err(err()),
+        },
+        Utf8 => match s {
+            Scalar::Utf8(st) => {
+                let mut b = st.as_bytes().to_vec();
+                b.push(0x00);
+                b
+            }
+            _ => return Err(err()),
+        },
+    })
+}
+
+/// Decode bytes produced by [`encode_order_preserving`] back into a scalar.
+///
+/// # Errors
+///
+/// Returns [`TypesError::MalformedKey`] if the bytes are not a valid encoding
+/// of `ty` (for example a boolean byte other than `0`/`1`, or a string without
+/// its trailing NUL terminator).
+pub fn decode_order_preserving(
+    ty: crate::model::LogicalType,
+    b: &[u8],
+) -> Result<Scalar, TypesError> {
+    use crate::model::LogicalType::{Boolean, DateTime, Float64, Int64, Utf8};
+    Ok(match ty {
+        Boolean => match b {
+            [0] => Scalar::Boolean(false),
+            [1] => Scalar::Boolean(true),
+            _ => return Err(TypesError::MalformedKey),
+        },
+        Int64 => {
+            let raw: [u8; 8] = b.try_into().map_err(|_| TypesError::MalformedKey)?;
+            Scalar::Int64(int_decode(&raw))
+        }
+        DateTime => {
+            let raw: [u8; 8] = b.try_into().map_err(|_| TypesError::MalformedKey)?;
+            Scalar::DateTime(int_decode(&raw))
+        }
+        Float64 => {
+            let raw: [u8; 8] = b.try_into().map_err(|_| TypesError::MalformedKey)?;
+            let value = float_decode(&raw);
