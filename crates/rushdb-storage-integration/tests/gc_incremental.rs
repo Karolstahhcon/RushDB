@@ -59,3 +59,65 @@ fn bounded_incremental_gc_matches_monolithic() {
             None => break,
         }
     }
+    // Several bounded transactions, not one monolithic sweep.
+    assert!(
+        batches >= 3,
+        "expected multiple bounded batches, got {batches}"
+    );
+    assert_eq!(store.gc_watermark(), watermark);
+
+    // Monolithic store: single gc() at the same watermark.
+    let dir2 = std::env::temp_dir().join(format!(
+        "rushdb-gc-mono-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir2).unwrap();
+    let (store2, _lmpg2) = seed_history(&dir2);
+    let wm2 = store2.committed_version();
+    assert_eq!(wm2, watermark);
+    store2.gc(wm2).unwrap();
+
+    // Both approaches must advance the durable GC watermark identically. The
+    // `gc()` return value (in-memory retained-version count) is a map-derived
+    // metric and is 0 for redb-backed stores after P04 (maps are no longer
+    // maintained); the durable floor is the contract.
+    assert_eq!(store.gc_watermark(), store2.gc_watermark());
+    assert_eq!(store.gc_watermark(), watermark);
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
+#[test]
+fn incremental_gc_watermark_survives_reopen() {
+    let dir = std::env::temp_dir().join(format!(
+        "rushdb-gc-inc-reopen-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let (store, _lmpg) = seed_history(&dir);
+        let watermark = store.committed_version();
+        let mut cursor: Option<Vec<u8>> = None;
+        while let Some(k) = store.retire_before_batch(watermark, cursor, 8).unwrap() {
+            cursor = Some(k);
+        }
+        assert_eq!(store.gc_watermark(), watermark);
+    }
+    let reopened = Store::open(&dir.join("rushdb.redb")).unwrap();
+    assert_eq!(
+        reopened.gc_watermark(),
+        reopened.committed_version(),
+        "incremental GC watermark must be durable"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
