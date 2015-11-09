@@ -326,3 +326,167 @@ fn staged_transaction_writes_never_leak_tenant_boundary() {
     };
     rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-a".to_string()))
         .execute(stage)
+        .unwrap();
+
+    // Pre-commit: staged writes are invisible to tenant-a, and tenant-b sees
+    // nothing of tenant-a at all.
+    assert!(!find_text(&node, "tenant-a").contains(&serde_json::json!("staged-a")));
+    assert!(find_text(&node, "tenant-b").is_empty());
+}
+
+#[test]
+fn build_info_is_global_metadata_with_no_tenant_data() {
+    let node = multitenant();
+    put(&node, "tenant-a", "NOTE", "a-secret");
+    let envelope = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("describe".into()),
+        context: RequestContext {
+            scope: Some("tenant-a".to_string()),
+            deadline_ms: None,
+            ..Default::default()
+        },
+        operation: Operation::Describe {
+            describe: Describe::BuildInfo,
+        },
+    };
+    let res = rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-a".to_string()))
+        .execute(envelope)
+        .unwrap();
+    let Response::BuildInfo { build } = res.response else {
+        panic!("expected build info");
+    };
+    let serialized = serde_json::to_string(&build).unwrap();
+    assert!(!serialized.contains("a-secret"));
+    assert!(!serialized.contains("tenant-a"));
+}
+
+/// Tenancy Phase 1 (`AuthorizedView`): a tenant's `DataAccessPolicy` label
+/// grant is enforced on direct-fetch-by-id — through `record_value_in_view`,
+/// the same consolidated check `search` already applied — and a second
+/// tenant with no policy of its own is unaffected by tenant A's. Every write
+/// that touches an owner (create, retype, and plain field updates alike)
+/// already rejects a disallowed label at commit time
+/// (`Lmpg::authorize_label_in_txn`), so a revoked label cannot be written to
+/// again either; this test is the read-side half of that same guarantee.
+#[test]
+fn data_access_policy_label_denial_is_scoped_per_tenant() {
+    let node = multitenant();
+
+    // Created while tenant-a has no policy yet (boundary-only).
+    let a_created = put_mode(
+        &node,
+        "tenant-a",
+        PutMode::Create,
+        None,
+        Some("SECRET"),
+        serde_json::json!({ "value": "classified" }),
+    )
+    .unwrap();
+    let a_id = a_created["id"].as_str().unwrap().to_string();
+
+    // tenant-a now narrows its policy to a different label, revoking SECRET.
+    RequestScope::new(&node, Some("tenant-a".to_string()))
+        .security_put_policy(
+            &DataAccessPolicy {
+                allowed_labels: vec!["NOTE".into()],
+                ..Default::default()
+            },
+            AuthorizationMode::PolicyEnforced,
+        )
+        .unwrap();
+
+    // A direct fetch by id is denied once the label is revoked.
+    let fetch_denied =
+        rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-a".to_string()))
+            .execute(RequestEnvelope {
+                protocol_version: 1,
+                request_id: Some("fetch-revoked".into()),
+                context: RequestContext {
+                    scope: Some("tenant-a".into()),
+                    deadline_ms: None,
+                    ..Default::default()
+                },
+                operation: Operation::Query {
+                    query: Query::Record { id: a_id.clone() },
+                },
+            })
+            .expect_err("a revoked label must not be fetchable by id");
+    assert_eq!(fetch_denied.code, ErrorCode::Unauthorized);
+    assert!(fetch_denied.message.contains("denied by policy"));
+
+    // Writes to the now-denied record are rejected too (defense in depth,
+    // not this bucket's own mechanism) — the write never reaches the
+    // read-side check at all.
+    put_mode(
+        &node,
+        "tenant-a",
+        PutMode::Replace,
+        Some(&a_id),
+        None,
+        serde_json::json!({ "value": "still-classified" }),
+    )
+    .expect_err("a revoked label must not accept further writes either");
+
+    // tenant-b has no policy at all (boundary-only). The identical label
+    // remains fully fetchable on its own — tenant-a's policy must not leak
+    // into, or restrict, a different tenant.
+    let b_created = put_mode(
+        &node,
+        "tenant-b",
+        PutMode::Create,
+        None,
+        Some("SECRET"),
+        serde_json::json!({ "value": "classified" }),
+    )
+    .unwrap();
+    let b_id = b_created["id"].as_str().unwrap().to_string();
+    let b_fetched =
+        rushdb_server::protocol::ProtocolExecutor::new(&node, Some("tenant-b".to_string()))
+            .execute(RequestEnvelope {
+                protocol_version: 1,
+                request_id: Some("fetch-b".into()),
+                context: RequestContext {
+                    scope: Some("tenant-b".into()),
+                    deadline_ms: None,
+                    ..Default::default()
+                },
+                operation: Operation::Query {
+                    query: Query::Record { id: b_id },
+                },
+            })
+            .unwrap();
+    let Response::Record { record } = b_fetched.response else {
+        panic!("expected record response");
+    };
+    assert_eq!(record["properties"]["value"], "classified");
+}
+
+/// Tenancy Phase 1 (`AuthorizedView`): a tenant's property mask is applied
+/// on the mutation-response path (previously unmasked for merge/replace/
+/// retype), and is scoped to the tenant that configured it.
+#[test]
+fn data_access_policy_property_mask_is_scoped_per_tenant() {
+    let node = multitenant();
+    RequestScope::new(&node, Some("tenant-a".to_string()))
+        .security_put_policy(
+            &DataAccessPolicy {
+                allowed_labels: vec!["NOTE".into()],
+                visible_properties: std::collections::BTreeMap::from([(
+                    "NOTE".into(),
+                    vec!["title".into()],
+                )]),
+                ..Default::default()
+            },
+            AuthorizationMode::PolicyEnforced,
+        )
+        .unwrap();
+
+    let a_created = put_mode(
+        &node,
+        "tenant-a",
+        PutMode::Create,
+        None,
+        Some("NOTE"),
+        serde_json::json!({ "title": "visible", "secretField": "hidden" }),
+    )
