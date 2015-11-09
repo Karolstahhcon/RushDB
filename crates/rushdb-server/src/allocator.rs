@@ -1,0 +1,67 @@
+//! Process-wide allocator policy.
+//!
+//! The default system allocator (glibc malloc) retains freed bulk-load memory
+//! in per-thread arenas with no decay, so resident set size stays at its
+//! high-water mark long after peak allocations are freed. With the `jemalloc`
+//! feature (on by default), the server instead uses jemalloc with background
+//! purge threads and jemalloc's default dirty/muzzy decay: steady-state
+//! allocation stays fast, while idle pages are returned to the OS.
+//!
+//! This module also exposes allocator introspection for `/metrics` so the
+//! managed-budget gauges (`rushdb_budget_*`, which track reservation tokens,
+//! not bytes actually mapped) are complemented by real resident numbers.
+
+#[cfg(all(feature = "jemalloc", not(feature = "alloc-accounting")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Measurement builds only (`alloc-accounting`): jemalloc wrapped with a
+/// cumulative allocated-bytes counter, so benchmarks can report allocation
+/// *churn* per record. `stats.allocated` is a live-bytes gauge, so its delta
+/// cannot measure churn. Off by default; release builds are unchanged.
+#[cfg(feature = "alloc-accounting")]
+#[global_allocator]
+static GLOBAL: accounting::Counting = accounting::Counting;
+
+#[cfg(feature = "alloc-accounting")]
+mod accounting {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    const SHARDS: usize = 64;
+
+    /// One cache line per shard so threads never contend on a counter.
+    #[repr(align(64))]
+    pub(super) struct Shard(pub(super) AtomicU64);
+
+    pub(super) static TOTALS: [Shard; SHARDS] = [const { Shard(AtomicU64::new(0)) }; SHARDS];
+    static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    pub(super) struct Counting;
+
+    fn count(bytes: usize) {
+        let slot = SLOT
+            .try_with(|slot| {
+                if slot.get() == usize::MAX {
+                    slot.set(NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % SHARDS);
+                }
+                slot.get()
+            })
+            .unwrap_or(0);
+        TOTALS[slot]
+            .0
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    pub(super) fn total() -> u64 {
+        TOTALS
+            .iter()
+            .map(|shard| shard.0.load(Ordering::Relaxed))
+            .fold(0, u64::saturating_add)
+    }
+
