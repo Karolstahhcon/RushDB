@@ -1,0 +1,22 @@
+{
+ "profileId": "rushdb-gql-property-graph-v1",
+ "language": "ISO/IEC 39075 GQL",
+ "status": "release_candidate",
+ "scope": "Property-graph statements accepted by the Grafeo frontend and committed through RushDB's tenant-scoped LMPG mutation boundary.",
+ "acceptedFeatures": [
+  "match",
+  "filter",
+  "projection",
+  "parameters",
+  "optionalMatch",
+  "aggregation",
+  "unwind",
+  "order",
+  "pagination",
+  "createNode",
+  "updateProperties",
+  "deleteNode",
+  "createRelationship",
+  "deleteRelationship",
+  "atomicStatementCommit"
+ ],
