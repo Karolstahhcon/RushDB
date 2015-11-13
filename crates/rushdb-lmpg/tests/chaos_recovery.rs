@@ -72,3 +72,77 @@ fn scrub_repair_removes_bounded_orphan_occurrences() {
             key: orphan.clone(),
             value: rushdb_types::occurrence::encode_occ_value(
                 false,
+                rushdb_types::occurrence::OccurrenceValue::ExplicitNull,
+                None,
+            ),
+        },
+    )
+    .unwrap();
+    let before = store.read_view().unwrap();
+    let report = rushdb_lmpg::scrub::scrub_report(&before, tenant).unwrap();
+    assert_eq!(report.occurrence_rows, 1, "{report:?}");
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.what == "occurrence_orphaned"));
+    let plan = rushdb_lmpg::scrub::plan_orphan_occurrences(&before, tenant, 1).unwrap();
+    assert_eq!(plan.keys, vec![orphan]);
+    assert!(plan.complete);
+    drop(before);
+    assert_eq!(
+        rushdb_lmpg::scrub::repair_orphan_occurrences(&store, tenant, 1).unwrap(),
+        1
+    );
+    let after = store.read_view().unwrap();
+    let report = rushdb_lmpg::scrub::scrub_report(&after, tenant).unwrap();
+    // Repair removes the base row; apply-time derivation removes the
+    // presence and counters it produced, so nothing is left to flag.
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+}
+
+#[test]
+fn crash_at_every_commit_boundary_converges() {
+    let primary = Arc::new(Store::new_in_memory());
+    let tenant = TenantId::from_ordinal(9);
+
+    {
+        let eng = Lmpg::new(Arc::clone(&primary), tenant);
+        import_document(
+            &eng,
+            "City",
+            &serde_json::json!({"city":"Rome","pop":4_000_000}),
+        )
+        .unwrap();
+        let a = eng
+            .create_record(
+                "X",
+                None,
+                vec![("k".into(), FieldChange::Set(serde_json::json!("v")))],
+            )
+            .unwrap();
+        let b = eng.create_record("Y", None, vec![]).unwrap();
+        eng.create_relationship(
+            "L",
+            a,
+            b,
+            vec![("m".into(), FieldChange::Set(serde_json::json!(1)))],
+        )
+        .unwrap();
+        eng.update_fields(
+            a,
+            vec![("k".into(), FieldChange::Set(serde_json::json!("w")))],
+        )
+        .unwrap();
+        eng.delete_record(b).unwrap();
+    }
+
+    let full_log = primary.take_log_for_crash();
+    assert!(full_log.len() >= 5, "scenario produced too few commits");
+
+    // every prefix is a clean checkpoint; replay twice and compare.
+    for cut in 0..=full_log.len() {
+        let prefix = &full_log[..cut];
+
+        let rec_store = Arc::new(Store::new_in_memory());
+        drop(Lmpg::new(Arc::clone(&rec_store), tenant));
+        rec_store.try_replay(prefix).unwrap();
