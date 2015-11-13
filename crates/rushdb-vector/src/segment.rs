@@ -978,3 +978,493 @@ impl SegmentSet {
     /// Returns `false` (and changes nothing) when a segment is gone.
     pub(crate) fn replace_merged(&self, ids: &[u64], merged: Option<Segment>) -> bool {
         let current = self.state.load_full();
+        if !ids.iter().all(|id| current.ids.contains(id)) {
+            return false;
+        }
+        let merged_id = self.alloc_segment_id();
+        let mut state = (*current).clone();
+        for (index, entry) in merged.iter().flat_map(Segment::entries).enumerate() {
+            let key = source_key(entry.source);
+            if state.live.get(&key).is_some_and(|(id, _)| ids.contains(id)) {
+                state.set_live(key, merged_id, index);
+            }
+        }
+        let mut segments = Vec::with_capacity(current.segments.len());
+        let mut new_ids = Vec::with_capacity(current.ids.len());
+        // `None`: every entry was dead, the segments simply go.
+        let mut merged = merged.map(Arc::new);
+        for (segment, id) in current.segments.iter().zip(current.ids.iter()) {
+            if ids.contains(id) {
+                if let Some(merged) = merged.take() {
+                    segments.push(merged);
+                    new_ids.push(merged_id);
+                }
+                continue;
+            }
+            segments.push(Arc::clone(segment));
+            new_ids.push(*id);
+        }
+        for id in ids {
+            state.live_counts.remove(id);
+        }
+        state.segments = Arc::new(segments);
+        state.ids = Arc::new(new_ids);
+        self.state.store(Arc::new(state));
+        true
+    }
+
+    /// Reconcile reopened segments with the space's current bindings
+    ///: `current` maps each source to its bound `(slot, value
+    /// hash)`. An entry stays live only if it is its source's newest entry
+    /// and matches the binding; segments left without a live entry are
+    /// dropped and their files superseded. Returns the bindings no segment
+    /// covers, which the caller decodes.
+    pub(crate) fn reconcile(&self, current: &[SegmentEntry]) -> Vec<SegmentEntry> {
+        let wanted: std::collections::HashMap<SourceKey, (u64, u64)> = current
+            .iter()
+            .map(|entry| (source_key(entry.source), (entry.slot, entry.value_hash)))
+            .collect();
+        let mut state = (**self.state.load()).clone();
+        let outdated: Vec<SourceKey> = state
+            .live
+            .iter()
+            .filter(|(key, (id, index))| {
+                let entry = state
+                    .ids
+                    .iter()
+                    .position(|candidate| candidate == id)
+                    .and_then(|at| state.segments[at].entries().get(*index));
+                entry.is_none_or(|entry| wanted.get(*key) != Some(&(entry.slot, entry.value_hash)))
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &outdated {
+            state.remove_live(key);
+        }
+        let mut segments = Vec::with_capacity(state.segments.len());
+        let mut ids = Vec::with_capacity(state.ids.len());
+        for (segment, id) in state.segments.iter().zip(state.ids.iter()) {
+            if state.live_counts.get(id).copied().unwrap_or(0) == 0 {
+                if let Segment::Frozen(frozen) = segment.as_ref() {
+                    frozen.supersede();
+                }
+                state.live_counts.remove(id);
+                continue;
+            }
+            segments.push(Arc::clone(segment));
+            ids.push(*id);
+        }
+        state.segments = Arc::new(segments);
+        state.ids = Arc::new(ids);
+        let missing = current
+            .iter()
+            .filter(|entry| !state.live.contains_key(&source_key(entry.source)))
+            .cloned()
+            .collect();
+        self.state.store(Arc::new(state));
+        missing
+    }
+
+    /// Supersede every segment of this set that `kept` no longer holds:
+    /// the publisher of a merge (or the discarder of a lost one) releases
+    /// exactly the files nobody newer uses.
+    pub(crate) fn supersede_absent_from(&self, kept: &SegmentSet) {
+        let kept = kept.state.load();
+        for segment in self.state.load().segments.iter() {
+            if let Segment::Frozen(frozen) = segment.as_ref() {
+                if !kept
+                    .segments
+                    .iter()
+                    .any(|other| Arc::ptr_eq(other, segment))
+                {
+                    frozen.supersede();
+                }
+            }
+        }
+    }
+
+    /// Frozen segment count.
+    pub(crate) fn frozen_count(&self) -> usize {
+        self.state
+            .load()
+            .segments
+            .iter()
+            .filter(|segment| matches!(segment.as_ref(), Segment::Frozen(_)))
+            .count()
+    }
+
+    /// Mark every persisted segment's file for deletion when its last holder
+    /// drops (the whole set was replaced by a rebuild).
+    pub(crate) fn supersede_all(&self) {
+        for segment in self.state.load().segments.iter() {
+            if let Segment::Frozen(frozen) = segment.as_ref() {
+                frozen.supersede();
+            }
+        }
+    }
+
+    /// Per-segment gather, then a **global** merge across every segment
+    /// (never a per-segment top-k concatenated). A gathered entry counts only
+    /// if it is its source's live entry, so a superseded or retired vector
+    /// can never surface, and reranking always uses the current one.
+    ///
+    /// Returns the deduped, filtered candidate count alongside the reranked
+    /// top-`k` — the caller's degradation contract (fall back to an exact
+    /// scan when ANN confidence is too low) is defined over that pre-rerank
+    /// count, not the post-truncate result length.
+    ///
+    /// # Errors
+    /// Propagates whatever `rerank` returns for a resolved candidate.
+    pub(crate) fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        similarity: Similarity,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+        rerank: impl Fn(&SegmentEntry) -> Result<ScoredSource, VectorError>,
+    ) -> Result<(usize, Vec<ScoredSource>), VectorError> {
+        let state = self.state.load_full();
+        if state.segments.is_empty() || k == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let gather_k = ef.max(k);
+        // Phase timings, emitted only when the
+        // `rushdb_vector::search` debug target is enabled.
+        let profile = tracing::enabled!(target: "rushdb_vector::search", tracing::Level::DEBUG);
+        let mut profile_gather = [(0usize, 0usize, std::time::Duration::ZERO); 2];
+        let mut resolved: Vec<&SegmentEntry> = Vec::new();
+        for (segment, id) in state.segments.iter().zip(state.ids.iter()) {
+            let started = profile.then(std::time::Instant::now);
+            let gathered = segment.gather(query, gather_k, gather_k, similarity);
+            if let Some(started) = started {
+                let kind = usize::from(matches!(**segment, Segment::Frozen(_)));
+                profile_gather[kind].0 += 1;
+                profile_gather[kind].1 += segment.entries().len();
+                profile_gather[kind].2 += started.elapsed();
+            }
+            for index in gathered {
+                let Some(entry) = segment.entries().get(index) else {
+                    continue;
+                };
+                if state.live.get(&source_key(entry.source)) != Some(&(*id, index)) {
+                    continue;
+                }
+                if candidate.is_none_or(|filter| filter(entry.source)) {
+                    resolved.push(entry);
+                }
+            }
+        }
+        let candidate_count = resolved.len();
+        let rerank_started = profile.then(std::time::Instant::now);
+        let mut out: Vec<ScoredSource> = resolved
+            .into_iter()
+            .map(&rerank)
+            .collect::<Result<_, _>>()?;
+        if let Some(started) = rerank_started {
+            let [hot, frozen] = profile_gather;
+            tracing::debug!(
+                target: "rushdb_vector::search",
+                hot_segments = hot.0,
+                hot_entries = hot.1,
+                hot_gather_us = hot.2.as_micros(),
+                frozen_segments = frozen.0,
+                frozen_entries = frozen.1,
+                frozen_gather_us = frozen.2.as_micros(),
+                reranked = candidate_count,
+                rerank_us = started.elapsed().as_micros(),
+                "segment search"
+            );
+        }
+        // Deterministic order: score descending, then the canonical source
+        // key.
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| source_key(a.source).cmp(&source_key(b.source)))
+        });
+        out.truncate(k);
+        Ok((candidate_count, out))
+    }
+}
+
+impl Default for SegmentSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok(vectors: &[Vec<f32>]) -> impl Iterator<Item = Result<&Vec<f32>, VectorError>> {
+        vectors.iter().map(Ok)
+    }
+
+    impl FrozenSegment {
+        fn entries_for_test(&self) -> &[SegmentEntry] {
+            &self.entries
+        }
+    }
+    use rushdb_types::ids::OwnerKind;
+
+    /// Two well-separated clusters, matching `ann_recall.rs`'s fixture shape,
+    /// so an exact top-k is unambiguous.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test fixture jitter is derived from a small grid index and only needs approximate f32 resolution"
+    )]
+    fn clustered(n: u64) -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|i| {
+                let jitter = ((i * 37) % 100) as f32 / 100.0 - 0.5;
+                if i % 2 == 0 {
+                    vec![0.9 + jitter * 0.05, 0.1 + jitter * 0.05]
+                } else {
+                    vec![0.1 + jitter * 0.05, 0.9 + jitter * 0.05]
+                }
+            })
+            .collect()
+    }
+
+    fn source_for(ord: u64) -> SourceRef {
+        SourceRef {
+            kind: OwnerKind::Record,
+            owner_ord: ord,
+            pid: 1,
+            elem: 0,
+        }
+    }
+
+    fn value_hash_of(vector: &[f32]) -> u64 {
+        let mut hash = blake3::Hasher::new();
+        for v in vector {
+            hash.update(&v.to_le_bytes());
+        }
+        let digest = hash.finalize();
+        u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap())
+    }
+
+    fn entries_for(
+        vectors: &[Vec<f32>],
+        slot_offset: u64,
+        source_offset: u64,
+    ) -> Vec<SegmentEntry> {
+        vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| SegmentEntry {
+                slot: slot_offset + i as u64,
+                source: source_for(source_offset + i as u64),
+                value_hash: value_hash_of(v),
+            })
+            .collect()
+    }
+
+    /// Canonical-vector lookup by slot, standing in for the store read a
+    /// production rerank closure would do (`emb_vector_key` + decode).
+    struct CanonicalStore(HashMap<u64, Vec<f32>>);
+
+    impl CanonicalStore {
+        fn new() -> Self {
+            CanonicalStore(HashMap::new())
+        }
+
+        fn insert_all(&mut self, entries: &[SegmentEntry], vectors: &[Vec<f32>]) {
+            for (entry, vector) in entries.iter().zip(vectors) {
+                self.0.insert(entry.slot, vector.clone());
+            }
+        }
+
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "matches SegmentSet::search's rerank callback signature, which must return Result for real production rerank closures that read the canonical store"
+        )]
+        fn rerank(
+            &self,
+            query: &[f32],
+            similarity: Similarity,
+            entry: &SegmentEntry,
+        ) -> Result<ScoredSource, VectorError> {
+            let vector = self
+                .0
+                .get(&entry.slot)
+                .expect("canonical vector for slot (test store is populated for every entry)");
+            Ok(ScoredSource {
+                source: entry.source,
+                score: crate::score(query, vector, similarity),
+                value_hash: entry.value_hash,
+            })
+        }
+    }
+
+    fn exact_top_k(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(f32, usize)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (crate::score(query, v, Similarity::Cosine), i))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(k).map(|(_, i)| i).collect()
+    }
+
+    #[test]
+    fn single_frozen_segment_matches_exact_oracle() {
+        // The 1-segment case must behave like today's single-generation path
+        // (no behavior change) — recall parity against the exact oracle,
+        // same discipline `ann_recall.rs` applies to `HnswProvider`.
+        let dir = tempfile::tempdir().unwrap();
+        let vectors = clustered(64);
+        let entries = entries_for(&vectors, 0, 0);
+        let mut store = CanonicalStore::new();
+        store.insert_all(&entries, &vectors);
+
+        let frozen = FrozenSegment::build(
+            entries,
+            ok(&vectors),
+            2,
+            Similarity::Cosine,
+            &dir.path().join("seg0"),
+        )
+        .unwrap();
+        let set = SegmentSet::new();
+        set.push(Arc::new(Segment::Frozen(frozen)));
+
+        let query = [0.92_f32, 0.08];
+        let exact = exact_top_k(&vectors, &query, 8);
+        let (_, approx) = set
+            .search(&query, 8, 24, Similarity::Cosine, None, |entry| {
+                store.rerank(&query, Similarity::Cosine, entry)
+            })
+            .unwrap();
+        assert_eq!(approx.len(), 8);
+        let overlap = exact
+            .iter()
+            .filter(|&&i| approx.iter().any(|a| a.source.owner_ord == i as u64))
+            .count();
+        assert!(overlap >= 7, "recall too low: {overlap}/8");
+        assert_eq!(approx[0].source.owner_ord, exact[0] as u64);
+    }
+
+    #[test]
+    fn concurrent_searches_with_different_ef_do_not_interfere() {
+        // C9 (cloud-capacity F11): `ef` used to be applied by mutating the
+        // shared index's expansion per query — a race between concurrent
+        // queries. A query's result must depend only on its own (query, k,
+        // ef), never on what other threads search concurrently: every
+        // concurrent result must equal the same search run alone.
+        let dir = tempfile::tempdir().unwrap();
+        let vectors = clustered(64);
+        let entries = entries_for(&vectors, 0, 0);
+        let mut store = CanonicalStore::new();
+        store.insert_all(&entries, &vectors);
+        let frozen = FrozenSegment::build(
+            entries,
+            ok(&vectors),
+            2,
+            Similarity::Cosine,
+            &dir.path().join("seg0"),
+        )
+        .unwrap();
+        let set = Arc::new(SegmentSet::new());
+        set.push(Arc::new(Segment::Frozen(frozen)));
+        let store = Arc::new(store);
+        let search = |set: &SegmentSet, store: &CanonicalStore, worker: u8, ef: usize| {
+            let query = [0.92_f32, 0.08 + f32::from(worker) * 0.01];
+            let (_, hits) = set
+                .search(&query, 4, ef, Similarity::Cosine, None, |entry| {
+                    store.rerank(&query, Similarity::Cosine, entry)
+                })
+                .unwrap();
+            hits.iter()
+                .map(|hit| hit.source.owner_ord)
+                .collect::<Vec<_>>()
+        };
+        let expected: Vec<(Vec<u64>, Vec<u64>)> = (0..8u8)
+            .map(|worker| {
+                (
+                    search(&set, &store, worker, 4),
+                    search(&set, &store, worker, 64),
+                )
+            })
+            .collect();
+        let expected = Arc::new(expected);
+        let workers: Vec<_> = (0..8u8)
+            .map(|worker| {
+                let (set, store, expected) =
+                    (Arc::clone(&set), Arc::clone(&store), Arc::clone(&expected));
+                std::thread::spawn(move || {
+                    for round in 0..50u8 {
+                        let (narrow, wide) = &expected[usize::from(worker)];
+                        if (worker + round) % 2 == 0 {
+                            assert_eq!(&search(&set, &store, worker, 4), narrow);
+                        } else {
+                            assert_eq!(&search(&set, &store, worker, 64), wide);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn derived_segment_sets_keep_allocating_fresh_segment_ids() {
+        // C9: a set derived from another (every incremental absorb) must
+        // continue its id sequence; restarting at 0 made each freeze
+        // overwrite the same `seg-0` file.
+        let set = SegmentSet::new();
+        for _ in 0..3 {
+            set.alloc_segment_id();
+        }
+        let derived = set.fork();
+        assert_eq!(derived.alloc_segment_id(), 3);
+        assert_eq!(derived.alloc_segment_id(), 4);
+        // The fork is independent of the original.
+        assert_eq!(set.peek_segment_id(), 3);
+    }
+
+    #[test]
+    fn in_memory_frozen_segment_matches_exact_oracle_with_no_disk_io() {
+        // The in-memory store's shape: no path, no filesystem
+        // interaction at all — the provider graph is resident only.
+        let vectors = clustered(64);
+        let entries = entries_for(&vectors, 0, 0);
+        let mut store = CanonicalStore::new();
+        store.insert_all(&entries, &vectors);
+
+        let frozen =
+            FrozenSegment::build_in_memory(entries, ok(&vectors), 2, Similarity::Cosine).unwrap();
+        assert_eq!(frozen.manifest().entries, 64);
+        let set = SegmentSet::new();
+        set.push(Arc::new(Segment::Frozen(frozen)));
+
+        let query = [0.92_f32, 0.08];
+        let exact = exact_top_k(&vectors, &query, 8);
+        let (_, approx) = set
+            .search(&query, 8, 24, Similarity::Cosine, None, |entry| {
+                store.rerank(&query, Similarity::Cosine, entry)
+            })
+            .unwrap();
+        let overlap = exact
+            .iter()
+            .filter(|&&i| approx.iter().any(|a| a.source.owner_ord == i as u64))
+            .count();
+        assert!(overlap >= 7, "recall too low: {overlap}/8");
+    }
+
+    #[test]
+    fn hot_plus_frozen_segments_merge_globally_against_full_corpus() {
+        // Split one corpus across a frozen and a hot segment; recall must
+        // hold against the oracle over the FULL corpus, not per segment —
+        // this is exactly the "global merge, not per-segment concat" fix
+        // the blueprint requires (rev. 1's rejected `flat_map().collect()`).
+        let dir = tempfile::tempdir().unwrap();
+        let vectors = clustered(64);
+        let (frozen_vectors, hot_vectors) = vectors.split_at(32);
+        let frozen_entries = entries_for(frozen_vectors, 0, 0);
+        let hot_entries = entries_for(hot_vectors, 32, 32);
