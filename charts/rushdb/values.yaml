@@ -14,20 +14,3 @@ auth:
 # Server options. `languages` empty keeps the engine's default set
 # (sql, gremlin, sql-pgq, mongodb); listing languages replaces it.
 server:
-  languages: []
-  # Multitenant mode serves HTTP only: set pgwirePort to 0 with it.
-  multitenant: false
-  # Ports inside the pod. 0 turns gRPC and Bolt off; Bolt needs `cypher`.
-  httpPort: 3000
-  pgwirePort: 5432
-  grpcPort: 0
-  boltPort: 0
-  # Extra `rushdb serve` flags, e.g. ['--request-timeout-ms', '30000'].
-  extraArgs: []
-  # Extra environment variables for the container.
-  extraEnv: []
-
-persistence:
-  size: 10Gi
-  storageClass: ''
-  accessMode: ReadWriteOnce
