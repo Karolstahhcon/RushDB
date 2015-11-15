@@ -125,3 +125,67 @@ fn item10_stale_exclusion_after_source_update() {
         kind: OwnerKind::Record,
         owner_ord: rec.ordinal,
         pid: pid_of(&lmpg, OwnerKind::Record, "text"),
+        elem: 0,
+    };
+    vecs.bind("doc-space", src, &[1.0, 0.0, 0.0]).unwrap();
+    assert_eq!(
+        vecs.search_exact("doc-space", &[1.0, 0.0, 0.0], 5, None)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    lmpg.update_fields(
+        rec,
+        vec![("text".into(), FieldChange::Set(json!("changed value")))],
+    )
+    .unwrap();
+
+    // Bounded read without revalidation still observes lagged Ready state.
+    assert_eq!(
+        vecs.search_exact("doc-space", &[1.0, 0.0, 0.0], 5, None)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let (stale, retired) = vecs.revalidate_bindings("doc-space").unwrap();
+    assert_eq!((stale, retired), (1, 0));
+    assert!(
+        vecs.search_exact("doc-space", &[1.0, 0.0, 0.0], 5, None)
+            .unwrap()
+            .is_empty(),
+        "stale binding must be ineligible"
+    );
+    let space_id = vecs
+        .lookup_space_by_alias("doc-space")
+        .unwrap()
+        .unwrap()
+        .space_id;
+    assert_eq!(
+        vecs.bindings_of(space_id).unwrap()[0].status,
+        BindingStatus::Stale
+    );
+
+    // Deleting the source retires the binding entirely.
+    lmpg.delete_record(rec).unwrap();
+    vecs.revalidate_bindings("doc-space").unwrap();
+    let bindings = vecs.bindings_of(space_id).unwrap();
+    assert_eq!(bindings.len(), 1);
+}
+
+/// Items 8 + 9: candidate scoping before scoring, exact top-K ranking and
+/// reconstruction projection through Records/Labels perspectives.
+#[test]
+fn items_8_9_candidate_scope_topk_and_projection() {
+    let (lmpg, vecs) = setup();
+    vecs.ensure_space("scope-space", 3).unwrap();
+
+    let examples: [(&str, [f32; 3]); 3] = [
+        ("keep", [1.0, 0.0, 0.0]),
+        ("drop-near", [0.99, 0.01, 0.0]),
+        ("far-away", [0.0, 1.0, 0.0]),
+    ];
+
+    let _seed = lmpg
+        .create_record(
