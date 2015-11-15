@@ -470,3 +470,476 @@ fn id_ordering_uses_uuidv7_creation_order() {
 
     let descending = run(&lmpg, &json!({ "labels": ["ITEM"], "orderBy": "desc" }));
     let descending_ids = descending
+        .iter()
+        .map(|record| record["__id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(descending_ids.windows(2).all(|pair| pair[0] > pair[1]));
+
+    let ascending = run(
+        &lmpg,
+        &json!({ "labels": ["ITEM"], "orderBy": { "id": "asc" } }),
+    );
+    let ascending_ids = ascending
+        .iter()
+        .map(|record| record["__id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(ascending_ids.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn record_and_aggregate_scans_stop_cooperatively_when_cancelled() {
+    let lmpg = setup();
+    for value in 0..32 {
+        import::import_document(&lmpg, "ITEM", &json!({ "value": value })).unwrap();
+    }
+
+    let parsed = parse_document(&json!({ "labels": ["ITEM"] })).unwrap();
+    let probes = std::cell::Cell::new(0usize);
+    let cancelled = || {
+        probes.set(probes.get() + 1);
+        probes.get() > 4
+    };
+    assert!(matches!(
+        find_records_with_cancel(&lmpg, &parsed.search, &cancelled),
+        Err(QueryError::Cancelled)
+    ));
+
+    let parsed = parse_document(&json!({
+        "labels": ["ITEM"],
+        "select": { "count": { "$count": "*" } },
+        "groupBy": ["$record.value"]
+    }))
+    .unwrap();
+    let probes = std::cell::Cell::new(0usize);
+    let cancelled = || {
+        probes.set(probes.get() + 1);
+        probes.get() > 6
+    };
+    assert!(matches!(
+        aggregate_with_cancel(&lmpg, parsed.aggregate.as_ref().unwrap(), &cancelled),
+        Err(QueryError::Cancelled)
+    ));
+}
+
+#[test]
+fn datetime_iso_and_component_operators() {
+    let lmpg = setup();
+    // created stored as epoch-ms Int64 values:
+    // 2023-01-01T00:00:00Z = 1672531200000
+    // 2023-06-15T12:00:00Z = 1686823200000
+    // 2024-01-01T00:00:00Z = 1704067200000
+    for ms in [1_672_531_200_000i64, 1_686_823_200_000, 1_704_067_200_000] {
+        lmpg.create_record(
+            "EVENT",
+            None,
+            vec![("created".into(), FieldChange::Set(json!(ms)))],
+        )
+        .unwrap();
+    }
+
+    // $gte ISO string: on or after 2023-06-15
+    let rows = run(
+        &lmpg,
+        &json!({"labels": ["EVENT"], "where": {"created": {"$gte": "2023-06-15T00:00:00Z"}}}),
+    );
+    assert_eq!(rows.len(), 2);
+
+    // $lt component object (year 2024 boundary)
+    let rows = run(
+        &lmpg,
+        &json!({"labels": ["EVENT"], "where": {"created": {"$lt": {"$year": 2024, "$month": 1, "$day": 1}}}}),
+    );
+    assert_eq!(rows.len(), 2);
+
+    // $year component: records created in 2023
+    let rows = run(
+        &lmpg,
+        &json!({"labels": ["EVENT"], "where": {"created": {"$year": 2023}}}),
+    );
+    assert_eq!(rows.len(), 2);
+
+    // $year + $month: June 2023
+    let rows = run(
+        &lmpg,
+        &json!({"labels": ["EVENT"], "where": {"$and": [
+            {"created": {"$year": 2023}},
+            {"created": {"$month": 6}}
+        ]}}),
+    );
+    assert_eq!(rows.len(), 1);
+}
+
+/// ORDER BY must be a total order even when a field mixes types or is missing
+/// on some records. A comparator returning `Equal` in a non-transitive way
+/// (e.g. from a NaN `partial_cmp`) previously panicked `sort_by` with
+/// "user-provided comparison function does not correctly implement a total
+/// order".
+#[test]
+fn order_by_handles_nan_and_mixed_types_as_total_order() {
+    let lmpg = setup();
+    // a real number, a string, a missing value, and a large number on one field
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![("birth_year_bby".into(), FieldChange::Set(json!(2000)))],
+    )
+    .unwrap();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![("birth_year_bby".into(), FieldChange::Set(json!("c")))],
+    )
+    .unwrap();
+    lmpg.create_record("ITEM", None, vec![]).unwrap();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![("birth_year_bby".into(), FieldChange::Set(json!(100)))],
+    )
+    .unwrap();
+
+    for order_by in [
+        json!({"birth_year_bby": "asc"}),
+        json!({"birth_year_bby": "desc"}),
+    ] {
+        let rows = run(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {}, "orderBy": order_by, "limit": 100}),
+        );
+        assert_eq!(rows.len(), 4, "orderBy {order_by} must not panic");
+    }
+}
+
+/// Regression: `$count` over a related-record alias must count the distinct
+/// related records, not be treated as a root-record field (all-zeros bug).
+/// Query shape mirrors the Star Wars fixture: FACTION <-[:`HAS_WINNER_FACTION_ID`]-(BATTLE).
+#[test]
+fn count_over_related_alias_counts_distinct_related_records() {
+    let lmpg = setup();
+    // Two factions; a wins twice, b wins once, via BATTLE -> FACTION edges.
+    let a = import::import_document(&lmpg, "FACTION", &json!({"name": "Jedi Order"})).unwrap();
+    let b = import::import_document(&lmpg, "FACTION", &json!({"name": "Sith Order"})).unwrap();
+    for _ in 0..2 {
+        let battle = import::import_document(&lmpg, "BATTLE", &json!({"name": "b"})).unwrap();
+        lmpg.create_relationship("HAS_WINNER_FACTION_ID", battle, a, vec![])
+            .unwrap();
+    }
+    {
+        let battle = import::import_document(&lmpg, "BATTLE", &json!({"name": "b"})).unwrap();
+        lmpg.create_relationship("HAS_WINNER_FACTION_ID", battle, b, vec![])
+            .unwrap();
+    }
+
+    let parsed = parse_document(&json!({
+        "labels": ["FACTION"],
+        "where": {
+            "BATTLE": {
+                "$alias": "$battle",
+                "$relation": { "type": "HAS_WINNER_FACTION_ID", "direction": "in" }
+            }
+        },
+        "select": {
+            "faction": "$record.name",
+            "wins": { "$count": "$battle" }
+        },
+        "groupBy": ["$record.name"],
+        "orderBy": { "wins": "desc" }
+    }))
+    .unwrap();
+    let req = parsed.aggregate.unwrap();
+    let buckets = aggregate(&lmpg, &req).unwrap();
+    let rows = aggregate_to_rows(&lmpg, &buckets, &req).unwrap();
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "both factions have at least one winning battle"
+    );
+    assert_eq!(rows[0]["name"], json!("Jedi Order"));
+    assert_eq!(rows[0]["wins"], json!(2), "Jedi Order won two battles");
+    assert_eq!(rows[1]["name"], json!("Sith Order"));
+    assert_eq!(rows[1]["wins"], json!(1), "Sith Order won one battle");
+}
+
+#[test]
+fn collect_from_alias_gathers_related_records() {
+    let lmpg = setup();
+    let company = import::import_document(&lmpg, "Company", &json!({"name": "TechCorp"})).unwrap();
+    let e1 = import::import_document(
+        &lmpg,
+        "Employee",
+        &json!({"name": "Jane", "salary": 600_000}),
+    )
+    .unwrap();
+    let e2 = import::import_document(
+        &lmpg,
+        "Employee",
+        &json!({"name": "John", "salary": 550_000}),
+    )
+    .unwrap();
+    lmpg.create_relationship("EMPLOYS", company, e1, vec![])
+        .unwrap();
+    lmpg.create_relationship("EMPLOYS", company, e2, vec![])
+        .unwrap();
+
+    let rows = run(
+        &lmpg,
+        &json!({
+            "labels": ["Company"],
+            "where": { "Employee": { "$alias": "$employee" } },
+            "select": {
+                "employeeNames": {
+                    "$collect": {
+                        "from": "$employee",
+                        "select": { "name": "$employee.name" },
+                        "orderBy": { "name": "asc" },
+                        "limit": 10
+                    }
+                }
+            }
+        }),
+    );
+    let names: Vec<String> = rows[0]["employeeNames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["Jane".to_string(), "John".to_string()]);
+}
+
+#[test]
+fn nested_label_collect_produces_hierarchical_output() {
+    let lmpg = setup();
+    let company = import::import_document(&lmpg, "Company", &json!({"name": "TechCorp"})).unwrap();
+    let dept = import::import_document(&lmpg, "Department", &json!({"name": "Eng"})).unwrap();
+    let project = import::import_document(&lmpg, "Project", &json!({"name": "Platform"})).unwrap();
+    let employee = import::import_document(
+        &lmpg,
+        "Employee",
+        &json!({"name": "Jane", "salary": 620_000}),
+    )
+    .unwrap();
+    lmpg.create_relationship("HAS_DEPT", company, dept, vec![])
+        .unwrap();
+    lmpg.create_relationship("HAS_PROJECT", dept, project, vec![])
+        .unwrap();
+    lmpg.create_relationship("HAS_EMPLOYEE", project, employee, vec![])
+        .unwrap();
+
+    let rows = run(
+        &lmpg,
+        &json!({
+            "labels": ["Company"],
+            "select": {
+                "departments": {
+                    "$collect": {
+                        "label": "Department",
+                        "select": {
+                            "name": "$self.name",
+                            "projects": {
+                                "$collect": {
+                                    "label": "Project",
+                                    "select": {
+                                        "name": "$self.name",
+                                        "employees": {
+                                            "$collect": {
+                                                "label": "Employee",
+                                                "select": { "name": "$self.name" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    assert_eq!(rows.len(), 1, "one company row");
+    eprintln!(
+        "[dbg] nested rows: {}",
+        serde_json::to_string_pretty(&rows[0]).unwrap()
+    );
+    let departments = rows[0]["departments"].as_array().unwrap();
+    assert_eq!(departments.len(), 1);
+    assert_eq!(departments[0]["name"], json!("Eng"));
+    let projects = departments[0]["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["name"], json!("Platform"));
+    let employees = projects[0]["employees"].as_array().unwrap();
+    assert_eq!(employees.len(), 1);
+    assert_eq!(employees[0]["name"], json!("Jane"));
+}
+
+#[test]
+fn label_collect_where_filter_and_slice() {
+    let lmpg = setup();
+    let company = import::import_document(&lmpg, "Company", &json!({"name": "TechCorp"})).unwrap();
+    for name in ["Alice", "Bob", "Carol"] {
+        let e =
+            import::import_document(&lmpg, "Employee", &json!({"name": name, "salary": 100_000}))
+                .unwrap();
+        lmpg.create_relationship("EMPLOYS", company, e, vec![])
+            .unwrap();
+    }
+    let rows = run(
+        &lmpg,
+        &json!({
+            "labels": ["Company"],
+            "select": {
+                "senior": {
+                    "$collect": {
+                        "label": "Employee",
+                        "where": { "name": { "$startsWith": "A" } },
+                        "select": { "name": "$self.name" }
+                    }
+                }
+            }
+        }),
+    );
+    let names: Vec<String> = rows[0]["senior"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["Alice".to_string()]);
+}
+
+#[test]
+fn aggregate_with_select_aliases_and_collect_per_root() {
+    let lmpg = setup();
+    let tech = import::import_document(&lmpg, "Company", &json!({"name": "TechCorp"})).unwrap();
+    let other = import::import_document(&lmpg, "Company", &json!({"name": "OldCorp"})).unwrap();
+    let e1 = import::import_document(
+        &lmpg,
+        "Employee",
+        &json!({"name": "Jane", "salary": 600_000}),
+    )
+    .unwrap();
+    let e2 = import::import_document(
+        &lmpg,
+        "Employee",
+        &json!({"name": "John", "salary": 550_000}),
+    )
+    .unwrap();
+    let e3 = import::import_document(
+        &lmpg,
+        "Employee",
+        &json!({"name": "Grace", "salary": 480_000}),
+    )
+    .unwrap();
+    lmpg.create_relationship("EMPLOYS", tech, e1, vec![])
+        .unwrap();
+    lmpg.create_relationship("EMPLOYS", tech, e2, vec![])
+        .unwrap();
+    lmpg.create_relationship("EMPLOYS", other, e3, vec![])
+        .unwrap();
+
+    let q = parse_document(&json!({
+        "labels": ["Company"],
+        "where": { "Employee": { "$alias": "$employee" } },
+        "select": {
+            "companyName": "$record.name",
+            "headcount": { "$count": "$employee" },
+            "totalWage": { "$sum": "$employee.salary" },
+            "minSalary": { "$min": "$employee.salary" },
+            "maxSalary": { "$max": "$employee.salary" },
+            "employeeNames": {
+                "$collect": {
+                    "from": "$employee",
+                    "select": { "name": "$employee.name" },
+                    "orderBy": { "name": "asc" }
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let req = q.aggregate.unwrap();
+    let buckets = aggregate(&lmpg, &req).unwrap();
+    let rows = aggregate_to_rows(&lmpg, &buckets, &req).unwrap();
+
+    // Per-root rows: one per company (no groupBy).
+    assert_eq!(rows.len(), 2, "one row per root company");
+    let tech_row = rows
+        .iter()
+        .find(|r| r["companyName"] == json!("TechCorp"))
+        .expect("tech row");
+    assert_eq!(tech_row["headcount"], json!(2));
+    assert_eq!(tech_row["totalWage"], json!(1_150_000.0));
+    assert_eq!(tech_row["minSalary"], json!(550_000.0));
+    assert_eq!(tech_row["maxSalary"], json!(600_000.0));
+    let names: Vec<String> = tech_row["employeeNames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["Jane".to_string(), "John".to_string()]);
+    let old_row = rows
+        .iter()
+        .find(|r| r["companyName"] == json!("OldCorp"))
+        .expect("old row");
+    assert_eq!(old_row["headcount"], json!(1));
+    assert_eq!(old_row["totalWage"], json!(480_000.0));
+    assert_eq!(old_row["employeeNames"][0]["name"], json!("Grace"));
+}
+
+#[test]
+fn self_group_divide_ref_matches_prod() {
+    let lmpg = setup();
+    // 26 military ships with crew_capacity (mix).
+    for i in 0..26 {
+        import::import_document(
+            &lmpg,
+            "STARSHIP",
+            &json!({ "is_military": true, "crew_capacity": 200_000 + i * 3000 }),
+        )
+        .unwrap();
+    }
+    let q = parse_document(&json!({
+        "labels": ["STARSHIP"],
+        "where": { "is_military": true },
+        "select": {
+            "totalCrewCapacity": { "$sum": "$record.crew_capacity" },
+            "shipCount": { "$count": "*" },
+            "crewPerShip": { "$divide": [ { "$ref": "totalCrewCapacity" }, { "$ref": "shipCount" } ] }
+        },
+        "groupBy": ["totalCrewCapacity", "shipCount", "crewPerShip"],
+        "orderBy": { "crewPerShip": "desc" }
+    }))
+    .unwrap();
+    let req = q.aggregate.unwrap();
+    let (buckets, matched) = aggregate_with_cancel(&lmpg, &req, &|| false).unwrap();
+    let rows = aggregate_to_rows(&lmpg, &buckets, &req).unwrap();
+    assert_eq!(matched, 26, "total = matched roots");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    // 26 ships at 200000 + i*3000: sum = 6175000, per-ship = 6175000/26 = 237500
+    assert_eq!(row["shipCount"], json!(26));
+    assert_eq!(row["totalCrewCapacity"], json!(6_175_000.0));
+    let crew_per_ship = row["crewPerShip"].as_f64().unwrap();
+    assert!(
+        (crew_per_ship - 237_500.0).abs() < 0.01,
+        "crewPerShip={crew_per_ship}"
+    );
+    assert!(
+        row.get("totalcrewcapacity").is_none(),
+        "no junk self-group keys"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario asserts several alias-metric results that share fixture setup"
+)]
+fn alias_metrics_apply_level_filter_and_traverse_paths() {
+    // q1 pattern: alias $count/$sum/$avg must apply the alias-level `where`
+    // filter (is_military) — only military ships are counted/summed.
+    let lmpg = setup();
+    let f1 = import::import_document(&lmpg, "FACTION", &json!({ "id": "f1", "name": "Rebels" }))
+        .unwrap();
+    for (name, military, crew, firepower) in [

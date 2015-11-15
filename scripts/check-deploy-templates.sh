@@ -12,3 +12,10 @@ if [ "$manual_unit" != "$(cat deploy/templates/systemd/rushdb.service)" ]; then
   echo "deploy/templates/systemd/rushdb.service differs from the unit in docs/manual/operations/deployment.md" >&2
   exit 1
 fi
+
+python3 - <<'PY'
+import tomllib, yaml
+yaml.safe_load(open('deploy/templates/cloud-init/cloud-init.yaml'))
+assert open('deploy/templates/cloud-init/cloud-init.yaml').readline().strip() == '#cloud-config'
+yaml.safe_load(open('render.yaml'))
+tomllib.load(open('deploy/templates/fly/fly.toml', 'rb'))
