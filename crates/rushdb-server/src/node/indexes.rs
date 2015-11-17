@@ -125,3 +125,67 @@ impl RequestScope<'_> {
         if let IndexKind::Structural { dimensions } = def.kind {
             self.vector_engine()?
                 .ensure_space_similarity(
+                    &def.name,
+                    dimensions,
+                    rushdb_types::occurrence::Similarity::Cosine,
+                )
+                .map_err(|e| e.to_string())?;
+            self.put_meta_blob(
+                &self.vector_index_key(&def.name),
+                &structural_vector_row(&def, dimensions),
+            )?;
+        }
+        self.index_build_wake.notify_one();
+        Ok(describe(&def))
+    }
+
+    /// Start dropping a declared index in the request's tenant.
+    ///
+    /// # Errors
+    /// Returns a message when the index does not exist or the commit fails.
+    pub(crate) fn drop_index(&self, name: &str) -> Result<(), String> {
+        let view = self.store.read_view().map_err(|e| e.to_string())?;
+        let structural = index::by_name(&view, self.tenant(), name)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|def| matches!(def.kind, IndexKind::Structural { .. }));
+        drop(view);
+        self.lmpg().drop_index(name).map_err(|e| e.to_string())?;
+        if structural {
+            // Its vectors and registry row go with it.
+            self.drop_vector_index(name)?;
+        }
+        self.index_build_wake.notify_one();
+        Ok(())
+    }
+
+    /// Declared indexes of the request's tenant at `view`.
+    ///
+    /// # Errors
+    /// Returns a message when the catalog cannot be read.
+    pub(crate) fn list_indexes_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        index::definitions(view, self.tenant())
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|def| {
+                let mut out = describe(def);
+                if def.kind.applied() {
+                    // Freshness: records whose change the applier has not
+                    // processed yet (counted up to a bound).
+                    out["pending"] =
+                        index::pending(view, self.tenant(), def.id, PENDING_COUNT_LIMIT)
+                            .map_err(|e| e.to_string())?
+                            .len()
+                            .into();
+                }
+                Ok(out)
+            })
+            .collect()
+    }
+}
+
+impl Node {
+    /// Advance every building or dropping index of every tenant, a batch at a
+    /// time, until done or `budget` elapses. Returns the commits made.

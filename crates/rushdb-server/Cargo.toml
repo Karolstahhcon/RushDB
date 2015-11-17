@@ -1,0 +1,48 @@
+[package]
+name = "rushdb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RushDB property graph database: the `rushdb` server and CLI"
+readme = "../../README.md"
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "rushdb"
+path = "src/bin/rushdb/main.rs"
+
+[features]
+default = ["jemalloc"]
+# jemalloc global allocator with background purge threads: idle heap pages
+# decay back to the OS instead of being retained in per-thread arenas.
+# Disable (`--no-default-features`) to fall back to the system allocator.
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Benchmark builds: count cumulative allocated bytes (churn per record).
+alloc-accounting = ["jemalloc"]
+
+[dependencies]
+roaring = { workspace = true }
+tikv-jemallocator = { version = "0.6", optional = true, features = ["background_threads", "stats"] }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
+rushdb-types = { workspace = true }
+rushdb-storage = { workspace = true }
+rushdb-lmpg = { workspace = true }
+rushdb-tx = { workspace = true }
+rushdb-raft = { workspace = true }
+rushdb-query = { workspace = true }
+rushdb-authz = { workspace = true }
+rushdb-textsearch = { workspace = true }
+rushdb-vector = { workspace = true }
+rushdb-sql = { workspace = true }
+rushdb-engine = { workspace = true }
+rushdb-protocol = { workspace = true }
+rushdb-grpc = { workspace = true }
+rushdb-bolt = { workspace = true }
+rushdb-language = { workspace = true }
+rushdb-mongodb = { workspace = true }
+rushdb-backup = { workspace = true }
