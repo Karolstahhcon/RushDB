@@ -139,3 +139,74 @@ fn run_filtered_experiment(
         let hits = vecs
             .search_exact_in_view(&snap, &space, q, k, Some(&candidate))
             .unwrap();
+        exact.push(hits.into_iter().map(|h| h.source.owner_ord).collect());
+    }
+    let exact_ms = t_exact.elapsed().as_secs_f64() / queries.len() as f64;
+
+    let t_ann = Instant::now();
+    let mut ann: Vec<Vec<u64>> = Vec::new();
+    for q in queries {
+        let hits = vecs
+            .search_ann_in_view(&snap, &space, q, k, k.max(8), Some(&candidate))
+            .unwrap();
+        ann.push(hits.into_iter().map(|h| h.source.owner_ord).collect());
+    }
+    let ann_ms = t_ann.elapsed().as_secs_f64() / queries.len() as f64;
+
+    let mut recall_sum = 0.0f64;
+    let mut identical = 0usize;
+    for (a, e) in ann.iter().zip(exact.iter()) {
+        let set: std::collections::HashSet<u64> = e.iter().copied().collect();
+        let hit = a.iter().filter(|v| set.contains(v)).count();
+        recall_sum += hit as f64 / e.len().max(1) as f64;
+        if a == e {
+            identical += 1;
+        }
+    }
+    let recall = recall_sum / ann.len().max(1) as f64;
+    let fallback = identical as f64 / ann.len().max(1) as f64;
+    (recall, ann_ms * 1000.0, exact_ms * 1000.0, fallback)
+}
+
+#[test]
+#[ignore = "long-running real-data benchmark; set RUSHDB_FILTERED_ANN_BENCH=1"]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "selectivity is a fraction in [0,1] over a small category count, so the ceiling fits usize exactly"
+)]
+fn dbpedia_filtered_recall_and_latency() {
+    if std::env::var("RUSHDB_FILTERED_ANN_BENCH").ok().as_deref() != Some("1") {
+        eprintln!("skipping; set RUSHDB_FILTERED_ANN_BENCH=1 to run");
+        return;
+    }
+    let (dims, vectors) = read_fvecs(&format!("{FIXTURES_DIR}/dbpedia/vectors.fvecs"), 50_000);
+    assert_eq!(dims, 1536, "DBPedia should be 1536-dim");
+    let (vecs, _ords) = bind_real(&vectors, dims);
+
+    // Queries: a held-out slice of the base vectors (out-of-sample queries are
+    // not part of this fixture; using base vectors as queries is the standard
+    // self-recall approximation for a corpus without a separate query set).
+    // The exact-scan oracle over 50k x 1536 dominates runtime, so keep the
+    // query set small for calibration.
+    let nq = 32usize;
+    let queries: Vec<Vec<f32>> = vectors[..nq].to_vec();
+
+    let k = 10usize;
+    println!(
+        "DBPedia-100K (50k subset): {dims}-dim, {} vectors, {nq} queries",
+        vectors.len()
+    );
+    println!(
+        "{:<12} {:>8} {:>10} {:>12} {:>12}",
+        "selectivity", "recall", "ann_ms", "exact_ms", "fallback%"
+    );
+    for selectivity in [0.05f64, 0.10, 0.25, 0.50, 1.00] {
+        let count = ((20.0f64) * selectivity).ceil() as usize;
+        let allowed: std::collections::HashSet<usize> = (0..count.min(20)).collect();
+        let (recall, ann_ms, exact_ms, fallback) =
+            run_filtered_experiment(&vecs, &queries, k, &allowed);
+        println!(
+            "{:<12.0} {:>8.2} {:>10.2} {:>12.2} {:>12.0}",
+            selectivity * 100.0,
+            recall,

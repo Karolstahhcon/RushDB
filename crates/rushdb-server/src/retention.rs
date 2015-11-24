@@ -128,3 +128,263 @@ pub struct ConsumerLease {
 /// consumers while allowing released consumers to stop pinning history.
 ///
 /// Claims are **leases**. A consumer that stops acknowledging (a crashed
+/// backup job, a decommissioned replica, a disabled archiver) is expired by
+/// [`Self::expire`] instead of pinning the WAL forever (C5, cloud-capacity
+/// F2/F3).
+#[derive(Debug, Default, Clone)]
+pub struct RetentionConsumers {
+    floors: std::collections::BTreeMap<String, ConsumerLease>,
+    /// Lease length in milliseconds; `0` disables expiry.
+    lease_ms: u64,
+    /// Oldest commit still retained: acknowledgements below it are refused.
+    oldest_available: u64,
+    /// Consumers dropped because retention passed them (until they resync).
+    lost: std::collections::BTreeSet<String>,
+}
+
+impl RetentionConsumers {
+    /// An empty registry whose claims expire after `lease` without renewal.
+    #[must_use]
+    pub fn with_lease(lease: std::time::Duration) -> Self {
+        Self {
+            floors: std::collections::BTreeMap::new(),
+            lease_ms: u64::try_from(lease.as_millis()).unwrap_or(u64::MAX),
+            oldest_available: 0,
+            lost: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Register or advance a consumer acknowledgement monotonically and renew
+    /// its lease.
+    ///
+    /// # Errors
+    /// [`ConsumerResyncRequired`] when `floor` is below the oldest retained
+    /// commit: the history it asks for is gone, so the claim is refused and
+    /// the consumer is marked lost.
+    pub fn acknowledge(
+        &mut self,
+        consumer: impl Into<String>,
+        floor: u64,
+        now_ms: u64,
+    ) -> Result<(), ConsumerResyncRequired> {
+        let consumer = consumer.into();
+        if floor < self.oldest_available {
+            self.floors.remove(&consumer);
+            self.lost.insert(consumer);
+            return Err(ConsumerResyncRequired {
+                oldest_available_lsn: self.oldest_available,
+            });
+        }
+        self.lost.remove(&consumer);
+        self.floors
+            .entry(consumer)
+            .and_modify(|lease| {
+                lease.floor = lease.floor.max(floor);
+                lease.acknowledged_at_ms = lease.acknowledged_at_ms.max(now_ms);
+            })
+            .or_insert(ConsumerLease {
+                floor,
+                acknowledged_at_ms: now_ms,
+            });
+        Ok(())
+    }
+
+    /// Retention reclaimed everything below `floor`: refuse acknowledgements
+    /// under it from now on, and drop (as lost) every consumer whose claim
+    /// it passed. Returns the newly lost consumers.
+    pub fn enforce_floor(&mut self, floor: u64) -> Vec<String> {
+        self.oldest_available = self.oldest_available.max(floor);
+        let oldest = self.oldest_available;
+        let lost: Vec<String> = self
+            .floors
+            .iter()
+            .filter(|(_, lease)| lease.floor < oldest)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &lost {
+            self.floors.remove(name);
+            self.lost.insert(name.clone());
+        }
+        lost
+    }
+
+    /// Whether `consumer` was dropped by retention and has not resynced.
+    #[must_use]
+    pub fn is_lost(&self, consumer: &str) -> bool {
+        self.lost.contains(consumer)
+    }
+
+    /// Consumers currently lost (a metric).
+    #[must_use]
+    pub fn lost_len(&self) -> usize {
+        self.lost.len()
+    }
+
+    /// Remove a consumer that no longer requires retained history.
+    pub fn release(&mut self, consumer: &str) -> bool {
+        self.floors.remove(consumer).is_some()
+    }
+
+    /// Drop every consumer whose lease is older than the registry's lease at
+    /// `now_ms` and return their names. A zero lease disables expiry.
+    pub fn expire(&mut self, now_ms: u64) -> Vec<String> {
+        let lease_ms = self.lease_ms;
+        if lease_ms == 0 {
+            return Vec::new();
+        }
+        let expired: Vec<String> = self
+            .floors
+            .iter()
+            .filter(|(_, lease)| now_ms.saturating_sub(lease.acknowledged_at_ms) > lease_ms)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &expired {
+            self.floors.remove(name);
+        }
+        expired
+    }
+
+    /// Lowest acknowledged commit, or `None` when there are no consumers.
+    #[must_use]
+    pub fn protected_floor(&self) -> Option<u64> {
+        self.floors.values().map(|lease| lease.floor).min()
+    }
+
+    /// Number of active consumers, useful for retention metrics.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.floors.len()
+    }
+
+    /// Whether no consumers are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.floors.is_empty()
+    }
+
+    /// Replace the registry from its durable representation during boot.
+    pub fn replace(&mut self, floors: std::collections::BTreeMap<String, ConsumerLease>) {
+        self.floors = floors;
+    }
+
+    /// Copy the leases for durable persistence.
+    #[must_use]
+    pub fn snapshot(&self) -> std::collections::BTreeMap<String, ConsumerLease> {
+        self.floors.clone()
+    }
+}
+
+/// Current unix time in milliseconds (lease clock).
+#[must_use]
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Maintenance knobs read once at startup.
+#[derive(Debug, Clone)]
+pub struct MaintenanceConfig {
+    /// Retention policy for per-commit metadata: the hard commit cap.
+    pub retention: RetentionPolicy,
+    /// Commits kept even when no consumer or reader pins them
+    /// (`RUSHDB_TX_LOG_KEEP_COMMITS`, default 0).
+    pub keep_commits: u64,
+    /// Optional byte target for retained command-log rows
+    /// (`RUSHDB_TX_LOG_RETENTION_BYTES`; none = off). Applied in addition to
+    /// the commit floor.
+    pub retention_bytes: Option<u64>,
+    /// Idle-window compaction period (`RUSHDB_COMPACT_INTERVAL_SECONDS`; none =
+    /// disabled). Acts as the minimum interval between compactions.
+    pub compact_interval: Option<std::time::Duration>,
+    /// Minimum quiet period after the last commit before compaction may run
+    /// (`RUSHDB_COMPACT_QUIESCE_SECONDS`, default 10s). Prevents compaction
+    /// from rewriting the file while commits are flowing.
+    pub compact_quiesce: std::time::Duration,
+    /// Compact only when the file has grown by at least this percent since the
+    /// last compaction (`RUSHDB_COMPACT_GROWTH_PERCENT`, default 150).
+    pub compact_growth_percent: u32,
+    /// RSS watchdog threshold in bytes (`RUSHDB_RSS_MAX_BYTES`; none =
+    /// disabled). Policy, not a hard allocation cap.
+    pub rss_max_bytes: Option<u64>,
+    /// Directory for continuous logical-WAL archiving (`RUSHDB_WAL_ARCHIVE_DIR`;
+    /// none = off). A worker writes append-only segment files plus an
+    /// `archive.state` watermark there.
+    pub wal_archive_dir: Option<std::path::PathBuf>,
+    /// Archive retention window (`RUSHDB_WAL_ARCHIVE_RETENTION_SECONDS`).
+    pub wal_archive_retention: std::time::Duration,
+    /// Hard archive byte cap (`RUSHDB_WAL_ARCHIVE_RETENTION_BYTES`; none =
+    /// off).
+    pub wal_archive_retention_bytes: Option<u64>,
+    /// Streaming replication follower settings (`RUSHDB_REPLICA_OF`; none =
+    /// not a follower). See [`ReplicaConfig`].
+    pub replica: Option<ReplicaConfig>,
+}
+
+/// Streaming replication follower settings: which leader to
+/// poll, the identity this node reports (so the leader can protect WAL
+/// retention per follower), and the bearer token to present.
+#[derive(Debug, Clone)]
+pub struct ReplicaConfig {
+    /// The leader's base URL, e.g. `http://leader:3000`.
+    pub leader_url: String,
+    /// Stable identity reported to the leader's replication endpoint.
+    pub follower_id: String,
+    /// Bearer token presented to the leader.
+    pub token: String,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            retention: RetentionPolicy::Commits(100_000),
+            keep_commits: 0,
+            retention_bytes: None,
+            compact_interval: Some(std::time::Duration::from_secs(300)),
+            compact_quiesce: std::time::Duration::from_secs(10),
+            compact_growth_percent: 150,
+            rss_max_bytes: None,
+            wal_archive_dir: None,
+            wal_archive_retention: std::time::Duration::from_hours(7 * 24),
+            wal_archive_retention_bytes: None,
+            replica: None,
+        }
+    }
+}
+
+/// Memory watchdog decision: act when resident memory exceeds the configured
+/// limit. `resident` is `None` when the allocator exposes no counters.
+#[must_use]
+pub fn over_rss_limit(resident: Option<u64>, limit: u64) -> bool {
+    limit > 0 && resident.is_some_and(|rss| rss > limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_policy_parses_commits_and_extremes() {
+        assert_eq!(
+            RetentionPolicy::parse("").unwrap(),
+            RetentionPolicy::KeepAll
+        );
+        assert_eq!(
+            RetentionPolicy::parse("keep_all").unwrap(),
+            RetentionPolicy::KeepAll
+        );
+        assert_eq!(
+            RetentionPolicy::parse("keep_none").unwrap(),
+            RetentionPolicy::KeepNone
+        );
+        assert_eq!(
+            RetentionPolicy::parse("500 commits").unwrap(),
+            RetentionPolicy::Commits(500)
+        );
+        assert_eq!(
+            RetentionPolicy::parse("500 commit").unwrap(),
+            RetentionPolicy::Commits(500)
+        );
+        assert!(RetentionPolicy::parse("2 days").is_err());
