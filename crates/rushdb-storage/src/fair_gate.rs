@@ -26,32 +26,3 @@ pub(crate) struct FairGate {
 
 /// Holding a [`Turn`] means every earlier ticket holder has passed the gate;
 /// dropping it admits the next ticket.
-pub(crate) struct Turn<'a>(&'a FairGate);
-
-impl FairGate {
-    /// Wait for this caller's turn.
-    pub(crate) fn enter(&self) -> Turn<'_> {
-        let ticket = self.next.fetch_add(1, Ordering::AcqRel);
-        let mut serving = self.serving.lock().unwrap_or_else(PoisonError::into_inner);
-        while *serving != ticket {
-            serving = self
-                .turn
-                .wait(serving)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        Turn(self)
-    }
-}
-
-impl Drop for Turn<'_> {
-    fn drop(&mut self) {
-        *self
-            .0
-            .serving
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 1;
-        self.0.turn.notify_all();
-    }
-}
-
-#[cfg(test)]

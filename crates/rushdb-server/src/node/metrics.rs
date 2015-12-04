@@ -355,3 +355,181 @@ impl Metrics {
         .expect("valid Prometheus metric");
         let commit_latency = prometheus::Histogram::with_opts(
             prometheus::HistogramOpts::new(
+                "rushdb_commit_latency_seconds",
+                "Durable commit latency in seconds",
+            )
+            .buckets(BUCKETS.to_vec()),
+        )
+        .expect("valid Prometheus metric");
+        let commit_phase = prometheus::HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "rushdb_commit_phase_seconds",
+                "Commit pipeline time by phase (committer phases per commit, publisher phases per group)",
+            )
+            .buckets(BUCKETS.to_vec()),
+            &["phase"],
+        )
+        .expect("valid Prometheus metric");
+        // Allocator introspection (jemalloc `stats.*`, bytes). Unlike the
+        // managed-budget gauges these report bytes actually mapped, so
+        // allocator retention after bulk-load peaks is observable. On the
+        // system allocator (`--no-default-features`) no counters exist and
+        // the gauges stay zero.
+        let alloc_total = prometheus::IntCounter::new(
+            "rushdb_allocator_bytes_allocated_total",
+            "Cumulative bytes allocated since start (alloc-accounting builds only; 0 otherwise)",
+        )
+        .expect("valid Prometheus metric");
+        let alloc_allocated = prometheus::IntGauge::new(
+            "rushdb_allocator_allocated_bytes",
+            "Application bytes allocated (jemalloc stats.allocated)",
+        )
+        .expect("valid Prometheus metric");
+        let alloc_active = prometheus::IntGauge::new(
+            "rushdb_allocator_active_bytes",
+            "Bytes in active pages (jemalloc stats.active)",
+        )
+        .expect("valid Prometheus metric");
+        let alloc_metadata = prometheus::IntGauge::new(
+            "rushdb_allocator_metadata_bytes",
+            "Bytes used for allocator metadata (jemalloc stats.metadata)",
+        )
+        .expect("valid Prometheus metric");
+        let alloc_resident = prometheus::IntGauge::new(
+            "rushdb_allocator_resident_bytes",
+            "Physically resident bytes (jemalloc stats.resident)",
+        )
+        .expect("valid Prometheus metric");
+        let alloc_retained = prometheus::IntGauge::new(
+            "rushdb_allocator_retained_bytes",
+            "Bytes retained in arenas but not active (jemalloc stats.retained)",
+        )
+        .expect("valid Prometheus metric");
+        // Storage-file growth and retention/compaction activity: the durable
+        // file should track live data once per-commit metadata is pruned.
+        let storage_file_bytes = prometheus::IntGauge::new(
+            "rushdb_storage_file_bytes",
+            "Apparent size of the primary durable file (0 when in-memory)",
+        )
+        .expect("valid Prometheus metric");
+        let storage_data_bytes = prometheus::IntGauge::new(
+            "rushdb_storage_data_bytes",
+            "Live canonical data row bytes (key+value), excluding history/log",
+        )
+        .expect("valid Prometheus metric");
+        let storage_history_bytes = prometheus::IntGauge::new(
+            "rushdb_storage_history_bytes",
+            "Retained MVCC history bytes",
+        )
+        .expect("valid Prometheus metric");
+        let storage_log_bytes =
+            prometheus::IntGauge::new("rushdb_storage_log_bytes", "Retained command-log bytes")
+                .expect("valid Prometheus metric");
+        let storage_receipt_bytes = prometheus::IntGauge::new(
+            "rushdb_storage_receipt_bytes",
+            "Retained retry-receipt bytes",
+        )
+        .expect("valid Prometheus metric");
+        let storage_admission_waits = prometheus::IntCounter::new(
+            "rushdb_storage_admission_waits_total",
+            "Cumulative bounded storage admission-lock waits",
+        )
+        .expect("valid Prometheus metric");
+        let storage_admission_wait_ms = prometheus::IntCounter::new(
+            "rushdb_storage_admission_wait_ms_total",
+            "Cumulative milliseconds spent waiting for storage admission",
+        )
+        .expect("valid Prometheus metric");
+        let storage_checkpoints = prometheus::IntCounter::new(
+            "rushdb_storage_checkpoints_total",
+            "Cumulative explicit durability checkpoints",
+        )
+        .expect("valid Prometheus metric");
+        let storage_checkpoint_wait_ms = prometheus::IntCounter::new(
+            "rushdb_storage_checkpoint_wait_ms_total",
+            "Cumulative milliseconds spent in durability checkpoints",
+        )
+        .expect("valid Prometheus metric");
+        let storage_backend_mutex_wait_ms = prometheus::IntCounter::new(
+            "rushdb_storage_backend_mutex_wait_ms_total",
+            "Cumulative milliseconds spent waiting for the backend database mutex",
+        )
+        .expect("valid Prometheus metric");
+        let storage_backend_mutex_hold_ms = prometheus::IntCounter::new(
+            "rushdb_storage_backend_mutex_hold_ms_total",
+            "Cumulative milliseconds the backend database mutex was held",
+        )
+        .expect("valid Prometheus metric");
+        let wal_retained_bytes =
+            prometheus::IntGauge::new("rushdb_wal_retained_bytes", "WAL bytes retained on disk")
+                .expect("valid Prometheus metric");
+        let conflict_window_bytes = prometheus::IntGauge::new(
+            "rushdb_conflict_window_bytes",
+            "Bytes held by the in-memory conflict-validation window",
+        )
+        .expect("valid Prometheus metric");
+        let http_inflight_body_bytes = prometheus::IntGauge::new(
+            "rushdb_http_inflight_body_bytes",
+            "HTTP request-body bytes reserved in flight",
+        )
+        .expect("valid Prometheus metric");
+        let gc_tick_seconds = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "rushdb_gc_tick_seconds",
+                "Duration of one maintenance (GC, retention, checkpoint) tick",
+            )
+            .buckets(BUCKETS.to_vec()),
+        )
+        .expect("valid Prometheus metric");
+        let storage_backend_mutex_hold_max_ms = prometheus::IntGauge::new(
+            "rushdb_storage_backend_mutex_hold_max_ms",
+            "Maximum single backend database-mutex hold in milliseconds",
+        )
+        .expect("valid Prometheus metric");
+        let retention_consumers = prometheus::IntGauge::new(
+            "rushdb_retention_consumers",
+            "Active retention consumers protecting history",
+        )
+        .expect("valid Prometheus metric");
+        let retention_protected_floor = prometheus::IntGauge::new(
+            "rushdb_retention_protected_floor",
+            "Lowest acknowledged commit protected by retention consumers",
+        )
+        .expect("valid Prometheus metric");
+        let retention_oldest_reader = prometheus::IntGauge::new(
+            "rushdb_retention_oldest_reader_commit",
+            "Oldest commit pinned by a live read view (0 when none)",
+        )
+        .expect("valid Prometheus metric");
+        let sequencer_inflight_keys = prometheus::IntGauge::new(
+            "rushdb_sequencer_inflight_keys",
+            "Keys in the sequencer's assigned-but-unpublished overlay",
+        )
+        .expect("valid Prometheus metric");
+        let planner_stats_bytes = prometheus::IntGauge::new(
+            "rushdb_planner_stats_bytes",
+            "Bytes held by the evictable planner-statistics cache",
+        )
+        .expect("valid Prometheus metric");
+        let planner_stats_entries = prometheus::IntGauge::new(
+            "rushdb_planner_stats_entries",
+            "Value distributions held by the planner-statistics cache",
+        )
+        .expect("valid Prometheus metric");
+        let group_commits_total = prometheus::IntCounter::new(
+            "rushdb_storage_group_commits_total",
+            "Cumulative group-commit write transactions persisted",
+        )
+        .expect("valid Prometheus metric");
+        let scheduler_inflight = prometheus::IntGauge::new(
+            "rushdb_scheduler_inflight",
+            "Transport jobs admitted to the bounded scheduler",
+        )
+        .expect("valid Prometheus metric");
+        let scheduler_capacity = prometheus::IntGauge::new(
+            "rushdb_scheduler_capacity",
+            "Global bounded scheduler admission capacity",
+        )
+        .expect("valid Prometheus metric");
+        let log_rows_pruned = prometheus::IntGauge::new(
+            "rushdb_commit_log_rows_pruned",
