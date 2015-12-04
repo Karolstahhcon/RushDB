@@ -63,3 +63,36 @@ fn tls_listener_serves_https() {
 
     let cfg = ServerConfig {
         port: 0,
+        listen_addr: "127.0.0.1".into(),
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        pgwire_port: 0,
+        grpc_port: 0,
+        bolt_port: 0,
+        token: "t".into(),
+        data_dir: None,
+        multitenant: false,
+        capability_secret: None,
+        raft: None,
+        resources: rushdb_server::resource_config::ResourceConfig::default(),
+        transactions: rushdb_server::resource_config::TransactionConfig::default(),
+        languages: rushdb_protocol::LanguageSet::default(),
+        max_request_bytes: 64 * 1024 * 1024,
+        maintenance: false,
+        allow_insecure_listen: false,
+        require_index_warmup: false,
+        request_timeout_ms: 0,
+        max_concurrent_requests_per_tenant: 0,
+        explicit_flags: std::collections::BTreeSet::new(),
+    };
+    // rustls 0.23 with both `ring` and (via axum-server) `aws-lc-rs` enabled
+    // cannot auto-determine a provider; install one explicitly.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install ring provider");
+    let (mut router, port) = new_router(cfg).expect("bootstrap");
+    std::thread::spawn(move || router.serve_forever());
+
+    // Retry the connect: axum-server binds + loads the cert asynchronously.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut tcp = loop {
