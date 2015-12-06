@@ -31,3 +31,14 @@ pub(super) fn as_statement(mut request: RequestEnvelope) -> Result<RequestEnvelo
         Operation::Mutate {
             mutation:
                 Mutation::GremlinBytecode {
+                    bytecode,
+                    parameters,
+                },
+        } => Operation::Mutate {
+            mutation: Mutation::Statement {
+                language: StatementLanguage::Gremlin,
+                statement: text(&bytecode)?,
+                parameters,
+            },
+        },
+        other => other,

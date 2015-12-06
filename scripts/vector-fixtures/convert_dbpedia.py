@@ -18,23 +18,3 @@ import pyarrow.parquet as pq
 
 VEC_COL = "text-embedding-3-large-1536-embedding"
 N_DIM = 1536
-
-
-def read_shards(data_dir: str) -> pd.DataFrame:
-    frames = []
-    for i in range(3):
-        path = f"{data_dir}/train-{i}.parquet"
-        table = pq.read_table(path, columns=["_id", "title", "text", VEC_COL])
-        frames.append(table.to_pandas())
-    return pd.concat(frames, ignore_index=True)
-
-
-def write_fvecs(rows: np.ndarray, path: str) -> None:
-    n, d = rows.shape
-    with open(path, "wb") as f:
-        for r in rows:
-            f.write(struct.pack("<I", d))
-            f.write(r.astype("<f4").tobytes())
-    print(f"  wrote {path}: {n} x {d} (float32)")
-
-
