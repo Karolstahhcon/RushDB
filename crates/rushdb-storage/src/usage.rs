@@ -13,3 +13,34 @@
 
 use std::collections::BTreeMap;
 
+use rushdb_types::ids::TenantId;
+use rushdb_types::keys::{parse_tenant, usage_bytes_key, F_USAGE_BYTES, TENANT_PREFIX_LEN};
+
+/// Whether `key` is a tenant's usage-bytes row.
+#[must_use]
+pub fn is_usage_bytes_key(key: &[u8]) -> bool {
+    key.len() == TENANT_PREFIX_LEN + 1
+        && parse_tenant(key).is_some()
+        && key[TENANT_PREFIX_LEN] == F_USAGE_BYTES
+}
+
+/// Byte deltas of one batch, per tenant.
+#[derive(Default)]
+pub(crate) struct UsageBytes {
+    deltas: BTreeMap<TenantId, i64>,
+}
+
+impl UsageBytes {
+    /// Record that `key` went from a value of `old` bytes to one of `new`
+    /// bytes (`None` = absent).
+    pub(crate) fn record(&mut self, key: &[u8], old: Option<usize>, new: Option<usize>) {
+        let Some(tenant) = parse_tenant(key) else {
+            return;
+        };
+        if is_usage_bytes_key(key) {
+            return;
+        }
+        let size = |value: Option<usize>| {
+            value.map_or(0, |len| i64::try_from(key.len() + len).unwrap_or(i64::MAX))
+        };
+        let delta = size(new) - size(old);
