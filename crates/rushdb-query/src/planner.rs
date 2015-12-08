@@ -254,3 +254,772 @@ fn leaf_estimate<R: TryRead>(
         }
         // `$id` resolves through the record-id index: one lookup, one ordinal.
         Expr::Field(FieldPred::Id(_)) => Some(1),
+        // `$id: {$in: [...]}` lowers to an `Or` of id leaves; the union is
+        // exactly the id set, so it is indexable (no residual scan).
+        Expr::Or(items) if !items.is_empty() && items.iter().all(is_id_leaf) => {
+            Some(items.len() as u64)
+        }
+        Expr::Field(FieldPred::IsNull(_, true) | FieldPred::Exists(_, true)) => Some(u64::MAX),
+        // A bounded estimate from the on-demand value distribution
+        // (never surfaced as EXPLAIN's exact field, see `is_range_leaf`).
+        Expr::Field(FieldPred::Gt(name, bound)) => {
+            range_leaf_estimate(snap, tenant, name, RangeOp::Gt, *bound)?
+        }
+        Expr::Field(FieldPred::Gte(name, bound)) => {
+            range_leaf_estimate(snap, tenant, name, RangeOp::Gte, *bound)?
+        }
+        Expr::Field(FieldPred::Lt(name, bound)) => {
+            range_leaf_estimate(snap, tenant, name, RangeOp::Lt, *bound)?
+        }
+        Expr::Field(FieldPred::Lte(name, bound)) => {
+            range_leaf_estimate(snap, tenant, name, RangeOp::Lte, *bound)?
+        }
+        _ => None,
+    })
+}
+
+/// Whether `expr` is a range leaf (`Gt`/`Gte`/`Lt`/`Lte`). Used to exclude
+/// range leaves from [`explain_cardinality`] *structurally* — not by
+/// coincidentally filtering on the `u64::MAX` sentinel value — so a future
+/// improvement to the histogram estimate can never silently leak an
+/// approximation into EXPLAIN's exact `estimatedCardinality` field.
+fn is_range_leaf(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Field(
+            FieldPred::Gt(..) | FieldPred::Gte(..) | FieldPred::Lt(..) | FieldPred::Lte(..)
+        )
+    )
+}
+
+/// Resolves a range leaf's selectivity against the value distribution of the
+/// property, computed on demand from the value dictionary:
+/// `(estimated owners, owner-occurrences the distribution covers)` for the
+/// first numeric typed definition that holds values, or `None` when none
+/// does.
+fn range_leaf_histogram_estimate<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    name: &str,
+    op: RangeOp,
+    bound: f64,
+) -> Result<Option<(u64, u64)>, QueryError> {
+    let norm = normalize(name);
+    if norm.is_empty() || rushdb_types::value::is_reserved_name(&norm) {
+        return Ok(None);
+    }
+    let Some(fid) = family_id(snap, tenant, &norm)? else {
+        return Ok(None);
+    };
+    let above = matches!(op, RangeOp::Gt | RangeOp::Gte);
+    for ty in [
+        LogicalType::Int64,
+        LogicalType::Float64,
+        LogicalType::DateTime,
+    ] {
+        let Some(pid) = property_id(snap, tenant, fid, ty)? else {
+            continue;
+        };
+        let Some(hist) = crate::stats_cache::distribution(
+            snap,
+            tenant,
+            rushdb_types::ids::OwnerKind::Record,
+            None,
+            pid,
+        )?
+        else {
+            continue;
+        };
+        let scalar = match ty {
+            LogicalType::Float64 => Scalar::Float64(bound),
+            LogicalType::Int64 => Scalar::Int64(round_bound(bound, above)),
+            LogicalType::DateTime => Scalar::DateTime(round_bound(bound, above)),
+            LogicalType::Boolean | LogicalType::Utf8 => continue,
+        };
+        let Ok(enc) = rushdb_types::encoding::encode_order_preserving(ty, &scalar) else {
+            continue;
+        };
+        // Few distinct values is where bucket interpolation is weakest and an
+        // exact dictionary sum is cheapest (a partial walk saw too few to know).
+        if !hist.partial && hist.distinct <= LOW_CARDINALITY_EXACT_THRESHOLD {
+            let exact = exact_low_cardinality_range_count(snap, tenant, pid, ty, op, bound)?;
+            return Ok(Some((exact, hist.total())));
+        }
+        return Ok(Some((hist.estimate(&enc, above), hist.total())));
+    }
+    Ok(None)
+}
+
+/// Distinct-value ceiling gating [`exact_low_cardinality_range_count`].
+const LOW_CARDINALITY_EXACT_THRESHOLD: u64 = 256;
+
+/// Exact owner-occurrence count for a range predicate: the sum of the value
+/// dictionary's refcounts over matching values.
+fn exact_low_cardinality_range_count<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    pid: u64,
+    ty: LogicalType,
+    op: RangeOp,
+    bound: f64,
+) -> Result<u64, QueryError> {
+    let tag = rushdb_types::encoding::logical_tag(ty);
+    let mut total = 0u64;
+    for (entry, count) in rushdb_lmpg::derived::dictionary(
+        snap,
+        tenant,
+        rushdb_types::ids::OwnerKind::Record,
+        pid,
+        &[],
+    )? {
+        let Some((&entry_tag, payload)) = entry.split_first() else {
+            continue;
+        };
+        if entry_tag != tag {
+            continue;
+        }
+        let Ok(scalar) = rushdb_types::encoding::decode_order_preserving(ty, payload) else {
+            continue;
+        };
+        if range_scalar_matches(&scalar, op, bound) {
+            total = total.saturating_add(count);
+        }
+    }
+    Ok(total)
+}
+
+/// Bounded estimate of owners satisfying a range predicate, or `u64::MAX`
+/// ("eligible but unknown") when the property holds no numeric values.
+fn range_leaf_estimate<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    name: &str,
+    op: RangeOp,
+    bound: f64,
+) -> Result<Option<u64>, QueryError> {
+    Ok(Some(
+        range_leaf_histogram_estimate(snap, tenant, name, op, bound)?
+            .map_or(u64::MAX, |(estimate, _total)| estimate),
+    ))
+}
+
+/// Selectivity fraction (`estimated owners / exact owner-occurrences`,
+/// clamped to `[0.0, 1.0]`) for the first range leaf (`Gt`/`Gte`/`Lt`/`Lte`)
+/// in `where_`, from the value-distribution histogram — `None` when the predicate has no
+/// range leaf or no usable histogram exists. This is `ExplainPlan`'s own
+/// estimate channel: deliberately never merged with
+/// [`explain_cardinality`]'s exact field.
+///
+/// # Errors
+///
+/// Returns the underlying storage error from a definition/family lookup.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "estimate/total feed a selectivity fraction, not an exact count; this is \
+              approximate by design"
+)]
+pub fn explain_range_selectivity<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    where_: &Expr,
+) -> Result<Option<f64>, QueryError> {
+    let mut leaves = Vec::new();
+    collect_leaves(where_, &mut leaves);
+    for leaf in leaves {
+        let Expr::Field(pred) = leaf else {
+            continue;
+        };
+        let (name, op, bound) = match pred {
+            FieldPred::Gt(name, bound) => (name, RangeOp::Gt, *bound),
+            FieldPred::Gte(name, bound) => (name, RangeOp::Gte, *bound),
+            FieldPred::Lt(name, bound) => (name, RangeOp::Lt, *bound),
+            FieldPred::Lte(name, bound) => (name, RangeOp::Lte, *bound),
+            _ => continue,
+        };
+        if let Some((estimate, total)) =
+            range_leaf_histogram_estimate(snap, tenant, name, op, bound)?
+        {
+            if total > 0 {
+                return Ok(Some((estimate as f64 / total as f64).clamp(0.0, 1.0)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A set of owner ordinals. Ordinals are allocated densely per tenant, so a
+/// compressed bitmap holds a million owners in ~128 KiB and intersects them
+/// word by word.
+pub(crate) type OwnerSet = roaring::RoaringTreemap;
+
+/// Upper bound of an [`OwnerSet`]'s bytes per owner: array containers store
+/// two bytes per owner, bitmap containers less; the slack covers container
+/// headers.
+pub(crate) const OWNER_SET_BYTES_PER_OWNER: usize = 4;
+
+pub(super) fn extend_owners(
+    owners: &mut OwnerSet,
+    additions: impl IntoIterator<Item = u64>,
+    limit: usize,
+) -> Result<(), QueryError> {
+    for owner in additions {
+        if owners.len() >= u64::try_from(limit).unwrap_or(u64::MAX) && !owners.contains(owner) {
+            return Err(QueryError::ResourceLimit(
+                "aggregate candidate budget exceeded".into(),
+            ));
+        }
+        owners.insert(owner);
+    }
+    Ok(())
+}
+
+/// Materialize an eligible leaf's owner set exactly: from a declared ordered
+/// index when one covers every requested label; otherwise presence
+/// rows narrow to the owners carrying the property (under `labels` when
+/// given), and their occurrence values decide the predicate. There are no
+/// automatic value postings.
+fn leaf_owners<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    expr: &Expr,
+    scope: &LeafScope<'_>,
+) -> Result<Option<OwnerSet>, QueryError> {
+    let (labels, owner_limit) = (scope.labels, scope.owner_limit);
+    if let Some(owners) = crate::index_access::leaf_owners(snap, tenant, expr, labels, owner_limit)?
+    {
+        return Ok(Some(owners));
+    }
+    match expr {
+        Expr::Field(FieldPred::Eq(name, value)) if value.is_null() => {
+            owners_with_presence(snap, tenant, name, true, labels, owner_limit)
+        }
+        Expr::Field(FieldPred::Eq(name, value)) => {
+            owners_for_values(snap, tenant, name, std::slice::from_ref(value), scope)
+        }
+        Expr::Field(FieldPred::In(name, values)) if values.iter().all(|v| !v.is_null()) => {
+            owners_for_values(snap, tenant, name, values, scope)
+        }
+        Expr::Field(FieldPred::Id(id)) => Ok(Some(owners_for_id(snap, tenant, id)?)),
+        Expr::Or(items) if !items.is_empty() && items.iter().all(is_id_leaf) => {
+            let mut out = OwnerSet::new();
+            for item in items {
+                if let Expr::Field(FieldPred::Id(id)) = item {
+                    extend_owners(&mut out, owners_for_id(snap, tenant, id)?, owner_limit)?;
+                }
+            }
+            Ok(Some(out))
+        }
+        Expr::Field(FieldPred::Exists(name, true)) => {
+            owners_with_presence(snap, tenant, name, false, labels, owner_limit)
+        }
+        Expr::Field(FieldPred::IsNull(name, true)) => {
+            owners_with_presence(snap, tenant, name, true, labels, owner_limit)
+        }
+        Expr::Field(FieldPred::Gt(name, bound)) => {
+            owners_with_range(snap, tenant, name, RangeOp::Gt, *bound, scope)
+        }
+        Expr::Field(FieldPred::Gte(name, bound)) => {
+            owners_with_range(snap, tenant, name, RangeOp::Gte, *bound, scope)
+        }
+        Expr::Field(FieldPred::Lt(name, bound)) => {
+            owners_with_range(snap, tenant, name, RangeOp::Lt, *bound, scope)
+        }
+        Expr::Field(FieldPred::Lte(name, bound)) => {
+            owners_with_range(snap, tenant, name, RangeOp::Lte, *bound, scope)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Leaf resolving through the record-id index (`$id`).
+fn is_id_leaf(expr: &Expr) -> bool {
+    matches!(expr, Expr::Field(FieldPred::Id(_)))
+}
+
+/// Resolve `$id` string values through the maintained id index. Hyphens are
+/// ignored and case-folded, matching the evaluator's `canonical_id`.
+fn owners_for_id<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    id: &str,
+) -> Result<OwnerSet, QueryError> {
+    let canonical = canonical_id(id);
+    let Some(bytes) = hex_decode_16(&canonical) else {
+        return Ok(OwnerSet::new());
+    };
+    let rid = rushdb_types::ids::RecordId(bytes);
+    Ok(access::record_by_id(snap, tenant, &rid)?
+        .map(|header| header.ordinal)
+        .into_iter()
+        .collect())
+}
+
+/// Exact owner-occurrence count of `values` from the value dictionary,
+/// restricted to `labels` when given. `None` = not indexable.
+fn estimate_values<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    name: &str,
+    values: &[Json],
+    labels: &[String],
+) -> Result<Option<u64>, QueryError> {
+    let norm = normalize(name);
+    if norm.is_empty() || rushdb_types::value::is_reserved_name(&norm) {
+        return Ok(None);
+    }
+    let Some(fid) = family_id(snap, tenant, &norm)? else {
+        return Ok(Some(0));
+    };
+    let Some((pids, encodings)) = value_probes(snap, tenant, fid, values)? else {
+        return Ok(None);
+    };
+    let mut total = 0u64;
+    for (ty, enc) in &encodings {
+        let mut entry = vec![rushdb_types::encoding::logical_tag(*ty)];
+        entry.extend_from_slice(enc);
+        if entry.len() > rushdb_types::keys::DICT_MAX_VALUE_BYTES {
+            // Long values are not in the dictionary: unknown, sorts last.
+            return Ok(Some(u64::MAX));
+        }
+        for &pid in &pids {
+            for label in labels_for(snap, tenant, pid, labels)? {
+                total = total.saturating_add(rushdb_lmpg::derived::value_count(
+                    snap,
+                    tenant,
+                    rushdb_types::ids::OwnerKind::Record,
+                    &label,
+                    pid,
+                    &entry,
+                )?);
+            }
+        }
+    }
+    Ok(Some(total))
+}
+
+/// The labels to search for a pid: the requested ones, or every label whose
+/// records carry it.
+fn labels_for<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    pid: u64,
+    labels: &[String],
+) -> Result<Vec<String>, QueryError> {
+    if labels.is_empty() {
+        Ok(rushdb_lmpg::derived::labels_of_pid(
+            snap,
+            tenant,
+            rushdb_types::ids::OwnerKind::Record,
+            pid,
+        )?)
+    } else {
+        Ok(labels.to_vec())
+    }
+}
+
+/// What a leaf is resolved against: the requested labels, the owner budget,
+/// and the owners earlier leaves already narrowed to (when any).
+pub(super) struct LeafScope<'a> {
+    pub(super) labels: &'a [String],
+    pub(super) owner_limit: usize,
+    pub(super) candidates: Option<&'a OwnerSet>,
+}
+
+/// Owners under `labels` (all when empty) carrying a non-null value of `pid`
+/// for which `keep` holds. When earlier leaves already narrowed the owners
+/// to fewer candidates than `pid`'s population, only those candidates are
+/// checked; otherwise the population is walked. Returns `false` (scan
+/// instead) when the population to walk exceeds the materialization cap.
+fn owners_matching<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    pid: u64,
+    scope: &LeafScope<'_>,
+    owners: &mut OwnerSet,
+    keep: &dyn Fn(&access::Occurrence) -> bool,
+) -> Result<bool, QueryError> {
+    let kind = rushdb_types::ids::OwnerKind::Record;
+    let labels = labels_for(snap, tenant, pid, scope.labels)?;
+    let mut population = 0u64;
+    for label in &labels {
+        population = population.saturating_add(rushdb_lmpg::derived::prop_support_label(
+            snap, tenant, kind, pid, label,
+        )?);
+    }
+    // Labels whose owners hold `pid` as an array (maintained per label): only
+    // those need every element; elsewhere the value is the single row at
+    // element 0, read with one point get instead of a range scan per owner.
+    let (_, array_labels) = rushdb_lmpg::derived::array_markers(snap, tenant, kind, pid)?;
+    let matches = |owner: u64, scalar: bool| -> Result<bool, QueryError> {
+        Ok(if scalar {
+            access::occurrence(snap, tenant, kind, owner, pid, 0)?.is_some_and(|occ| keep(&occ))
+        } else {
+            access::occurrences_of_pid(snap, tenant, kind, owner, pid)?
+                .iter()
+                .any(keep)
+        })
+    };
+    if let Some(candidates) = scope.candidates.filter(|c| c.len() < population) {
+        let scalar = array_labels.is_empty();
+        for owner in candidates {
+            if !owners.contains(owner) && matches(owner, scalar)? {
+                extend_owners(owners, std::iter::once(owner), scope.owner_limit)?;
+            }
+        }
+        return Ok(true);
+    }
+    if population > PLANNER_MATERIALIZE_CAP {
+        return Ok(false);
+    }
+    if population > UNINDEXED_WALK_THRESHOLD {
+        UNINDEXED_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    for label in &labels {
+        let scalar = !array_labels.contains(label);
+        for owner in rushdb_lmpg::derived::presence_owners(
+            snap,
+            tenant,
+            kind,
+            label,
+            pid,
+            rushdb_types::keys::NULLNESS_VALUE,
+        )? {
+            if !owners.contains(owner) && matches(owner, scalar)? {
+                extend_owners(owners, std::iter::once(owner), scope.owner_limit)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Owner ordinals whose value satisfies a range predicate. String and boolean
+/// properties never satisfy `numeric_cmp_any`, so they contribute nothing.
+fn owners_with_range<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    name: &str,
+    op: RangeOp,
+    bound: f64,
+    scope: &LeafScope<'_>,
+) -> Result<Option<OwnerSet>, QueryError> {
+    let norm = normalize(name);
+    if norm.is_empty() || rushdb_types::value::is_reserved_name(&norm) {
+        return Ok(None);
+    }
+    let Some(fid) = family_id(snap, tenant, &norm)? else {
+        return Ok(Some(OwnerSet::new()));
+    };
+    let mut owners = OwnerSet::new();
+    for ty in [
+        LogicalType::Int64,
+        LogicalType::Float64,
+        LogicalType::DateTime,
+    ] {
+        let Some(pid) = property_id(snap, tenant, fid, ty)? else {
+            continue;
+        };
+        let keep = |occ: &access::Occurrence| {
+            matches!(occ.value, rushdb_types::occurrence::OccurrenceValue::Stored { ty: stored } if stored == ty)
+                && rushdb_types::encoding::decode_order_preserving(ty, &occ.payload)
+                    .is_ok_and(|scalar| range_scalar_matches(&scalar, op, bound))
+        };
+        if !owners_matching(snap, tenant, pid, scope, &mut owners, &keep)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(owners))
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RangeOp {
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+/// Round a float range bound to an integer threshold without leaving the i64
+/// domain (`as` saturates on overflow).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "floor/ceil already made the value integral; `as` saturates at the i64 edges"
+)]
+fn round_bound(bound: f64, lower: bool) -> i64 {
+    if lower {
+        bound.floor() as i64
+    } else {
+        bound.ceil() as i64
+    }
+}
+
+pub(super) fn range_scalar_matches(scalar: &Scalar, op: RangeOp, bound: f64) -> bool {
+    // DateTime and integer postings share the exact integer domain. Comparing
+    // them through `f64` would make values above 2^53 collide; the canonical
+    // scalar comparator preserves the integer/float ordering instead.
+    let scalar = match scalar {
+        Scalar::DateTime(value) => Scalar::Int64(*value),
+        other => other.clone(),
+    };
+    let Some(ordering) = rushdb_types::value::scalar_cmp(&scalar, &Scalar::Float64(bound)) else {
+        return false;
+    };
+    match op {
+        RangeOp::Gt => ordering == std::cmp::Ordering::Greater,
+        RangeOp::Gte => matches!(
+            ordering,
+            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+        ),
+        RangeOp::Lt => ordering == std::cmp::Ordering::Less,
+        RangeOp::Lte => matches!(
+            ordering,
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+        ),
+    }
+}
+
+pub(super) fn family_id<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    normalized: &str,
+) -> Result<Option<u64>, QueryError> {
+    use rushdb_lmpg::reader::keys_ext as kx;
+    let sig = kx::family_sig_key(
+        tenant,
+        "default",
+        rushdb_types::ids::OwnerKind::Record,
+        normalized,
+    );
+    let Some(raw) = snap.get(&sig)? else {
+        return Ok(None);
+    };
+    Ok(Some(u64::from_be_bytes(
+        raw.as_slice()
+            .try_into()
+            .map_err(|_| rushdb_storage::StorageError::CorruptLog)?,
+    )))
+}
+
+fn property_id<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    fid: u64,
+    ty: LogicalType,
+) -> Result<Option<u64>, QueryError> {
+    use rushdb_lmpg::reader::keys_ext as kx;
+    let Some(raw) = snap.get(&kx::definition_key(tenant, fid, TypeState::Known(ty)))? else {
+        return Ok(None);
+    };
+    Ok(Some(u64::from_be_bytes(
+        raw.as_slice()
+            .try_into()
+            .map_err(|_| rushdb_storage::StorageError::CorruptLog)?,
+    )))
+}
+
+/// Every logical type state a property family may have definitions for.
+fn all_type_states() -> Vec<TypeState> {
+    let mut states = vec![TypeState::Unresolved];
+    states.extend(
+        [
+            LogicalType::Boolean,
+            LogicalType::Int64,
+            LogicalType::Float64,
+            LogicalType::Utf8,
+            LogicalType::DateTime,
+        ]
+        .into_iter()
+        .map(TypeState::Known),
+    );
+    states
+}
+
+/// Typed definitions `(pid)` of a property family, every type state.
+pub(super) fn pids_of<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    fid: u64,
+) -> Result<Vec<u64>, QueryError> {
+    use rushdb_lmpg::reader::keys_ext as kx;
+    let mut pids = Vec::new();
+    for state in all_type_states() {
+        let Some(raw) = snap.get(&kx::definition_key(tenant, fid, state))? else {
+            continue;
+        };
+        pids.push(u64::from_be_bytes(
+            raw.as_slice()
+                .try_into()
+                .map_err(|_| rushdb_storage::StorageError::CorruptLog)?,
+        ));
+    }
+    Ok(pids)
+}
+
+/// Presence row prefixes `(label, pid, nullness)` of a property name under
+/// `labels` (all labels carrying it when empty); `null_only` restricts to
+/// owners whose values are all null.
+fn presence_prefixes<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    name: &str,
+    null_only: bool,
+    labels: &[String],
+) -> Result<Option<Vec<Vec<u8>>>, QueryError> {
+    let norm = normalize(name);
+    if norm.is_empty() || rushdb_types::value::is_reserved_name(&norm) {
+        return Ok(None);
+    }
+    let Some(fid) = family_id(snap, tenant, &norm)? else {
+        return Ok(Some(Vec::new()));
+    };
+    let mut prefixes = Vec::new();
+    for pid in pids_of(snap, tenant, fid)? {
+        for label in labels_for(snap, tenant, pid, labels)? {
+            let nullness: &[u8] = if null_only {
+                &[rushdb_types::keys::NULLNESS_NULL]
+            } else {
+                &[
+                    rushdb_types::keys::NULLNESS_VALUE,
+                    rushdb_types::keys::NULLNESS_NULL,
+                ]
+            };
+            for &nullness in nullness {
+                prefixes.push(rushdb_types::keys::presence_nullness_prefix(
+                    tenant,
+                    rushdb_types::ids::OwnerKind::Record,
+                    &label,
+                    pid,
+                    nullness,
+                ));
+            }
+        }
+    }
+    Ok(Some(prefixes))
+}
+
+/// Owner ordinals carrying `name` (any value, or only nulls with
+/// `null_only`) under `labels`, from presence rows. `None` when not
+/// indexable.
+pub(super) fn owners_with_presence<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    name: &str,
+    null_only: bool,
+    labels: &[String],
+    owner_limit: usize,
+) -> Result<Option<OwnerSet>, QueryError> {
+    let Some(prefixes) = presence_prefixes(snap, tenant, name, null_only, labels)? else {
+        return Ok(None);
+    };
+    let mut owners = OwnerSet::new();
+    for prefix in prefixes {
+        let (start, end) = rushdb_storage::prefix_range(&prefix);
+        let mut failed = None;
+        snap.for_each_key(&start, &end, &mut |key| {
+            let result = rushdb_types::keys::read_ord_tail(key, prefix.len())
+                .ok_or_else(|| rushdb_storage::StorageError::CorruptLog.into())
+                .and_then(|owner| extend_owners(&mut owners, std::iter::once(owner), owner_limit));
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    failed = Some(error);
+                    false
+                }
+            }
+        })?;
+        if let Some(error) = failed {
+            return Err(error);
+        }
+    }
+    Ok(Some(owners))
+}
+
+/// Owner ordinals whose value equals any of `values` (exact), under
+/// `labels`. `None` when the shape is not indexable or the population is too
+/// large to inspect (scan instead).
+fn owners_for_values<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    name: &str,
+    values: &[Json],
+    scope: &LeafScope<'_>,
+) -> Result<Option<OwnerSet>, QueryError> {
+    let norm = normalize(name);
+    // System fields and `_id` are not properties; leave them to the evaluator.
+    if norm.is_empty() || rushdb_types::value::is_reserved_name(&norm) {
+        return Ok(None);
+    }
+    let Some(fid) = family_id(snap, tenant, &norm)? else {
+        return Ok(Some(OwnerSet::new()));
+    };
+    let Some((pids, encodings)) = value_probes(snap, tenant, fid, values)? else {
+        return Ok(None);
+    };
+    let keep = |occ: &access::Occurrence| {
+        encodings.iter().any(|(ty, enc)| {
+            matches!(occ.value, rushdb_types::occurrence::OccurrenceValue::Stored { ty: stored } if stored == *ty)
+                && occ.payload == *enc
+        })
+    };
+    let mut owners = OwnerSet::new();
+    for pid in pids {
+        if !owners_matching(snap, tenant, pid, scope, &mut owners, &keep)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(owners))
+}
+
+/// Typed definitions of family `fid` that may hold any of `values`, and every
+/// `(type, encoding)` a matching occurrence may carry. Encodings are probed
+/// under every definition, not only their own: a write can widen an Int64
+/// value into an existing Float64 definition while keeping its Int64
+/// encoding. `None` when a value is not equality-indexable.
+type ValueProbes = (std::collections::BTreeSet<u64>, Vec<(LogicalType, Vec<u8>)>);
+
+fn value_probes<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    fid: u64,
+    values: &[Json],
+) -> Result<Option<ValueProbes>, QueryError> {
+    let mut pids = std::collections::BTreeSet::new();
+    let mut encodings = Vec::new();
+    for value in values {
+        let Some(variants) = scalar_variants(value) else {
+            return Ok(None);
+        };
+        for (ty, scalar) in variants {
+            let Ok(enc) = rushdb_types::encoding::encode_order_preserving(ty, &scalar) else {
+                return Ok(None);
+            };
+            encodings.push((ty, enc));
+            if let Some(pid) = property_id(snap, tenant, fid, ty)? {
+                pids.insert(pid);
+            }
+        }
+    }
+    Ok(Some((pids, encodings)))
+}
+
+/// Exact owner support of a property (summed over its typed definitions;
+/// owners with several typed values count once per definition), restricted
+/// to `labels` when given. `None` when not a property name.
+pub(super) fn total_support<R: TryRead>(
+    snap: &R,
+    tenant: rushdb_types::ids::TenantId,
+    name: &str,
+    labels: &[String],
+) -> Result<Option<u64>, QueryError> {
+    let norm = normalize(name);
+    if norm.is_empty() || rushdb_types::value::is_reserved_name(&norm) {
+        return Ok(None);
+    }
+    let Some(fid) = family_id(snap, tenant, &norm)? else {
+        return Ok(Some(0));
+    };
+    let kind = rushdb_types::ids::OwnerKind::Record;
+    let mut total = 0u64;
+    for pid in pids_of(snap, tenant, fid)? {
+        if labels.is_empty() {
+            total = total.saturating_add(rushdb_lmpg::derived::prop_support_total(
+                snap, tenant, kind, pid,

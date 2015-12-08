@@ -101,3 +101,107 @@ impl ProtocolExecutor<'_> {
         execution_context: &mut rushdb_engine::ExecutionContext,
     ) -> Result<Response, ProtocolError> {
         let (count, relationships) = match Self::ingest_input(ingest)? {
+            Some((label, documents, options)) => self
+                .node
+                .tx_stage_ingest(&transaction_id, label.as_deref(), &documents, &options)
+                .map_err(|error| self.transaction_failed(&transaction_id, error))?,
+            None => (0, 0),
+        };
+        execution_context
+            .check_deadline()
+            .map_err(|error| execution_failed(error.to_string()))?;
+        Ok(Response::TransactionIngested {
+            transaction_id,
+            count,
+            relationships,
+        })
+    }
+
+    fn ingest_documents(
+        &self,
+        label: Option<&str>,
+        documents: &serde_json::Value,
+        options: &serde_json::Value,
+        execution_context: &mut rushdb_engine::ExecutionContext,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Response, ProtocolError> {
+        let result = self
+            .node
+            .ingest_documents_with_execution_context(
+                execution_context,
+                label,
+                documents,
+                options,
+                is_cancelled,
+            )
+            .map_err(|error| {
+                if execution_context.check_deadline().is_err() {
+                    execution_failed("execution deadline exceeded")
+                } else if is_cancelled() {
+                    ProtocolError::new(ErrorCode::Cancelled, "operation cancelled")
+                } else {
+                    execution_failed(error)
+                }
+            })?;
+        // The engine reports ingested records as `data` only when the
+        // caller requested them. `returnResult: false` (the default)
+        // yields `data: true`, and a result set above the inline
+        // reconstruction bound omits `data` entirely. Both are normal
+        // success shapes and map to an empty record list; any other
+        // shape is a malformed engine payload.
+        let records = match result.get("data") {
+            Some(serde_json::Value::Array(records)) => records.clone(),
+            Some(serde_json::Value::Bool(_)) | None => Vec::new(),
+            Some(_) => {
+                return Err(execution_failed(
+                    "engine ingest `data` must be an array or boolean",
+                ))
+            }
+        };
+        execution_context
+            .check_deadline()
+            .map_err(|error| execution_failed(error.to_string()))?;
+        if is_cancelled() {
+            return Err(ProtocolError::new(
+                ErrorCode::Cancelled,
+                "operation cancelled",
+            ));
+        }
+        Ok(Response::Ingested {
+            count: response_u64(&result, "count")?,
+            relationships: response_u64(&result, "relationships")?,
+            records,
+        })
+    }
+
+    pub(super) fn index(
+        &self,
+        index: IndexOperation,
+        execution_context: &mut rushdb_engine::ExecutionContext,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Response, ProtocolError> {
+        execution_context
+            .check_deadline()
+            .map_err(|error| execution_failed(error.to_string()))?;
+        if is_cancelled() {
+            return Err(ProtocolError::new(
+                ErrorCode::Cancelled,
+                "operation cancelled",
+            ));
+        }
+        let response = match index {
+            IndexOperation::Create { definition } => Response::Index {
+                index: self
+                    .node
+                    .create_index(&definition)
+                    .map_err(execution_failed)?,
+            },
+            IndexOperation::Drop { name } => {
+                self.node.drop_index(&name).map_err(execution_failed)?;
+                Response::Mutation { affected: 1 }
+            }
+            IndexOperation::CreateVector { definition } => {
+                let index = self
+                    .node
+                    .create_vector_index_with_execution_context(execution_context, &definition)
+                    .map_err(execution_failed)?;
