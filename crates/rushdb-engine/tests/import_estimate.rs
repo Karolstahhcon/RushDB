@@ -18,13 +18,3 @@ fn nested_import_still_rejects_a_tiny_budget() {
     let document = ten_level_nested_document();
     let mut context = engine
         .context(None, OperationClass::Write, None, Some(1))
-        .unwrap();
-
-    assert!(engine
-        .import_document_with_context(&mut context, "Audit", &document)
-        .is_err());
-}
-
-#[test]
-fn ten_level_nested_import_fits_a_64_mib_budget() {
-    let engine = Engine::new_in_memory();
