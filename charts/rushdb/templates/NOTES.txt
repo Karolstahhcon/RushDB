@@ -1,9 +1,3 @@
 RushDB is starting as the StatefulSet {{ include "rushdb.fullname" . }}.
 
 Check it:
-  kubectl port-forward svc/{{ include "rushdb.fullname" . }} {{ .Values.server.httpPort }}:{{ .Values.server.httpPort }} -n {{ .Release.Namespace }}
-  curl http://127.0.0.1:{{ .Values.server.httpPort }}/ready
-
-In-cluster address: http://{{ include "rushdb.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.server.httpPort }}
-{{- if .Values.server.pgwirePort }}
-PostgreSQL wire:    {{ include "rushdb.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.server.pgwirePort }} (password: the token)

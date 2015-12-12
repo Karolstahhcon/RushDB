@@ -133,3 +133,48 @@ fn eq_bool_and_array_membership() {
 
 #[test]
 fn in_filter_matches_scan() {
+    assert_both(
+        &json!({"where": {"s": {"$in": ["alpha", "gamma"]}}}),
+        4,
+        "in strings",
+    );
+    assert_both(&json!({"where": {"n": {"$in": [7, 7.5]}}}), 3, "in numbers");
+    assert_both(
+        &json!({"where": {"s": {"$in": ["nope"]}}}),
+        0,
+        "in empty match",
+    );
+}
+
+#[test]
+fn label_scoped_index_matches_scan() {
+    assert_both(
+        &json!({"labels": ["A"], "where": {"s": "alpha"}}),
+        2,
+        "label scoped",
+    );
+    assert_both(
+        &json!({"labels": ["B"], "where": {"s": "alpha"}}),
+        1,
+        "label scoped single",
+    );
+    assert_both(
+        &json!({"labels": ["A", "B"], "where": {"s": "alpha"}}),
+        3,
+        "label union",
+    );
+}
+
+#[test]
+fn unsupported_shapes_fall_back_and_stay_correct() {
+    // $ne requires presence and must not be served by the index.
+    assert_both(&json!({"where": {"s": {"$ne": "alpha"}}}), 2, "ne fallback");
+    // $or is not a conjunction; whole expression must fall back.
+    assert_both(
+        &json!({"where": {"$or": [{"s": "beta"}, {"s": "gamma"}]}}),
+        2,
+        "or fallback",
+    );
+    // Conjunction with a range leaf falls back entirely and stays exact.
+    assert_both(
+        &json!({"where": {"s": "alpha", "n": {"$gte": 7}}}),
