@@ -31,3 +31,19 @@ for file in crates/rushdb-server/src/node/*.rs crates/rushdb-server/src/protocol
   case "$file" in
     */tests.rs|*_tests.rs) continue ;;
     # Ratcheted in LIMITS above; exempt from the 1300 extracted-module limit.
+    crates/rushdb-server/src/node/catalog.rs) continue ;;
+  esac
+  if (( $(wc -l < "$file") > 1300 )); then
+    printf 'quality bar: extracted module exceeds 1300 lines: %s\n' "$file" >&2
+    exit 1
+  fi
+  if rg -n '^use super::\*;' "$file"; then
+    printf 'quality bar: production module must declare its dependencies: %s\n' "$file" >&2
+    exit 1
+  fi
+done
+
+# Native query and storage must remain usable without a transport or product
+# harness. New dependencies across this boundary require an architecture review.
+if rg -n '^(use |pub use )(rushdb_server|rushdb_protocol|axum|tonic)::' \
+  crates/rushdb-query/src crates/rushdb-storage/src --glob '*.rs'; then
