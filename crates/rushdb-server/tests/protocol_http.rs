@@ -489,3 +489,248 @@ fn protocol_http_preserves_raw_envelope_and_fails_closed_on_scope_mismatch() {
         listen_addr: "127.0.0.1".into(),
         tls_cert: None,
         tls_key: None,
+        maintenance: false,
+        allow_insecure_listen: false,
+        require_index_warmup: false,
+        request_timeout_ms: 0,
+        max_concurrent_requests_per_tenant: 0,
+        explicit_flags: std::collections::BTreeSet::new(),
+    };
+    let (mut router, port) = new_router(cfg).expect("bootstrap");
+    std::thread::spawn(move || router.serve_forever());
+    std::thread::sleep(Duration::from_millis(40));
+
+    let (source_status, source_response) = call(
+        port,
+        "/protocol/v1/execute",
+        &put_request(
+            "tenant-a",
+            "SOURCE",
+            &serde_json::json!({ "targetId": ["target-1", "target-1"] }),
+        ),
+        Some("tenant-a"),
+    );
+    assert_eq!(source_status, 200);
+    assert_eq!(source_response["response"]["kind"], "record");
+    assert_eq!(source_response["response"]["record"]["label"], "SOURCE");
+    assert!(
+        source_response["response"]["record"]
+            .get("properties")
+            .and_then(|p| p.get("tenantKey"))
+            .is_none(),
+        "multitenant records must not expose a tenant discriminator property: {source_response}"
+    );
+    assert!(
+        source_response["response"]["record"].get("__id").is_none(),
+        "canonical records must not expose SDK aliases: {source_response}"
+    );
+    let (target_status, _) = call(
+        port,
+        "/protocol/v1/execute",
+        &put_request(
+            "tenant-a",
+            "TARGET",
+            &serde_json::json!({ "id": "target-1" }),
+        ),
+        Some("tenant-a"),
+    );
+    assert_eq!(target_status, 200);
+
+    let (status, response) = call(
+        port,
+        "/protocol/v1/execute",
+        &join_request("tenant-a"),
+        Some("tenant-a"),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["protocolVersion"], 1);
+    assert_eq!(response["requestId"], "http-join-1");
+    assert_eq!(response["response"]["kind"], "count");
+    assert_eq!(response["response"]["value"], 1);
+    assert!(response.get("data").is_none(), "{response}");
+
+    let (other_scope_status, _) = call(
+        port,
+        "/protocol/v1/execute",
+        &put_request(
+            "tenant-b",
+            "SOURCE",
+            &serde_json::json!({ "targetId": "target-1" }),
+        ),
+        Some("tenant-b"),
+    );
+    assert_eq!(other_scope_status, 200);
+    let (query_status, query_response) = call(
+        port,
+        "/protocol/v1/execute",
+        &records_request("tenant-a", "SOURCE"),
+        Some("tenant-a"),
+    );
+    assert_eq!(query_status, 200, "{query_response}");
+    assert_eq!(query_response["response"]["kind"], "records");
+    assert_eq!(query_response["response"]["total"], 1);
+    assert!(
+        query_response["response"]["records"][0]["properties"]
+            .get("tenantKey")
+            .is_none(),
+        "records must not expose the tenant discriminator: {query_response}"
+    );
+
+    let (mismatch_status, mismatch) = call(
+        port,
+        "/protocol/v1/execute",
+        &join_request("tenant-b"),
+        Some("tenant-a"),
+    );
+    assert_eq!(mismatch_status, 403, "{mismatch}");
+    assert!(
+        mismatch["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("authenticated transport scope"),
+        "{mismatch}"
+    );
+
+    let (removed_route_status, _) = call(
+        port,
+        "/api/v1/records",
+        &serde_json::json!({}),
+        Some("tenant-a"),
+    );
+    assert_eq!(removed_route_status, 404);
+}
+
+#[test]
+fn single_tenant_mode_has_no_scope_or_discriminator() {
+    let cfg = ServerConfig {
+        port: 0,
+        pgwire_port: 0,
+        grpc_port: 0,
+        bolt_port: 0,
+        token: "test-token".into(),
+        data_dir: None,
+        multitenant: false,
+        capability_secret: None,
+        raft: None,
+        resources: rushdb_server::resource_config::ResourceConfig::default(),
+        transactions: rushdb_server::resource_config::TransactionConfig::default(),
+        languages: rushdb_protocol::LanguageSet {
+            sql: true,
+            gql: true,
+            cypher: true,
+            gremlin: true,
+            sql_pgq: true,
+            mongodb: true,
+        },
+        max_request_bytes: 64 * 1024 * 1024,
+        listen_addr: "127.0.0.1".into(),
+        tls_cert: None,
+        tls_key: None,
+        maintenance: false,
+        allow_insecure_listen: false,
+        require_index_warmup: false,
+        request_timeout_ms: 0,
+        max_concurrent_requests_per_tenant: 0,
+        explicit_flags: std::collections::BTreeSet::new(),
+    };
+    let (mut router, port) = new_router(cfg).expect("bootstrap");
+    std::thread::spawn(move || router.serve_forever());
+    std::thread::sleep(Duration::from_millis(40));
+
+    let request = serde_json::json!({
+        "protocolVersion": 1,
+        "context": {},
+        "operation": {
+            "kind": "mutate",
+            "mutation": {
+                "kind": "putRecord",
+                "mode": "create",
+                "label": "NOTE",
+                "properties": { "text": "standalone" },
+                "options": {}
+            }
+        }
+    });
+    let (status, response) = call(port, "/protocol/v1/execute", &request, None);
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(
+        response["response"]["record"]["properties"],
+        serde_json::json!({ "text": "standalone" })
+    );
+
+    let scoped_request = put_request("unexpected", "NOTE", &serde_json::json!({ "text": "bad" }));
+    let (scoped_status, scoped_response) =
+        call(port, "/protocol/v1/execute", &scoped_request, None);
+    assert_eq!(scoped_status, 403, "{scoped_response}");
+    assert_eq!(scoped_response["error"]["code"], "scope_mismatch");
+}
+
+#[test]
+fn label_less_ingest_derives_labels_from_complex_container_keys() {
+    let cfg = ServerConfig {
+        port: 0,
+        pgwire_port: 0,
+        grpc_port: 0,
+        bolt_port: 0,
+        token: "test-token".into(),
+        data_dir: None,
+        multitenant: false,
+        capability_secret: None,
+        raft: None,
+        resources: rushdb_server::resource_config::ResourceConfig::default(),
+        transactions: rushdb_server::resource_config::TransactionConfig::default(),
+        languages: rushdb_protocol::LanguageSet {
+            sql: true,
+            gql: true,
+            cypher: true,
+            gremlin: true,
+            sql_pgq: true,
+            mongodb: true,
+        },
+        max_request_bytes: 64 * 1024 * 1024,
+        listen_addr: "127.0.0.1".into(),
+        tls_cert: None,
+        tls_key: None,
+        maintenance: false,
+        allow_insecure_listen: false,
+        require_index_warmup: false,
+        request_timeout_ms: 0,
+        max_concurrent_requests_per_tenant: 0,
+        explicit_flags: std::collections::BTreeSet::new(),
+    };
+    let (mut router, port) = new_router(cfg).expect("bootstrap");
+    std::thread::spawn(move || router.serve_forever());
+    std::thread::sleep(Duration::from_millis(40));
+
+    let (status, response) = call(
+        port,
+        "/protocol/v1/execute",
+        &ingest_request_with_options(
+            &serde_json::json!({
+                "battle": [{ "name": "Battle of Yavin" }],
+                "planet": { "name": "Alderaan" },
+                "starship": [{ "name": "Millennium Falcon" }],
+                "faction": { "name": "Rebel Alliance" },
+                "character": [{ "name": "Leia Organa" }]
+            }),
+            &serde_json::json!({
+                "returnResult": true,
+                "capitalizeLabels": true
+            }),
+        ),
+        None,
+    );
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["response"]["kind"], "ingested");
+    assert_eq!(response["response"]["count"], 5);
+    let labels = response["response"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|record| record["label"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        labels,
+        vec!["BATTLE", "PLANET", "STARSHIP", "FACTION", "CHARACTER"]
+    );
+

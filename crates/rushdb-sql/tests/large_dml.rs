@@ -37,3 +37,82 @@ fn engine() -> Lmpg {
         "Small",
         None,
         vec![("n".into(), FieldChange::Set(json!(3)))],
+    )
+    .unwrap();
+    lmpg
+}
+
+fn count(lmpg: &Lmpg, sql: &str) -> u64 {
+    execute_sql(lmpg, sql).unwrap()[0]["c"].as_u64().unwrap()
+}
+
+#[test]
+fn dml_on_a_label_past_the_old_ceiling() {
+    let lmpg = engine();
+    let tenth = (RECORDS / 10) as u64; // rows with n = 3 (RECORDS - 1 ends in 0)
+
+    // UPDATE by predicate, with a parameter and a quoted mixed-case column.
+    let updated = execute_sql_mutation(
+        &lmpg,
+        "UPDATE big SET \"Code Name\" = 'hit' WHERE n = $1",
+        Some(&json!([3])),
+    )
+    .unwrap();
+    assert_eq!(updated.affected, tenth);
+    assert_eq!(
+        count(
+            &lmpg,
+            "SELECT COUNT(*) AS c FROM big WHERE \"Code Name\" = 'hit'"
+        ),
+        tenth
+    );
+
+    // An UPDATE touching every row, the whole label in one commit.
+    let all = execute_sql_mutation(&lmpg, "UPDATE big SET n = n + 10", None).unwrap();
+    assert_eq!(all.affected, RECORDS as u64);
+    assert_eq!(
+        count(&lmpg, "SELECT COUNT(*) AS c FROM big WHERE n < 10"),
+        0
+    );
+
+    // A row that already holds the value is matched but not rewritten.
+    let same = execute_sql_mutation(&lmpg, "UPDATE small SET n = 3", None).unwrap();
+    assert_eq!((same.affected, same.commit_index), (1, all.commit_index));
+
+    // DELETE by predicate.
+    let deleted = execute_sql_mutation(&lmpg, "DELETE FROM big WHERE n = 13", None).unwrap();
+    assert_eq!(deleted.affected, tenth);
+    assert_eq!(
+        count(&lmpg, "SELECT COUNT(*) AS c FROM big"),
+        RECORDS as u64 - tenth
+    );
+
+    // INSERT, with and without a column list, into the large tenant.
+    let inserted =
+        execute_sql_mutation(&lmpg, "INSERT INTO small (n) VALUES (7), (8)", None).unwrap();
+    assert_eq!(inserted.affected, 2);
+    // Without a column list, values follow the table's column order (as
+    // `SELECT *` shows it): properties, then `__id`.
+    let id = "00000000-0000-7000-8000-000000000042";
+    execute_sql_mutation(
+        &lmpg,
+        &format!("INSERT INTO small VALUES (9, '{id}')"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(count(&lmpg, "SELECT COUNT(*) AS c FROM small"), 4);
+    assert!(matches!(
+        execute_sql_mutation(
+            &lmpg,
+            &format!("INSERT INTO small VALUES (9, '{id}')"),
+            None
+        ),
+        Err(SqlError::InvalidIdentity(_))
+    ));
+
+    // UPDATE ... FROM another table.
+    let from = execute_sql_mutation(
+        &lmpg,
+        "UPDATE small SET n = s.n + 100 FROM small s WHERE small.__id = s.__id AND s.n = 9",
+        None,
+    )
