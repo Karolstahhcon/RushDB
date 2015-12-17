@@ -33,38 +33,3 @@ fn relationship_can_reference_records_created_in_the_same_atomic_batch() {
                 BatchOp::CreateRelationshipById {
                     rel_type: "KNOWS".into(),
                     source_id,
-                    target_id,
-                    fields: vec![("since".into(), FieldChange::Set(json!(2024)))],
-                },
-            ],
-        })
-        .unwrap();
-
-    assert_eq!(committed.created_records.len(), 2);
-    assert_eq!(committed.created_relationships.len(), 1);
-    let snapshot = graph.store.read_view().unwrap();
-    let relationship = try_access::relationship_by_ord(
-        &snapshot,
-        graph.tenant,
-        committed.created_relationships[0].ordinal,
-    )
-    .unwrap();
-    let relationship = relationship.unwrap();
-    assert_eq!(relationship.source_id, source_id);
-    assert_eq!(relationship.target_id, target_id);
-}
-
-#[test]
-fn derived_batch_rejects_a_stale_snapshot_version() {
-    let store = Arc::new(Store::new_in_memory());
-    let graph = Lmpg::new(store, TenantId::from_ordinal(9));
-    let snapshot_version = graph.store.committed_version();
-
-    graph
-        .create_record(
-            "Person",
-            None,
-            vec![("name".into(), FieldChange::Set(json!("concurrent")))],
-        )
-        .unwrap();
-
