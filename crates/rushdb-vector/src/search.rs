@@ -62,3 +62,67 @@ pub struct SearchOutcome {
 }
 
 impl VectorEngine {
+    /// Top-`k` search within a caller-owned view in `mode`, keeping only
+    /// hits scoring at least `min_score` (scores are "higher is more
+    /// similar" for every metric).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search_exact_in_view`] and [`Self::search_ann_in_view`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_in_view(
+        &self,
+        snap: &ReadView,
+        space: &EmbeddingSpace,
+        query: &[f32],
+        k: usize,
+        mode: SearchMode,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+        min_score: Option<f32>,
+    ) -> Result<SearchOutcome, VectorError> {
+        let (hits, path) = match mode {
+            SearchMode::Exact => (
+                self.exact_in_view(snap, space, query, k, candidate, min_score)?,
+                SearchPath::Exact,
+            ),
+            SearchMode::Ann { ef } => {
+                self.ann_in_view(snap, space, query, k, ef, candidate, min_score)?
+            }
+        };
+        Ok(SearchOutcome { hits, path })
+    }
+
+    /// The number of `space`'s vectors a search ranks: its bindings in
+    /// `Ready` status, as maintained by every commit that writes a binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] when the read fails or the count row
+    /// is corrupt.
+    pub fn ready_vectors_in_view(
+        &self,
+        snap: &ReadView,
+        space: &EmbeddingSpace,
+    ) -> Result<u64, VectorError> {
+        match snap.get(&rushdb_types::keys::emb_ready_count_key(
+            self.tenant(),
+            space.space_id,
+        ))? {
+            None => Ok(0),
+            Some(raw) => Ok(u64::from_be_bytes(
+                raw.as_slice()
+                    .try_into()
+                    .map_err(|_| StorageError::CorruptLog)?,
+            )),
+        }
+    }
+
+    /// Whether `space`'s ANN graph is resident and current at `snap`, so an
+    /// ANN search answers without building it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] when the version row cannot be read
+    /// and [`VectorError::Engine`] when the cache mutex is poisoned.
+    pub fn ann_resident_in_view(
+        &self,
