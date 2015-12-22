@@ -87,33 +87,3 @@ impl Store {
             }
         }
         out.sort_by_key(|(lsn, _)| *lsn);
-        Ok(out.into_iter().map(|(_, payload)| payload).collect())
-    }
-
-    /// Durable-log export of commit-batch payloads from `from_lsn` onward
-    /// (each paired with its LSN), for a streaming-replication follower
-    /// to replay via [`Store::apply_replicated_batch_with_payload`].
-    /// Empty for a non-durable store. Takes the same `publish_lock` as
-    /// [`Store::try_take_log_for_crash`] (briefly contends with commits —
-    /// poll at a bounded interval, not a tight loop).
-    ///
-    /// # Errors
-    /// Returns [`StorageError::CorruptLog`] for a malformed WAL record and
-    /// the underlying storage error for a failed WAL read.
-    pub fn try_log_commands_from(
-        &self,
-        from_lsn: u64,
-    ) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
-        self.check_health()?;
-        if !self.is_durable() {
-            return Ok(Vec::new());
-        }
-        let _guard = self.health.guard(self.publish_lock.lock())?;
-        let records = {
-            let guard = self.health.guard(self.log.lock())?;
-            match guard.as_ref() {
-                Some(log) => log.read_from(from_lsn).map_err(|error| {
-                    StorageError::Durability(format!("read WAL for replication: {error}"))
-                })?,
-                None => Vec::new(),
-            }

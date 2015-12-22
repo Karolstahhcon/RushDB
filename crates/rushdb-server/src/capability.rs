@@ -99,37 +99,3 @@ pub fn verify(secret: &[u8], token: &str, now: u64) -> Result<Capability, CapErr
     let sig = URL_SAFE_NO_PAD
         .decode(sigb64)
         .map_err(|_| CapError::Malformed)?;
-    let mut mac = HmacSha256::new_from_slice(secret).expect("any key length");
-    mac.update(b64.as_bytes());
-    mac.verify_slice(&sig).map_err(|_| CapError::BadSignature)?;
-    let claims = String::from_utf8(
-        URL_SAFE_NO_PAD
-            .decode(b64)
-            .map_err(|_| CapError::Malformed)?,
-    )
-    .map_err(|_| CapError::Malformed)?;
-    let v: serde_json::Value = serde_json::from_str(&claims).map_err(|_| CapError::Malformed)?;
-    let cap = Capability {
-        sub: v
-            .get("sub")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        scope: v
-            .get("scope")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        tenant: v.get("tenant").and_then(|x| x.as_str()).map(str::to_string),
-        iat: v
-            .get("iat")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        exp: v
-            .get("exp")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-    };
-    if cap.exp < now {
-        return Err(CapError::Expired);
-    }
