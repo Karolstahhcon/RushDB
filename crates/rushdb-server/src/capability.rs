@@ -65,37 +65,3 @@ pub fn issue_for_tenant(
 ) -> String {
     let mut claims = serde_json::Map::new();
     claims.insert("sub".into(), serde_json::Value::String(sub.to_string()));
-    claims.insert("scope".into(), serde_json::Value::String(scope.to_string()));
-    if let Some(tenant) = tenant {
-        claims.insert(
-            "tenant".into(),
-            serde_json::Value::String(tenant.to_string()),
-        );
-    }
-    claims.insert("iat".into(), serde_json::json!(now));
-    claims.insert("exp".into(), serde_json::json!(now + ttl_secs));
-    let claims = serde_json::Value::Object(claims).to_string();
-    let b64 = URL_SAFE_NO_PAD.encode(claims.as_bytes());
-    let sig = sign(secret, &b64);
-    format!("{b64}.{}", URL_SAFE_NO_PAD.encode(sig))
-}
-
-/// Verify signature + expiry, returning the parsed claims.
-///
-/// # Errors
-///
-/// Returns [`CapError::Malformed`] when the token cannot be split, decoded, or
-/// parsed; [`CapError::BadSignature`] when the HMAC does not verify; and
-/// [`CapError::Expired`] when `exp` is earlier than `now`.
-///
-/// # Panics
-///
-/// Never panics in practice: HMAC-SHA256 accepts keys of any length, so the
-/// internal `new_from_slice` call cannot fail.
-pub fn verify(secret: &[u8], token: &str, now: u64) -> Result<Capability, CapError> {
-    let Some((b64, sigb64)) = token.split_once('.') else {
-        return Err(CapError::Malformed);
-    };
-    let sig = URL_SAFE_NO_PAD
-        .decode(sigb64)
-        .map_err(|_| CapError::Malformed)?;
