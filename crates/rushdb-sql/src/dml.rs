@@ -287,3 +287,148 @@ pub(crate) fn plan(sql: &str) -> Result<DmlPlan, SqlError> {
             let q = qualifier(relation);
             let mut query = format!("SELECT {q}.\"{ID_FIELD}\" AS \"{ROW_ID}\" FROM {relation}");
             if let Some(selection) = &delete.selection {
+                let _ = write!(query, " WHERE {selection}");
+            }
+            Ok(DmlPlan {
+                kind: DmlKind::Delete,
+                target,
+                query,
+                columns: Vec::new(),
+                parameter_columns: Vec::new(),
+            })
+        }
+        _ => Err(unsupported(
+            "only INSERT, UPDATE, and DELETE are accepted by the mutation endpoint",
+        )),
+    }
+}
+
+/// The stored label a lowercased table name refers to.
+pub(crate) fn target_label(
+    lmpg: &Lmpg,
+    snapshot: &ReadView,
+    target: &str,
+) -> Result<String, SqlError> {
+    let labels = access::labels(snapshot, lmpg.tenant)?;
+    if let Some(label) = labels
+        .iter()
+        .find(|label| label.to_ascii_lowercase() == target)
+    {
+        return Ok(label.clone());
+    }
+    let closest = rushdb_types::names::closest(target, labels.iter().map(String::as_str), 3);
+    let hint = if closest.is_empty() {
+        String::new()
+    } else {
+        let quoted: Vec<String> = closest.iter().map(|label| format!("`{label}`")).collect();
+        format!("; did you mean {}?", quoted.join(" or "))
+    };
+    Err(unsupported(format!(
+        "DML target `{target}` is not a tenant-visible record table{hint}"
+    )))
+}
+
+fn record_of(lmpg: &Lmpg, snapshot: &ReadView, id: &str) -> Result<Option<RecordRef>, SqlError> {
+    let uuid = uuid::Uuid::parse_str(id)
+        .map_err(|_| SqlError::InvalidIdentity(format!("invalid __id `{id}`")))?;
+    Ok(access::record_by_id(
+        snapshot,
+        lmpg.tenant,
+        &rushdb_types::ids::RecordId(*uuid.as_bytes()),
+    )?
+    .map(|header| RecordRef {
+        record_id: header.record_id,
+        ordinal: header.ordinal,
+    }))
+}
+
+fn row_id(row: &Row) -> Result<String, SqlError> {
+    match row.get(ROW_ID) {
+        Some(Json::String(value)) => canonical_uuid(value),
+        other => Err(SqlError::InvalidIdentity(format!(
+            "stored __id must be a UUID string, got {}",
+            other.cloned().unwrap_or(Json::Null)
+        ))),
+    }
+}
+
+/// Plans writes from the rows the read returns, charging their size.
+struct Writes<'a> {
+    lmpg: &'a Lmpg,
+    snapshot: &'a ReadView,
+    plan: &'a DmlPlan,
+    label: String,
+    insert_columns: Vec<String>,
+    batch: BatchTx,
+    seen: BTreeSet<String>,
+    affected: u64,
+    charged: usize,
+    limit: Option<usize>,
+}
+
+impl Writes<'_> {
+    fn charge(&mut self, fields: &[(String, FieldChange)]) -> Result<(), SqlError> {
+        let mut bytes = WRITE_OVERHEAD;
+        for (name, change) in fields {
+            bytes = bytes.saturating_add(name.len());
+            if let FieldChange::Set(value) = change {
+                bytes = bytes.saturating_add(
+                    serde_json::to_vec(value)
+                        .map_err(|error| SqlError::Engine(error.to_string()))?
+                        .len(),
+                );
+            }
+        }
+        self.charged = self.charged.saturating_add(bytes);
+        match self.limit {
+            Some(limit) if self.charged > limit => Err(SqlError::ResourceLimit(self.charged)),
+            _ => Ok(()),
+        }
+    }
+
+    fn row(&mut self, row: &Row, names: &[String]) -> Result<(), SqlError> {
+        match self.plan.kind {
+            DmlKind::Update => {
+                let id = row_id(row)?;
+                if !self.seen.insert(id.clone()) {
+                    return Ok(()); // UPDATE ... FROM may match a row more than once
+                }
+                self.affected += 1;
+                let record = record_of(self.lmpg, self.snapshot, &id)?
+                    .ok_or_else(|| SqlError::InvalidIdentity(format!("record `{id}` vanished")))?;
+                let mut fields = Vec::new();
+                for (i, column) in self.plan.columns.iter().enumerate() {
+                    let old = row.get(&format!("{OLD}{i}")).unwrap_or(&Json::Null);
+                    let new = row.get(&format!("{NEW}{i}")).unwrap_or(&Json::Null);
+                    if old != new {
+                        fields.push((column.clone(), FieldChange::Set(new.clone())));
+                    }
+                }
+                if !fields.is_empty() {
+                    self.charge(&fields)?;
+                    self.batch.ops.push(BatchOp::UpdateFields {
+                        owner: rushdb_types::ids::OwnerKind::Record,
+                        owner_ord: record.ordinal,
+                        owner_public_id: record.record_id,
+                        fields,
+                    });
+                }
+            }
+            DmlKind::Delete => {
+                let id = row_id(row)?;
+                if !self.seen.insert(id.clone()) {
+                    return Ok(());
+                }
+                self.affected += 1;
+                let record = record_of(self.lmpg, self.snapshot, &id)?
+                    .ok_or_else(|| SqlError::InvalidIdentity(format!("record `{id}` vanished")))?;
+                self.charge(&[])?;
+                self.batch.ops.push(BatchOp::DeleteRecord { record });
+            }
+            DmlKind::Insert => {
+                if names.len() > self.insert_columns.len() {
+                    return Err(unsupported(
+                        "INSERT has more expressions than target columns",
+                    ));
+                }
+                let mut id = None;
