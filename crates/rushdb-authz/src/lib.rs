@@ -204,3 +204,210 @@ pub fn find_records_authorized(
     let allowed_labels = if every { Vec::new() } else { allowed_labels };
     let effective = rushdb_query::SearchRequest {
         labels: allowed_labels.clone(),
+        related: sanitize_related(req.related.as_slice(), scope),
+        ..req.clone()
+    };
+
+    if matches!(scope.mode, AuthorizationMode::PolicyEnforced)
+        && allowed_labels.is_empty()
+        && !every
+    {
+        return Err(AuthzError::NoCandidates);
+    }
+
+    let page = rushdb_query::find_records(lmpg, &effective)?;
+
+    let mut records = page.records;
+    for r in &mut records {
+        mask_record_json(lmpg, r, scope);
+    }
+    records.retain(|r| !r.as_object().is_some_and(serde_json::Map::is_empty));
+    if scope.policy.max_results > 0 {
+        records.truncate(usize::try_from(scope.policy.max_results).unwrap_or(usize::MAX));
+    }
+    let total = records.len() as u64;
+    Ok(Page {
+        total_matched: total,
+        records,
+    })
+}
+
+fn sanitize_related(
+    specs: &[rushdb_query::RelatedSpec],
+    scope: &SecurityScope<'_>,
+) -> Vec<rushdb_query::RelatedSpec> {
+    specs
+        .iter()
+        .filter(|s| s.rel_type.iter().all(|rt| scope.policy.rel_allowed(rt)))
+        .cloned()
+        .collect()
+}
+
+/// Exposes Direction / `CollectSpec` passthrough to keep engine facade tidy.
+pub type QueryDirection = DirectionAlias;
+
+type DirectionAlias = rushdb_query::Direction;
+
+// ---- replicated policy persistence + engine authorizer (document 23) ----
+
+use std::sync::Arc;
+
+/// Read one complete policy generation from one retained native view.
+///
+/// # Errors
+///
+/// Propagates storage failures and returns [`AuthzError::InvalidPolicy`] when
+/// the stored generation/fingerprint pair does not validate.
+pub fn load_active_policy_in_view(
+    view: &rushdb_storage::ReadView,
+    tenant: rushdb_types::ids::TenantId,
+) -> Result<Option<ActivePolicy>, AuthzError> {
+    load_policy_from(view, tenant, view.commit_index())
+}
+
+fn load_policy_from<R: rushdb_lmpg::reader::TryRead>(
+    view: &R,
+    tenant: rushdb_types::ids::TenantId,
+    cap: u64,
+) -> Result<Option<ActivePolicy>, AuthzError> {
+    load_policy_from_reader(&|key: &[u8]| view.get(key), tenant, cap)
+}
+
+/// Policy loader over an injected key-reader. Used by the coordinator's
+/// commit-time revalidation so it never opens a nested store view (which
+/// would deadlock under the store's publish lock).
+///
+/// # Errors
+///
+/// Propagates reader failures and returns [`AuthzError::InvalidPolicy`] when
+/// stored metadata is malformed or uses the removed global policy layout.
+pub fn load_policy_from_reader(
+    read: &PolicyReader<'_>,
+    tenant: rushdb_types::ids::TenantId,
+    cap: u64,
+) -> Result<Option<ActivePolicy>, AuthzError> {
+    use rushdb_types::keys::{
+        security_generation_key, security_policy_key, SECURITY_GENERATION_KEY,
+        SECURITY_POLICY_ACTIVE_KEY,
+    };
+    let raw_generation = read(&security_generation_key(tenant))?;
+    let raw_policy = read(&security_policy_key(tenant))?;
+    match (raw_generation, raw_policy) {
+        (None, None) => {
+            // Global policy metadata has no tenant ownership in the current
+            // format. Reject it rather than silently widening access.
+            if read(SECURITY_GENERATION_KEY.as_bytes())?.is_some()
+                || read(SECURITY_POLICY_ACTIVE_KEY.as_bytes())?.is_some()
+            {
+                return Err(AuthzError::InvalidPolicy(
+                    "unsupported global authorization policy metadata".into(),
+                ));
+            }
+            Ok(None)
+        }
+        (Some(generation), Some(raw)) => {
+            let generation = u64::from_be_bytes(
+                generation
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| AuthzError::InvalidPolicy("invalid generation width".into()))?,
+            );
+            let active: ActivePolicy = serde_json::from_slice(&raw)
+                .map_err(|e| AuthzError::InvalidPolicy(e.to_string()))?;
+            if generation == 0
+                || generation > cap
+                || active.generation != generation
+                || active.fingerprint
+                    != policy_fingerprint_with_min_count(
+                        &active.policy,
+                        active.mode,
+                        active.min_count,
+                    )
+            {
+                return Err(AuthzError::InvalidPolicy(
+                    "generation/fingerprint mismatch".into(),
+                ));
+            }
+            Ok(Some(active))
+        }
+        _ => Err(AuthzError::InvalidPolicy(
+            "incomplete policy/generation pair".into(),
+        )),
+    }
+}
+
+/// Loads the active policy for `lmpg`'s tenant from live committed state.
+///
+/// # Errors
+///
+/// Propagates storage failures and policy validation errors.
+pub fn load_active_policy(lmpg: &Lmpg) -> Result<Option<ActivePolicy>, AuthzError> {
+    load_active_policy_in_view(&lmpg.store.read_view()?, lmpg.tenant)
+}
+
+/// Returns the committed policy generation for `lmpg`'s tenant, or `0` when
+/// no policy is active.
+///
+/// # Errors
+///
+/// Propagates storage failures and policy validation errors.
+pub fn current_generation(lmpg: &Lmpg) -> Result<u64, AuthzError> {
+    Ok(load_active_policy(lmpg)?.map_or(0, |active| active.generation))
+}
+
+/// Explicit administrative policy replacement. New tenant metadata overrides
+/// legacy global metadata for this tenant only; no legacy bytes are changed.
+/// The applying CI is assigned under admission, not before entering it.
+///
+/// # Errors
+///
+/// Returns the storage error or commit-conflict reason as a string when the
+/// administrative commit is rejected.
+pub fn store_policy(
+    lmpg: &Lmpg,
+    policy: &DataAccessPolicy,
+    mode: AuthorizationMode,
+) -> Result<ActivePolicy, String> {
+    store_policy_with_min_count(lmpg, policy, mode, 0)
+}
+
+/// [`store_policy`] with a small-count threshold for catalog reads:
+/// groups counted over fewer than `min_count` records are withheld. 0 is no
+/// threshold and publishes exactly what [`store_policy`] does.
+///
+/// # Errors
+///
+/// Returns the storage error or commit-conflict reason as a string when the
+/// administrative commit is rejected.
+pub fn store_policy_with_min_count(
+    lmpg: &Lmpg,
+    policy: &DataAccessPolicy,
+    mode: AuthorizationMode,
+    min_count: u64,
+) -> Result<ActivePolicy, String> {
+    let tenant = lmpg.tenant;
+    let policy = policy.clone();
+    let outcome = lmpg
+        .store
+        .commit_for_tenant(&tenant, uuid::Uuid::now_v7(), move |ci, _txn| {
+            let active = ActivePolicy {
+                generation: ci,
+                fingerprint: policy_fingerprint_with_min_count(&policy, mode, min_count),
+                policy: policy.clone(),
+                mode,
+                min_count,
+            };
+            let mutation = if min_count == 0 {
+                rushdb_types::command::Mutation::SetSecurityPolicy { policy, mode }
+            } else {
+                rushdb_types::command::Mutation::SetSecurityPolicyThreshold {
+                    policy,
+                    mode,
+                    min_count,
+                }
+            };
+            let batch = rushdb_types::command::CommitBatch {
+                command_version: rushdb_types::command::COMMAND_VERSION,
+                tenant,
+                transaction_id: String::new(),
+                commit_key: uuid::Uuid::nil(),

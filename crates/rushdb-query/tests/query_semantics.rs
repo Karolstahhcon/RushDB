@@ -138,3 +138,285 @@ fn ported_compile_select_scenarios() {
     }))
     .unwrap();
     let buckets = aggregate(&lmpg, q.aggregate.as_ref().unwrap()).unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].count_roots, 2);
+    assert_eq!(buckets[0].sums.get("revenue"), Some(&json!(35.0)));
+
+    // $sum over nested math ($multiply price*qty)
+    let q = parse_document(&json!({
+        "labels": ["ORDER"],
+        "select": {"lineTotal": {"$sum": {"$multiply": ["$record.price", "$record.qty"]}}}
+    }))
+    .unwrap();
+    let buckets = aggregate(&lmpg, q.aggregate.as_ref().unwrap()).unwrap();
+    assert_eq!(buckets[0].sums.get("lineTotal"), Some(&json!(35.0))); // 10*2 + 15*1
+
+    // $avg with $precision
+    let q = parse_document(&json!({
+        "labels": ["ORDER"],
+        "select": {"avgAmount": {"$avg": "$record.amount", "$precision": 1}}
+    }))
+    .unwrap();
+    let buckets = aggregate(&lmpg, q.aggregate.as_ref().unwrap()).unwrap();
+    assert_eq!(buckets[0].sums.get("avgAmount"), Some(&json!(17.5))); // (20+15)/2
+
+    // $subtract with $ref operands: revenue - cost
+    let q = parse_document(&json!({
+        "labels": ["ORDER"],
+        "select": {
+            "revenue": {"$sum": "$record.amount"},
+            "cost": {"$sum": "$record.qty"},
+            "margin": {"$subtract": [{"$ref": "revenue"}, {"$ref": "cost"}]}
+        }
+    }))
+    .unwrap();
+    let buckets = aggregate(&lmpg, q.aggregate.as_ref().unwrap()).unwrap();
+    assert_eq!(buckets[0].sums.get("margin"), Some(&json!(32.0))); // 35 - 3
+}
+
+/// Array-element semantics: { tags: 'typescript' } matches arrays containing it.
+#[test]
+fn array_element_semantics() {
+    let lmpg = setup();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![(
+            "tags".into(),
+            FieldChange::Set(json!(["javascript", "typescript", "react"])),
+        )],
+    )
+    .unwrap();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![("tags".into(), FieldChange::Set(json!(["python", "django"])))],
+    )
+    .unwrap();
+
+    let n = match_count(
+        &lmpg,
+        &json!({"labels": ["ITEM"], "where": {"tags": "typescript"}}),
+    );
+    assert_eq!(n, 1);
+
+    // $in over arrays: any element in list
+    let n = match_count(
+        &lmpg,
+        &json!({"labels": ["ITEM"], "where": {"tags": {"$in": ["python"]}}}),
+    );
+    assert_eq!(n, 1);
+
+    // $contains on array element
+    let n = match_count(
+        &lmpg,
+        &json!({"labels": ["ITEM"], "where": {"tags": {"$contains": "react"}}}),
+    );
+    assert_eq!(n, 1);
+}
+
+/// Array-literal equality `{ tags: ["a", "b"] }` lowers to element-match
+/// ($in) semantics instead of a label-key relationship block, matching the
+/// baseline behavior of wrapping single values into IN predicates.
+#[test]
+fn array_literal_value_is_element_match() {
+    let lmpg = setup();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![(
+            "tags".into(),
+            FieldChange::Set(json!(["javascript", "typescript"])),
+        )],
+    )
+    .unwrap();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![("tags".into(), FieldChange::Set(json!(["python"])))],
+    )
+    .unwrap();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![("tags".into(), FieldChange::Set(json!("single")))],
+    )
+    .unwrap();
+
+    // { tags: ["typescript"] } matches the record containing that element
+    let n = match_count(
+        &lmpg,
+        &json!({"labels": ["ITEM"], "where": {"tags": ["typescript"]}}),
+    );
+    assert_eq!(n, 1);
+
+    // { tags: ["python", "ruby"] } matches any element in the list
+    let n = match_count(
+        &lmpg,
+        &json!({"labels": ["ITEM"], "where": {"tags": ["python", "ruby"]}}),
+    );
+    assert_eq!(n, 1);
+
+    // scalar field values are matched by the same element semantics
+    let n = match_count(
+        &lmpg,
+        &json!({"labels": ["ITEM"], "where": {"tags": ["single", "missing"]}}),
+    );
+    assert_eq!(n, 1);
+
+    // $nin over an array literal list: records with no element in the list
+    let n = match_count(
+        &lmpg,
+        &json!({"labels": ["ITEM"], "where": {"tags": {"$nin": ["javascript", "python", "single"]}}}),
+    );
+    assert_eq!(n, 0);
+}
+
+/// `$type` is cardinality-aware: `string[]`/`number[]` match array-typed
+/// columns, `array` matches any array, and the bare type matches both scalar
+/// and array values (baseline stores array primitives as plain string).
+#[test]
+fn type_operator_is_array_cardinality_aware() {
+    let lmpg = setup();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![
+            ("tags".into(), FieldChange::Set(json!(["a", "b"]))),
+            ("score".into(), FieldChange::Set(json!([1, 2]))),
+        ],
+    )
+    .unwrap();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![
+            ("tags".into(), FieldChange::Set(json!("c"))),
+            ("score".into(), FieldChange::Set(json!(3))),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"tags": {"$type": "string[]"}}})
+        ),
+        1
+    );
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"tags": {"$type": "array"}}})
+        ),
+        1
+    );
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"score": {"$type": "number[]"}}})
+        ),
+        1
+    );
+    // bare type matches both scalar and array values (baseline compatibility)
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"tags": {"$type": "string"}}})
+        ),
+        2
+    );
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"score": {"$type": "number"}}})
+        ),
+        2
+    );
+}
+
+/// `$type` boolean alias: the client surface operates with `boolean`, while
+/// legacy queries may still send `bool`. Both must match boolean-typed
+/// properties (declared) and boolean-shaped values (fallback).
+#[test]
+fn type_operator_boolean_alias_accepts_bool_and_boolean() {
+    let lmpg = setup();
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![
+            ("active".into(), FieldChange::Set(json!(true))),
+            ("flagged".into(), FieldChange::Set(json!(false))),
+            ("score".into(), FieldChange::Set(json!(7))),
+        ],
+    )
+    .unwrap();
+
+    // canonical client-facing name
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"active": {"$type": "boolean"}}})
+        ),
+        1
+    );
+    // legacy alias still works
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"active": {"$type": "bool"}}})
+        ),
+        1
+    );
+    // array cardinality alias: boolean[] matches array-typed boolean columns
+    lmpg.create_record(
+        "ITEM",
+        None,
+        vec![("flags".into(), FieldChange::Set(json!([true, false])))],
+    )
+    .unwrap();
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"flags": {"$type": "boolean[]"}}})
+        ),
+        1
+    );
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"flags": {"$type": "bool[]"}}})
+        ),
+        1
+    );
+    // non-boolean field must not match
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({"labels": ["ITEM"], "where": {"score": {"$type": "boolean"}}})
+        ),
+        0
+    );
+}
+
+/// $ne on a missing field must NOT match (`RushDB` semantics).
+#[test]
+fn ne_requires_presence() {
+    let lmpg = setup();
+    lmpg.create_record(
+        "DOC",
+        None,
+        vec![("status".into(), FieldChange::Set(json!("active")))],
+    )
+    .unwrap();
+    lmpg.create_record("DOC", None, vec![]).unwrap();
+
+    // { status: { $ne: 'deleted' } } → only the record WITH status active
+    let n = match_count(
+        &lmpg,
+        &json!({"labels": ["DOC"], "where": {"status": {"$ne": "deleted"}}}),
+    );
+    assert_eq!(n, 1);
+
+    // $exists false still works
+    let n = match_count(

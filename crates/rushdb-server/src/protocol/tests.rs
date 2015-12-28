@@ -3684,3 +3684,1846 @@ fn property_values_range_keeps_large_integer_extrema_exact() {
         })
         .unwrap()
         .response
+    else {
+        panic!("expected propertyValues response")
+    };
+    assert_eq!(min, Some(serde_json::json!(9_007_199_254_740_992_i64)));
+    assert_eq!(max, Some(serde_json::json!(9_007_199_254_740_993_i64)));
+}
+
+#[test]
+fn schema_catalog_detail_projects_and_paginates_property_entries() {
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    node.scope()
+        .create_record(
+            "Widget",
+            &serde_json::json!({"alpha": 1, "beta": "x"}),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    node.scope()
+        .create_record(
+            "Widget",
+            &serde_json::json!({"gamma": true}),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    let run = |detail, skip, limit| {
+        let Response::Schema { schema } = ProtocolExecutor::new(&node, None)
+            .execute(RequestEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: None,
+                context: RequestContext::default(),
+                operation: Operation::Describe {
+                    describe: Describe::Schema {
+                        query: QueryDocument::default(),
+                        detail,
+                        skip,
+                        limit,
+                    },
+                },
+            })
+            .unwrap()
+            .response
+        else {
+            panic!("expected schema response")
+        };
+        schema
+    };
+    let full = run(None, None, None);
+    assert!(full.properties.len() >= 3, "{:?}", full.properties);
+    // Catalog detail: no samples/extrema, support counts still exact.
+    let catalog = run(Some(rushdb_protocol::PropertyDetail::Catalog), None, None);
+    assert!(catalog
+        .properties
+        .iter()
+        .all(|p| p.sample_values.is_empty() && p.min.is_none() && p.max.is_none()));
+    assert!(catalog.properties.iter().all(|p| p.records_count >= 1));
+    // Pagination slices the property entry list.
+    let page = run(
+        Some(rushdb_protocol::PropertyDetail::Catalog),
+        Some(1),
+        Some(1),
+    );
+    assert_eq!(page.properties.len(), 1);
+    assert_eq!(page.properties[0].name, catalog.properties[1].name);
+}
+
+#[test]
+fn delete_extremum_moves_describe_min_max() {
+    // E9: summaries are recomputed per describe scan (no maintained
+    // extrema), so deleting the min/max record must move the reported
+    // extrema — worst case is one bounded scan, never a stale sketch.
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    for rank in [1, 2, 3] {
+        node.scope()
+            .create_record(
+                "Ship",
+                &serde_json::json!({ "rank": rank }),
+                &[],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    let min_max = || {
+        let Response::Schema { schema } = ProtocolExecutor::new(&node, None)
+            .execute(RequestEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: None,
+                context: RequestContext::default(),
+                operation: Operation::Describe {
+                    describe: Describe::Schema {
+                        query: QueryDocument::default(),
+                        detail: None,
+                        skip: None,
+                        limit: None,
+                    },
+                },
+            })
+            .unwrap()
+            .response
+        else {
+            panic!("expected schema response")
+        };
+        let rank = schema
+            .properties
+            .iter()
+            .find(|p| p.name == "rank")
+            .expect("rank property");
+        (rank.min.clone(), rank.max.clone(), rank.records_count)
+    };
+    assert_eq!(
+        min_max(),
+        (Some(serde_json::json!(1)), Some(serde_json::json!(3)), 3)
+    );
+    let deleted = node
+        .scope()
+        .delete_records(&serde_json::json!({"labels": ["Ship"], "where": {"rank": 1}}))
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert_eq!(
+        min_max(),
+        (Some(serde_json::json!(2)), Some(serde_json::json!(3)), 2),
+        "deleting the extremum must move min without stale summaries"
+    );
+}
+
+#[test]
+fn schema_description_includes_scoped_relationship_topology() {
+    let mut cfg = config(true);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let scope = RequestScope::new(&node, Some("tenant-a".into()));
+    scope
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada", "join": 1 }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    scope
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB", "join": 1 }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    scope
+        .link_records(&rushdb_protocol::RelationshipMutation {
+            relation_type: "FOUNDED".into(),
+            source: rushdb_protocol::RelationshipSelector {
+                label: "Person".into(),
+                property: Some("join".into()),
+                predicate: serde_json::json!({}),
+            },
+            target: rushdb_protocol::RelationshipSelector {
+                label: "Company".into(),
+                property: Some("join".into()),
+                predicate: serde_json::json!({}),
+            },
+            direction: rushdb_protocol::Direction::Out,
+            allow_cartesian: false,
+            properties: serde_json::json!({ "since": 2020 }),
+        })
+        .unwrap();
+
+    let response = ProtocolExecutor::new(&node, Some("tenant-a".into()))
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: Some("tenant-a".into()),
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Describe {
+                describe: Describe::Schema {
+                    query: QueryDocument::default(),
+                    detail: None,
+                    skip: None,
+                    limit: None,
+                },
+            },
+        })
+        .unwrap();
+
+    let Response::Schema { schema } = response.response else {
+        panic!("expected schema response")
+    };
+    assert!(schema
+        .properties
+        .iter()
+        .all(|property| property.name != "tenantKey"));
+    assert_eq!(schema.relationships.len(), 1);
+    let relationship = &schema.relationships[0];
+    assert_eq!(relationship.source_label, "Person");
+    assert_eq!(relationship.target_label, "Company");
+    assert_eq!(relationship.relationship_type, "FOUNDED");
+    assert_eq!(relationship.count, 1);
+    assert_eq!(relationship.properties.len(), 1);
+    assert_eq!(relationship.properties[0].name, "since");
+    assert_eq!(relationship.properties[0].value_type, "number");
+}
+
+#[test]
+fn blessed_discovery_shapes_use_catalog() {
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    for i in 0..3 {
+        node.scope()
+            .create_record(
+                "Person",
+                &serde_json::json!({ "name": format!("p{i}"), "join": i }),
+                &[],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    node.scope()
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB", "join": 1 }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    node.scope()
+        .link_records(&rushdb_protocol::RelationshipMutation {
+            relation_type: "FOUNDED".into(),
+            source: rushdb_protocol::RelationshipSelector {
+                label: "Person".into(),
+                property: Some("join".into()),
+                predicate: serde_json::json!({}),
+            },
+            target: rushdb_protocol::RelationshipSelector {
+                label: "Company".into(),
+                property: Some("join".into()),
+                predicate: serde_json::json!({}),
+            },
+            direction: rushdb_protocol::Direction::Out,
+            allow_cartesian: false,
+            properties: serde_json::json!({}),
+        })
+        .unwrap();
+
+    let schema = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Describe {
+                describe: Describe::Schema {
+                    query: QueryDocument::default(),
+                    detail: None,
+                    skip: None,
+                    limit: None,
+                },
+            },
+        })
+        .unwrap();
+    let Response::Schema { schema } = schema.response else {
+        panic!("expected schema")
+    };
+    assert_eq!(schema.relationships.len(), 1);
+    assert_eq!(schema.relationships[0].count, 1);
+    assert_eq!(schema.relationships[0].relationship_type, "FOUNDED");
+
+    let counted = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: Query::Records {
+                    query: QueryDocument {
+                        labels: vec!["Person".into()],
+                        select: Some(serde_json::json!({ "n": { "$count": "*" } })),
+                        ..QueryDocument::default()
+                    },
+                },
+            },
+        })
+        .unwrap();
+    let Response::Rows { rows, total } = counted.response else {
+        panic!("expected aggregate rows, got {:?}", counted.response)
+    };
+    assert_eq!(total, 3);
+    assert_eq!(rows[0]["n"], 3);
+}
+
+#[test]
+fn link_and_unlink_records_by_id_are_idempotent_and_typed() {
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    node.scope()
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    node.scope()
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    let lmpg = node.scope().lmpg();
+    let snap = lmpg.store.read_view().unwrap();
+    let persons = test_access::label_members(&snap, lmpg.tenant, "Person");
+    let companies = test_access::label_members(&snap, lmpg.tenant, "Company");
+    let id_of = |ordinal| {
+        let record = node.scope().record_value(ordinal).unwrap();
+        record["id"].as_str().unwrap().to_string()
+    };
+    let pid = id_of(persons[0]);
+    let cid = id_of(companies[0]);
+
+    let affected = |mutation: rushdb_protocol::Mutation| {
+        let response = ProtocolExecutor::new(&node, None)
+            .execute(RequestEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: None,
+                context: RequestContext {
+                    scope: None,
+                    deadline_ms: None,
+                    ..Default::default()
+                },
+                operation: Operation::Mutate { mutation },
+            })
+            .unwrap()
+            .response;
+        match response {
+            Response::Mutation { affected }
+            | Response::Linked {
+                created: affected, ..
+            } => affected,
+            other => panic!("unexpected response {other:?}"),
+        }
+    };
+    let link = |command| rushdb_protocol::Mutation::LinkRecordsById { command };
+    let unlink = |command| rushdb_protocol::Mutation::UnlinkRecordsById { command };
+
+    let cmd = |ids: Vec<String>| rushdb_protocol::RelationshipIdsMutation {
+        relation_type: "FOUNDED".into(),
+        direction: rushdb_protocol::Direction::Out,
+        source_ids: vec![pid.clone()],
+        target_ids: ids,
+        properties: serde_json::json!({ "since": 2020 }),
+    };
+
+    // First link creates 1; a second identical link is idempotent (0 new).
+    assert_eq!(
+        affected(link(cmd(vec![cid.clone()]))),
+        1,
+        "first by-id link creates one edge"
+    );
+    assert_eq!(
+        affected(link(cmd(vec![cid.clone()]))),
+        0,
+        "by-id link is idempotent per pair"
+    );
+
+    let unlink_founded = |direction| {
+        affected(unlink(rushdb_protocol::UnlinkRecordsMutation {
+            relation_types: vec!["FOUNDED".into()],
+            direction: Some(direction),
+            source_ids: vec![pid.clone()],
+            target_ids: vec![cid.clone()],
+        }))
+    };
+    let (out, inward) = (
+        rushdb_protocol::Direction::Out,
+        rushdb_protocol::Direction::In,
+    );
+
+    // Unlink deletes the typed edge; a repeat unlink is a no-op.
+    assert_eq!(unlink_founded(out), 1, "by-id unlink removes the edge");
+    assert_eq!(unlink_founded(out), 0, "by-id unlink is idempotent");
+
+    // `direction: In` links target → source; unlink honours the direction.
+    let inbound = rushdb_protocol::RelationshipIdsMutation {
+        direction: inward,
+        ..cmd(vec![cid.clone()])
+    };
+    assert_eq!(affected(link(inbound)), 1);
+    assert_eq!(
+        unlink_founded(out),
+        0,
+        "an Out unlink must not delete the In edge"
+    );
+    assert_eq!(
+        unlink_founded(inward),
+        1,
+        "an In unlink deletes the In edge"
+    );
+}
+
+#[test]
+fn link_records_by_id_commits_one_batch_with_counts() {
+    // E1: N edges in one call must cost exactly one commit (not N), with
+    // created/skipped_existing distinguishing new edges from duplicates.
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    for name in ["a1", "a2"] {
+        node.scope()
+            .create_record(
+                "Person",
+                &serde_json::json!({ "name": name }),
+                &[],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    for name in ["c1", "c2"] {
+        node.scope()
+            .create_record(
+                "Company",
+                &serde_json::json!({ "name": name }),
+                &[],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    let lmpg = node.scope().lmpg();
+    let snap = lmpg.store.read_view().unwrap();
+    let ids = |label: &str| {
+        test_access::label_members(&snap, lmpg.tenant, label)
+            .iter()
+            .map(|ord| {
+                node.scope()
+                    .record_value(*ord)
+                    .unwrap()
+                    .get("id")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    let persons = ids("Person");
+    let companies = ids("Company");
+    assert_eq!((persons.len(), companies.len()), (2, 2));
+
+    let execute = |mutation: rushdb_protocol::Mutation| {
+        ProtocolExecutor::new(&node, None)
+            .execute(RequestEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: None,
+                context: RequestContext {
+                    scope: None,
+                    deadline_ms: None,
+                    ..Default::default()
+                },
+                operation: Operation::Mutate { mutation },
+            })
+            .unwrap()
+            .response
+    };
+    let cmd = |targets: Vec<String>| rushdb_protocol::RelationshipIdsMutation {
+        relation_type: "WORKS_AT".into(),
+        direction: rushdb_protocol::Direction::Out,
+        source_ids: persons.clone(),
+        target_ids: targets,
+        properties: serde_json::json!({}),
+    };
+    let affected = |response: rushdb_protocol::Response| match response {
+        rushdb_protocol::Response::Mutation { affected }
+        | rushdb_protocol::Response::Linked {
+            created: affected, ..
+        } => affected,
+        other => panic!("unexpected response {other:?}"),
+    };
+
+    let before = node.store().committed_version();
+    let created = affected(execute(rushdb_protocol::Mutation::LinkRecordsById {
+        command: cmd(companies.clone()),
+    }));
+    assert_eq!(created, 4, "2x2 by-id links create four edges");
+    assert_eq!(
+        node.store().committed_version(),
+        before + 1,
+        "one call must cost one commit, not one per edge"
+    );
+
+    // Re-linking is idempotent and stages nothing (no commit consumed).
+    let before = node.store().committed_version();
+    let created = affected(execute(rushdb_protocol::Mutation::LinkRecordsById {
+        command: cmd(companies),
+    }));
+    assert_eq!(created, 0, "duplicate batch creates nothing");
+    assert_eq!(
+        node.store().committed_version(),
+        before,
+        "all-duplicate batch must not consume a commit"
+    );
+}
+
+#[test]
+fn link_records_by_id_with_dangling_target_applies_nothing() {
+    // E5: endpoint resolution fails fast before any write, so a batch
+    // with one dangling id applies nothing; retrying with only the valid
+    // target then creates exactly that edge.
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    node.scope()
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    node.scope()
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    let lmpg = node.scope().lmpg();
+    let snap = lmpg.store.read_view().unwrap();
+    let pid = node
+        .scope()
+        .record_value(test_access::label_members(&snap, lmpg.tenant, "Person")[0])
+        .unwrap()
+        .get("id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cid = node
+        .scope()
+        .record_value(test_access::label_members(&snap, lmpg.tenant, "Company")[0])
+        .unwrap()
+        .get("id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let try_execute = |targets: Vec<String>| {
+        ProtocolExecutor::new(&node, None).execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: None,
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Mutate {
+                mutation: rushdb_protocol::Mutation::LinkRecordsById {
+                    command: rushdb_protocol::RelationshipIdsMutation {
+                        relation_type: "FOUNDED".into(),
+                        direction: rushdb_protocol::Direction::Out,
+                        source_ids: vec![pid.clone()],
+                        target_ids: targets,
+                        properties: serde_json::json!({}),
+                    },
+                },
+            },
+        })
+    };
+    let dangling = "00000000000000000000000000000000".to_string();
+    assert!(
+        try_execute(vec![cid.clone(), dangling]).is_err(),
+        "dangling target must fail the batch"
+    );
+    let retry = try_execute(vec![cid]).unwrap();
+    let affected = match retry.response {
+        rushdb_protocol::Response::Mutation { affected }
+        | rushdb_protocol::Response::Linked {
+            created: affected, ..
+        } => affected,
+        other => panic!("unexpected response {other:?}"),
+    };
+    assert_eq!(
+        affected, 1,
+        "retry creates the edge, proving the failed batch applied nothing"
+    );
+}
+
+#[test]
+fn link_records_pairs_commits_one_batch_with_verbatim_types() {
+    // Pairwise delivery gate: N explicit pairs cost exactly one commit,
+    // per-pair types survive verbatim (HAS_NEST_* default + REL_*
+    // overrides in one call), and repeats are idempotent.
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    for name in ["a1", "a2", "b1"] {
+        node.scope()
+            .create_record(
+                "T",
+                &serde_json::json!({ "name": name }),
+                &[],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    let lmpg = node.scope().lmpg();
+    let snap = lmpg.store.read_view().unwrap();
+    let ids: Vec<String> = test_access::label_members(&snap, lmpg.tenant, "T")
+        .iter()
+        .map(|ord| {
+            node.scope()
+                .record_value(*ord)
+                .unwrap()
+                .get("id")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(ids.len(), 3);
+    let execute = |mutation: rushdb_protocol::Mutation| {
+        ProtocolExecutor::new(&node, None)
+            .execute(RequestEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: None,
+                context: RequestContext {
+                    scope: None,
+                    deadline_ms: None,
+                    ..Default::default()
+                },
+                operation: Operation::Mutate { mutation },
+            })
+            .unwrap()
+    };
+    let pairs = vec![
+        rushdb_protocol::RelationshipPair {
+            source_id: ids[0].clone(),
+            target_id: ids[1].clone(),
+            relation_type: None,
+        },
+        rushdb_protocol::RelationshipPair {
+            source_id: ids[0].clone(),
+            target_id: ids[2].clone(),
+            relation_type: Some("REL_CUSTOM".into()),
+        },
+        rushdb_protocol::RelationshipPair {
+            source_id: ids[1].clone(),
+            target_id: ids[2].clone(),
+            relation_type: Some("REL_OTHER".into()),
+        },
+    ];
+    let cmd = || rushdb_protocol::RelationshipPairsMutation {
+        relation_type: "HAS_NEST_X".into(),
+        direction: rushdb_protocol::Direction::Out,
+        pairs: pairs.clone(),
+        properties: serde_json::json!({}),
+    };
+    let affected = |response: rushdb_protocol::Response| match response {
+        rushdb_protocol::Response::Mutation { affected }
+        | rushdb_protocol::Response::Linked {
+            created: affected, ..
+        } => affected,
+        other => panic!("unexpected response {other:?}"),
+    };
+    let before = node.store().committed_version();
+    let created =
+        affected(execute(rushdb_protocol::Mutation::LinkRecordsPairs { command: cmd() }).response);
+    assert_eq!(created, 3);
+    assert_eq!(
+        node.store().committed_version(),
+        before + 1,
+        "one pairs call must cost one commit"
+    );
+    // Ground-truth types survive verbatim: default + both overrides.
+    let view = node.store().read_view().unwrap();
+    for (ord, ty) in [(0, "HAS_NEST_X"), (0, "REL_CUSTOM"), (1, "REL_OTHER")] {
+        let linked = rushdb_lmpg::reader::try_access::adj_out(&view, lmpg.tenant, ord, Some(ty))
+            .unwrap()
+            .len();
+        assert_eq!(linked, 1, "verbatim {ty} edge missing for ord {ord}");
+    }
+    // Repeat is idempotent and stages nothing.
+    let before = node.store().committed_version();
+    let created =
+        affected(execute(rushdb_protocol::Mutation::LinkRecordsPairs { command: cmd() }).response);
+    assert_eq!(created, 0);
+    assert_eq!(
+        node.store().committed_version(),
+        before,
+        "all-duplicate pairs batch must not consume a commit"
+    );
+}
+
+#[test]
+fn link_records_pairs_with_dangling_id_applies_nothing() {
+    // Delivery gate (a): bad-id batch fails loud with zero partials;
+    // retrying without the bad id then creates exactly its edges.
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    node.scope()
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    node.scope()
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    let lmpg = node.scope().lmpg();
+    let snap = lmpg.store.read_view().unwrap();
+    let members = test_access::label_members(&snap, lmpg.tenant, "Person");
+    let comembers = test_access::label_members(&snap, lmpg.tenant, "Company");
+    let pid = node
+        .scope()
+        .record_value(members[0])
+        .unwrap()
+        .get("id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cid = node
+        .scope()
+        .record_value(comembers[0])
+        .unwrap()
+        .get("id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let try_execute = |pairs: Vec<rushdb_protocol::RelationshipPair>| {
+        ProtocolExecutor::new(&node, None).execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: None,
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Mutate {
+                mutation: rushdb_protocol::Mutation::LinkRecordsPairs {
+                    command: rushdb_protocol::RelationshipPairsMutation {
+                        relation_type: "FOUNDED".into(),
+                        direction: rushdb_protocol::Direction::Out,
+                        pairs,
+                        properties: serde_json::json!({}),
+                    },
+                },
+            },
+        })
+    };
+    let good = || rushdb_protocol::RelationshipPair {
+        source_id: pid.clone(),
+        target_id: cid.clone(),
+        relation_type: None,
+    };
+    let dangling = rushdb_protocol::RelationshipPair {
+        source_id: pid.clone(),
+        target_id: "00000000000000000000000000000000".to_string(),
+        relation_type: None,
+    };
+    assert!(
+        try_execute(vec![good(), dangling]).is_err(),
+        "batch with a dangling id must fail loud"
+    );
+    let retry = try_execute(vec![good()]).unwrap();
+    let affected = match retry.response {
+        rushdb_protocol::Response::Mutation { affected }
+        | rushdb_protocol::Response::Linked {
+            created: affected, ..
+        } => affected,
+        other => panic!("unexpected response {other:?}"),
+    };
+    assert_eq!(
+        affected, 1,
+        "retry creates the edge, proving the failed batch applied nothing"
+    );
+}
+
+#[test]
+fn link_records_pairs_do_not_disturb_other_shapes() {
+    // Delivery gate (a), cross-shape non-interference: a pairs batch
+    // neither skips over nor duplicates edges of other types, and a
+    // by-id batch does not disturb pairs-created edges.
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    for name in ["a", "b"] {
+        node.scope()
+            .create_record(
+                "N",
+                &serde_json::json!({ "name": name }),
+                &[],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    let lmpg = node.scope().lmpg();
+    let snap = lmpg.store.read_view().unwrap();
+    let ids: Vec<String> = test_access::label_members(&snap, lmpg.tenant, "N")
+        .iter()
+        .map(|ord| {
+            node.scope()
+                .record_value(*ord)
+                .unwrap()
+                .get("id")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    let execute = |mutation: rushdb_protocol::Mutation| {
+        ProtocolExecutor::new(&node, None)
+            .execute(RequestEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: None,
+                context: RequestContext {
+                    scope: None,
+                    deadline_ms: None,
+                    ..Default::default()
+                },
+                operation: Operation::Mutate { mutation },
+            })
+            .unwrap()
+            .response
+    };
+    let affected = |response: rushdb_protocol::Response| match response {
+        rushdb_protocol::Response::Mutation { affected }
+        | rushdb_protocol::Response::Linked {
+            created: affected, ..
+        } => affected,
+        other => panic!("unexpected response {other:?}"),
+    };
+    // Seed one edge via the cross-product path.
+    let seeded = affected(execute(rushdb_protocol::Mutation::LinkRecordsById {
+        command: rushdb_protocol::RelationshipIdsMutation {
+            relation_type: "SEED".into(),
+            direction: rushdb_protocol::Direction::Out,
+            source_ids: vec![ids[0].clone()],
+            target_ids: vec![ids[1].clone()],
+            properties: serde_json::json!({}),
+        },
+    }));
+    assert_eq!(seeded, 1);
+    // Pairs batch with a new type: creates its edge, leaves SEED alone.
+    let created = affected(execute(rushdb_protocol::Mutation::LinkRecordsPairs {
+        command: rushdb_protocol::RelationshipPairsMutation {
+            relation_type: "PAIR".into(),
+            direction: rushdb_protocol::Direction::Out,
+            pairs: vec![rushdb_protocol::RelationshipPair {
+                source_id: ids[0].clone(),
+                target_id: ids[1].clone(),
+                relation_type: None,
+            }],
+            properties: serde_json::json!({}),
+        },
+    }));
+    assert_eq!(created, 1);
+    // Same pair, same type via by-id: now a duplicate (skipped).
+    let dup = affected(execute(rushdb_protocol::Mutation::LinkRecordsById {
+        command: rushdb_protocol::RelationshipIdsMutation {
+            relation_type: "PAIR".into(),
+            direction: rushdb_protocol::Direction::Out,
+            source_ids: vec![ids[0].clone()],
+            target_ids: vec![ids[1].clone()],
+            properties: serde_json::json!({}),
+        },
+    }));
+    assert_eq!(dup, 0, "cross-shape duplicate must be detected");
+    // Same pair under a third type via pairs: distinct edge, created.
+    let created = affected(execute(rushdb_protocol::Mutation::LinkRecordsPairs {
+        command: rushdb_protocol::RelationshipPairsMutation {
+            relation_type: "OTHER".into(),
+            direction: rushdb_protocol::Direction::Out,
+            pairs: vec![rushdb_protocol::RelationshipPair {
+                source_id: ids[0].clone(),
+                target_id: ids[1].clone(),
+                relation_type: None,
+            }],
+            properties: serde_json::json!({}),
+        },
+    }));
+    assert_eq!(created, 1, "same pair under a new type is a distinct edge");
+}
+
+#[test]
+fn transaction_statement_staging_is_gated_by_language() {
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let transaction_id = node.scope().tx_begin().unwrap();
+    let err = ProtocolExecutor::new(&node, None)
+        .execute(transaction_request(
+            TransactionOperation::Stage {
+                transaction_id,
+                mutation: rushdb_protocol::TransactionMutation::Statement {
+                    language: rushdb_protocol::StatementLanguage::Cypher,
+                    statement: "CREATE (:Doc {n: 1})".into(),
+                    parameters: None,
+                },
+            },
+            None,
+            None,
+        ))
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::LanguageDisabled);
+}
+
+/// Language gating: searchquery is always on, a disabled language is refused
+/// with `LanguageDisabled`, and an enabled language (mongodb) runs end-to-end.
+#[test]
+fn language_gating_enforces_enablement_and_searchquery_always_on() {
+    use rushdb_protocol::StatementLanguage;
+
+    // No statement languages: searchquery only.
+    let mut cfg = config(false);
+    cfg.languages = rushdb_protocol::LanguageSet::NONE;
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let executor = ProtocolExecutor::new(&node, None);
+    let statement = |language: StatementLanguage, statement: &str| RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: None,
+        context: RequestContext::default(),
+        operation: Operation::Query {
+            query: Query::Statement {
+                language,
+                statement: statement.to_string(),
+                parameters: None,
+            },
+        },
+    };
+
+    // searchquery (native QueryDocument) always works.
+    let ok = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: Query::Records {
+                    query: rushdb_protocol::QueryDocument::default(),
+                },
+            },
+        })
+        .unwrap();
+    assert!(matches!(ok.response, Response::Records { .. }));
+
+    // A disabled language (mongodb by default) is refused explicitly.
+    let err = executor
+        .execute(statement(
+            StatementLanguage::Mongo,
+            r#"{"collection":"Doc","filter":{}}"#,
+        ))
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::LanguageDisabled);
+
+    // Capabilities advertise only what is enabled (searchquery is always
+    // implied; no statement language by default).
+    let caps = executor
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Describe {
+                describe: Describe::Capabilities,
+            },
+        })
+        .unwrap();
+    let Response::Capabilities { capabilities } = caps.response else {
+        panic!("expected capabilities")
+    };
+    assert!(capabilities.contains(&"language:searchquery".to_string()));
+    assert!(!capabilities.iter().any(|c| c.contains("language:mongo")));
+
+    // Enable mongodb on a fresh node -> it runs end-to-end (find).
+    let mut cfg2 = config(false);
+    cfg2.languages = rushdb_protocol::LanguageSet::NONE;
+    cfg2.languages.mongodb = true;
+    let node2 = Node::bootstrap(&mut cfg2).unwrap();
+    node2
+        .scope()
+        .create_record(
+            "Doc",
+            &serde_json::json!({ "text": "alpha" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    let res = ProtocolExecutor::new(&node2, None)
+        .execute(statement(
+            StatementLanguage::Mongo,
+            r#"{"collection":"Doc","filter":{"text":"alpha"}}"#,
+        ))
+        .unwrap();
+    let Response::Rows { rows, .. } = res.response else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows.len(), 1);
+
+    // The Mongo profile advertises unsupported aggregate families rather
+    // than treating them as generic execution failures. Keep this at the
+    // Protocol boundary where clients observe the typed error contract.
+    let unsupported = ProtocolExecutor::new(&node2, None)
+        .execute(statement(
+            StatementLanguage::Mongo,
+            r#"{"collection":"Doc","aggregate":[{"$lookup":{"from":"Other","as":"joined"}}]}"#,
+        ))
+        .unwrap_err();
+    assert_eq!(unsupported.code, ErrorCode::Unsupported);
+
+    // Syntax outside a published community-language profile has the same
+    // typed boundary. It must not be exposed as an opaque execution fault.
+    let mut cfg3 = config(false);
+    cfg3.languages = rushdb_protocol::LanguageSet::NONE;
+    cfg3.languages.gql = true;
+    let node3 = Node::bootstrap(&mut cfg3).unwrap();
+    let gql_unsupported = ProtocolExecutor::new(&node3, None)
+        .execute(statement(
+            StatementLanguage::Gql,
+            "MATCH (n) WITH n ORDER BY n.id LIMIT 1 MATCH (m) RETURN m",
+        ))
+        .unwrap_err();
+    assert_eq!(gql_unsupported.code, ErrorCode::Unsupported);
+}
+
+/// SQL index DDL (`CREATE VECTOR INDEX` / `DROP INDEX`) routes to the
+/// native index operations instead of `DataFusion`.
+#[test]
+fn sql_index_ddl_creates_and_drops_vector_indexes() {
+    use rushdb_protocol::StatementLanguage;
+
+    let mut cfg = config(false);
+    cfg.languages.sql = true;
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    node.scope()
+        .create_record(
+            "Doc",
+            &serde_json::json!({ "text": "alpha" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    let executor = ProtocolExecutor::new(&node, None);
+    let mutate_sql = |statement: &str| RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: None,
+        context: RequestContext::default(),
+        operation: Operation::Mutate {
+            mutation: Mutation::Statement {
+                language: StatementLanguage::Sql,
+                statement: statement.to_string(),
+                parameters: None,
+            },
+        },
+    };
+
+    let created = executor
+        .execute(mutate_sql(
+            "CREATE VECTOR INDEX idx_doc ON Doc(text) SIMILARITY cosine DIMENSIONS 4",
+        ))
+        .unwrap();
+    let Response::StatementMutation {
+        status,
+        affected: 1,
+        ..
+    } = created.response
+    else {
+        panic!("expected statement mutation")
+    };
+    let alias = status.expect("created index alias");
+    assert_eq!(
+        alias, "idx_doc",
+        "SQL index names must remain durable identities"
+    );
+
+    let dropped = executor
+        .execute(mutate_sql(&format!("DROP INDEX {alias}")))
+        .unwrap();
+    assert!(matches!(
+        dropped.response,
+        Response::StatementMutation { affected: 1, .. }
+    ));
+}
+
+#[test]
+fn delete_property_removes_occurrences_and_schema() {
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    node.scope()
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada", "nickname": "Countess" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    node.scope()
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Bob", "nickname": "B" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+    // nickname appears in describe.properties before deletion.
+    let props = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: None,
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Describe {
+                describe: Describe::Properties {
+                    query: QueryDocument::default(),
+                    detail: None,
+                    skip: None,
+                    limit: None,
+                },
+            },
+        })
+        .unwrap();
+    let Response::Properties { properties } = props.response else {
+        panic!("expected properties response");
+    };
+    assert!(properties.iter().any(|p| p.name == "nickname"));
+
+    // deleteProperty removes it atomically.
+    let del = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: None,
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Mutate {
+                mutation: rushdb_protocol::Mutation::DeleteProperty {
+                    name: "nickname".into(),
+                },
+            },
+        })
+        .unwrap();
+    let Response::Mutation { affected } = del.response else {
+        panic!("expected mutation response");
+    };
+    assert_eq!(affected, 2, "two nickname occurrences removed");
+
+    let after = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: None,
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Describe {
+                describe: Describe::Properties {
+                    query: QueryDocument::default(),
+                    detail: None,
+                    skip: None,
+                    limit: None,
+                },
+            },
+        })
+        .unwrap();
+    let Response::Properties { properties } = after.response else {
+        panic!("expected properties response");
+    };
+    assert!(
+        !properties.iter().any(|p| p.name == "nickname"),
+        "deleted property must not appear in the schema"
+    );
+}
+
+#[test]
+fn protocol_scope_must_match_transport_scope() {
+    let mut cfg = config(true);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let error = ProtocolExecutor::new(&node, Some("tenant-a".into()))
+        .execute(join_request(Some("tenant-b")))
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ScopeMismatch);
+}
+
+#[test]
+fn policy_enforced_record_queries_intersect_labels_before_scanning() {
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let allowed_id = node
+        .scope()
+        .create_record(
+            "Allowed",
+            &serde_json::json!({"v": 1, "secret": "x"}),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let denied_id = node
+        .scope()
+        .create_record(
+            "Denied",
+            &serde_json::json!({"v": 2}),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    node.scope()
+        .security_put_policy(
+            &rushdb_authz::DataAccessPolicy {
+                allowed_labels: vec!["Allowed".into()],
+                visible_properties: std::collections::BTreeMap::from([(
+                    "Allowed".into(),
+                    vec!["v".into()],
+                )]),
+                ..Default::default()
+            },
+            rushdb_authz::AuthorizationMode::PolicyEnforced,
+        )
+        .unwrap();
+
+    let response = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: Query::Records {
+                    query: QueryDocument {
+                        limit: Some(10),
+                        ..Default::default()
+                    },
+                },
+            },
+        })
+        .unwrap()
+        .response;
+    let Response::Records { records, total, .. } = response else {
+        panic!("expected records response");
+    };
+    assert_eq!(total, 1);
+    assert_eq!(records.len(), 1);
+    assert!(records[0]["properties"].get("secret").is_none());
+
+    let direct = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: Query::Record { id: allowed_id },
+            },
+        })
+        .unwrap()
+        .response;
+    let Response::Record { record } = direct else {
+        panic!("expected direct record response");
+    };
+    assert!(record["properties"].get("secret").is_none());
+
+    let language_denied = ProtocolExecutor::new(&node, None)
+        .execute(statement_request(
+            StatementLanguage::Cypher,
+            "MATCH (n) RETURN n",
+        ))
+        .unwrap_err();
+    assert_eq!(language_denied.code, ErrorCode::Unauthorized);
+
+    let denied = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: Query::Record { id: denied_id },
+            },
+        })
+        .unwrap_err();
+    assert_eq!(denied.code, ErrorCode::Unauthorized);
+}
+
+#[test]
+fn oversized_response_for_a_committed_mutation_is_not_retryable() {
+    let mut cfg = config(false);
+    // The response cap is the request-byte budget; keep it tiny so a normal
+    // ingest response overflows it.
+    cfg.max_request_bytes = 256;
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let error = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Ingest {
+                ingest: Ingest::Documents {
+                    label: Some("Big".into()),
+                    documents: serde_json::json!([{ "payload": "x".repeat(4096) }]),
+                    options: serde_json::json!({ "returnResult": true }),
+                },
+            },
+        })
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ResourceExhausted);
+    assert!(
+        !error.retryable,
+        "a committed mutation must not be advertised as retryable"
+    );
+    assert!(
+        node.committed_version() > 0,
+        "the mutation must still be durable"
+    );
+}
+
+#[test]
+fn policy_enforced_reads_cannot_bypass_the_policy_gate() {
+    use rushdb_protocol::{PropertyValuesMode, QueryDocument, VectorIndexCandidatesQuery};
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    for value in [1, 2] {
+        node.scope()
+            .create_record(
+                "Allowed",
+                &serde_json::json!({"v": value}),
+                &[],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    node.scope()
+        .create_record(
+            "Denied",
+            &serde_json::json!({"v": 3}),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    node.scope()
+        .security_put_policy(
+            &rushdb_authz::DataAccessPolicy {
+                allowed_labels: vec!["Allowed".into()],
+                ..Default::default()
+            },
+            rushdb_authz::AuthorizationMode::PolicyEnforced,
+        )
+        .unwrap();
+
+    // Operations that cannot intersect the policy must fail closed.
+    let join = ProtocolExecutor::new(&node, None)
+        .execute(join_request(None))
+        .unwrap_err();
+    assert_eq!(join.code, ErrorCode::Unauthorized, "join must be gated");
+
+    let candidates = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: Query::VectorIndexCandidates {
+                    query: VectorIndexCandidatesQuery {
+                        label: "Allowed".into(),
+                        property: "v".into(),
+                        index: "i".into(),
+                        skip: 0,
+                        limit: 10,
+                    },
+                },
+            },
+        })
+        .unwrap_err();
+    assert_eq!(
+        candidates.code,
+        ErrorCode::Unauthorized,
+        "vector candidate enumeration must be gated"
+    );
+
+    // Property-value counts must be computed over the policy-intersected set,
+    // not the global maintained postings (which would also see "Denied").
+    let counts = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: Query::PropertyValues {
+                    property: "v".into(),
+                    query: QueryDocument::default(),
+                    mode: Some(PropertyValuesMode::Count),
+                    limit: None,
+                    search: None,
+                },
+            },
+        })
+        .unwrap()
+        .response;
+    let Response::PropertyValues { distinct_count, .. } = counts else {
+        panic!("expected property values response");
+    };
+    assert_eq!(
+        distinct_count,
+        Some(2),
+        "policy must exclude the denied label's value"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single linear operation/reader; splitting it would scatter shared borrows and hurt auditability"
+)]
+fn purge_tenant_removes_all_scoped_data() {
+    let mut cfg = config(true);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let scope = RequestScope::new(&node, Some("tenant-a".into()));
+    scope
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada", "tags": ["a", "b"] }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    scope
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    scope
+        .create_vector_index(&rushdb_protocol::VectorIndexDefinition {
+            label: "Person".into(),
+            property: "embedding".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            name: Some("purge-owned-index".into()),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    let external_index_key = format!(
+        "{}purge-owned-index",
+        rushdb_types::keys::vector_index_meta_prefix(scope.tenant())
+    );
+    assert!(scope
+        .lmpg()
+        .store
+        .read_view()
+        .unwrap()
+        .get(external_index_key.as_bytes())
+        .unwrap()
+        .is_some());
+
+    let before = ProtocolExecutor::new(&node, Some("tenant-a".into()))
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: Some("tenant-a".into()),
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Describe {
+                describe: Describe::Schema {
+                    query: QueryDocument::default(),
+                    detail: None,
+                    skip: None,
+                    limit: None,
+                },
+            },
+        })
+        .unwrap();
+    let Response::Schema { schema } = before.response else {
+        panic!("expected schema response")
+    };
+    assert_eq!(schema.labels.len(), 2);
+    // per-label attribution: name (Person), tags (Person), name (Company)
+    assert_eq!(schema.properties.len(), 3);
+
+    let purged = ProtocolExecutor::new(&node, Some("tenant-a".into()))
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: Some("tenant-a".into()),
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::PurgeTenant,
+        })
+        .unwrap();
+    assert!(matches!(purged.response, Response::PurgedTenant { .. }));
+
+    // after purge the same scope reports no labels, properties or relationships
+    let after = ProtocolExecutor::new(&node, Some("tenant-a".into()))
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: Some("tenant-a".into()),
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Describe {
+                describe: Describe::Schema {
+                    query: QueryDocument::default(),
+                    detail: None,
+                    skip: None,
+                    limit: None,
+                },
+            },
+        })
+        .unwrap();
+    let Response::Schema { schema } = after.response else {
+        panic!("expected schema response")
+    };
+    assert!(schema.labels.is_empty(), "labels: {:?}", schema.labels);
+    assert!(schema.relationships.is_empty());
+    assert!(schema.properties.is_empty());
+    assert!(
+        scope
+            .lmpg()
+            .store
+            .read_view()
+            .unwrap()
+            .get(external_index_key.as_bytes())
+            .unwrap()
+            .is_none(),
+        "tenant-owned vector metadata must be purged too"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single linear operation/reader; splitting it would scatter shared borrows and hurt auditability"
+)]
+fn retype_relations_renames_edges_between_labels() {
+    let mut cfg = config(false);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    node.scope()
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    node.scope()
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    // create the default edge directly through the LMPG (bypasses the
+    // linkRecords join-key/where constraints)
+    {
+        let lmpg = node.scope().lmpg();
+        let snap = lmpg.store.read_view().unwrap();
+        let ords = test_access::label_members(&snap, lmpg.tenant, "Person");
+        let src = test_access::record_by_ord(&snap, lmpg.tenant, ords[0]).unwrap();
+        let ords = test_access::label_members(&snap, lmpg.tenant, "Company");
+        let tgt = test_access::record_by_ord(&snap, lmpg.tenant, ords[0]).unwrap();
+        lmpg.create_relationship(
+            "__RUSHDB__RELATION__DEFAULT__",
+            rushdb_lmpg::RecordRef {
+                record_id: src.record_id,
+                ordinal: src.ordinal,
+            },
+            rushdb_lmpg::RecordRef {
+                record_id: tgt.record_id,
+                ordinal: tgt.ordinal,
+            },
+            vec![],
+        )
+        .unwrap();
+    }
+
+    // confirm a default edge exists
+    let q = rushdb_protocol::RelationshipQuery {
+        relation_type: Some("__RUSHDB__RELATION__DEFAULT__".into()),
+        ..Default::default()
+    };
+    let before = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: rushdb_protocol::Query::Relationships { query: q },
+            },
+        })
+        .unwrap();
+    let Response::Relationships { relationships, .. } = before.response else {
+        panic!("expected relationships response")
+    };
+    assert_eq!(relationships.len(), 1, "default edge exists before retype");
+
+    let retyped = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Mutate {
+                mutation: rushdb_protocol::Mutation::RetypeRelations {
+                    command: rushdb_protocol::RetypeRelationsMutation {
+                        source_label: "Person".into(),
+                        target_label: "Company".into(),
+                        source_type: "__RUSHDB__RELATION__DEFAULT__".into(),
+                        target_type: "FOUNDED".into(),
+                        direction: rushdb_protocol::Direction::Out,
+                    },
+                },
+            },
+        })
+        .unwrap();
+    let Response::Mutation { affected } = retyped.response else {
+        panic!("expected mutation response")
+    };
+    assert_eq!(affected, 1);
+
+    // default edge gone, FOUNDED edge present
+    let q_default = rushdb_protocol::RelationshipQuery {
+        relation_type: Some("__RUSHDB__RELATION__DEFAULT__".into()),
+        ..Default::default()
+    };
+    let after_default = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: rushdb_protocol::Query::Relationships { query: q_default },
+            },
+        })
+        .unwrap();
+    let Response::Relationships { relationships, .. } = after_default.response else {
+        panic!("expected relationships response")
+    };
+    assert!(relationships.is_empty(), "old type removed");
+
+    let q_founded = rushdb_protocol::RelationshipQuery {
+        relation_type: Some("FOUNDED".into()),
+        ..Default::default()
+    };
+    let after_founded = ProtocolExecutor::new(&node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: rushdb_protocol::Query::Relationships { query: q_founded },
+            },
+        })
+        .unwrap();
+    let Response::Relationships { relationships, .. } = after_founded.response else {
+        panic!("expected relationships response")
+    };
+    assert_eq!(relationships.len(), 1, "new type created");
+}
+
+#[test]
+fn backup_exports_consistent_snapshot_and_round_trips() {
+    // multitenant: two scopes with data
+    let mut cfg = config(true);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let scope = RequestScope::new(&node, Some("tenant-a".into()));
+    scope
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada", "tags": ["a", "b"] }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    scope
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    // link the two records directly through the LMPG
+    {
+        let lmpg = scope.lmpg();
+        let snap = lmpg.store.read_view().unwrap();
+        let ps = test_access::label_members(&snap, lmpg.tenant, "Person");
+        let cs = test_access::label_members(&snap, lmpg.tenant, "Company");
+        let p = test_access::record_by_ord(&snap, lmpg.tenant, ps[0]).unwrap();
+        let c = test_access::record_by_ord(&snap, lmpg.tenant, cs[0]).unwrap();
+        lmpg.create_relationship(
+            "FOUNDED",
+            rushdb_lmpg::RecordRef {
+                record_id: p.record_id,
+                ordinal: p.ordinal,
+            },
+            rushdb_lmpg::RecordRef {
+                record_id: c.record_id,
+                ordinal: c.ordinal,
+            },
+            vec![(
+                "since".into(),
+                rushdb_lmpg::plan::FieldChange::Set(serde_json::json!(2020)),
+            )],
+        )
+        .unwrap();
+    }
+
+    // take a backup pinned at the current commit index
+    let response = ProtocolExecutor::new(&node, Some("tenant-a".into()))
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext {
+                scope: Some("tenant-a".into()),
+                deadline_ms: None,
+                ..Default::default()
+            },
+            operation: Operation::Backup {
+                request: rushdb_protocol::BackupRequest {
+                    scopes: vec!["tenant-a".into()],
+                },
+            },
+        })
+        .unwrap();
+    let Response::Backup {
+        commit_index,
+        tenants,
+    } = response.response
+    else {
+        panic!("expected backup response")
+    };
+    assert_eq!(tenants.len(), 1);
+    assert_eq!(tenants[0].scope.as_deref(), Some("tenant-a"));
+    assert_eq!(tenants[0].records, 2);
+    assert_eq!(tenants[0].relationships, 1);
+    assert!(commit_index > 0);
+    let jsonl = tenants[0].jsonl.clone();
+
+    // restore into a fresh single-tenant node and compare canonical shape
+    let mut cfg2 = config(false);
+    let node2 = Node::bootstrap(&mut cfg2).unwrap();
+    let (records, relationships) =
+        rushdb_backup::restore_backup(&node2.scope().lmpg(), &jsonl).unwrap();
+    assert_eq!(records, 2);
+    assert_eq!(relationships, 1);
+
+    let schema = ProtocolExecutor::new(&node2, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation: Operation::Describe {
+                describe: Describe::Schema {
+                    query: QueryDocument::default(),
+                    detail: None,
+                    skip: None,
+                    limit: None,
+                },
+            },
+        })
+        .unwrap();
+    let Response::Schema { schema } = schema.response else {
+        panic!("expected schema response")
+    };
+    assert_eq!(schema.labels.len(), 2, "labels: {:?}", schema.labels);
+    assert_eq!(schema.relationships.len(), 1);
+    assert_eq!(schema.relationships[0].relationship_type, "FOUNDED");
+    assert_eq!(schema.relationships[0].properties[0].name, "since");
+}
+
+#[test]
+fn framed_snapshot_export_restores_and_rejects_corruption() {
+    // Seed data in tenant-a (record + relationship, mirrors the plain
+    // backup round-trip test).
+    let mut cfg = config(true);
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let scope = RequestScope::new(&node, Some("tenant-a".into()));
+    scope
+        .create_record(
+            "Person",
+            &serde_json::json!({ "name": "Ada", "tags": ["a", "b"] }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    scope
+        .create_record(
+            "Company",
+            &serde_json::json!({ "name": "RushDB" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    {
+        let lmpg = scope.lmpg();
+        let snap = lmpg.store.read_view().unwrap();
+        let ps = test_access::label_members(&snap, lmpg.tenant, "Person");
+        let cs = test_access::label_members(&snap, lmpg.tenant, "Company");
+        let p = test_access::record_by_ord(&snap, lmpg.tenant, ps[0]).unwrap();
+        let c = test_access::record_by_ord(&snap, lmpg.tenant, cs[0]).unwrap();
+        lmpg.create_relationship(
+            "FOUNDED",
+            rushdb_lmpg::RecordRef {
+                record_id: p.record_id,
+                ordinal: p.ordinal,
+            },
+            rushdb_lmpg::RecordRef {
+                record_id: c.record_id,
+                ordinal: c.ordinal,
+            },
+            vec![(
+                "since".into(),
+                rushdb_lmpg::plan::FieldChange::Set(serde_json::json!(2020)),
+            )],
+        )
+        .unwrap();
+    }
+
+    // Export the framed, manifest-verified snapshot.
