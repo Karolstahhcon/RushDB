@@ -18,24 +18,3 @@ fn put(node: &Node, mutation: &serde_json::Value) -> Result<Response, ProtocolEr
                 deadline_ms: None,
                 ..Default::default()
             },
-            operation,
-        })
-        .map(|envelope| envelope.response)
-}
-
-fn create(properties: &serde_json::Value, merge_by: &[&str]) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "putRecord", "mode": "create", "label": "User",
-        "properties": properties, "options": { "mergeBy": merge_by }
-    })
-}
-
-fn assert_invalid(error: &ProtocolError, expected: &str) {
-    assert_eq!(error.code, ErrorCode::InvalidRequest, "{error:?}");
-    assert!(!error.retryable, "{error:?}");
-    assert!(error.message.contains(expected), "{error:?}");
-}
-
-#[test]
-fn reserved_names_and_unindexed_upserts_over_the_limit_are_invalid_requests() {
-    let mut config = super::tests::config(false);
