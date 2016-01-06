@@ -20,25 +20,3 @@ fn gql_profile_manifest_is_complete_and_traceable() {
         .expect("accepted feature list");
     for required in [
         "match",
-        "parameters",
-        "optionalMatch",
-        "aggregation",
-        "unwind",
-        "createNode",
-        "createRelationship",
-        "atomicStatementCommit",
-    ] {
-        assert!(
-            accepted.iter().any(|value| value == required),
-            "profile omits {required}"
-        );
-    }
-    let excluded = profile["excludedFeatures"]
-        .as_array()
-        .expect("excluded feature list");
-    assert!(excluded
-        .iter()
-        .any(|value| value == "fullIsoGqlConformance"));
-
-    let sources = profile["sources"].as_array().expect("source list");
-    assert!(sources.iter().any(|source| source["kind"] == "standard"));
