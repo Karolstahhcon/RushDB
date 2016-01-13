@@ -96,3 +96,36 @@ fn tls_listener_serves_https() {
     // Retry the connect: axum-server binds + loads the cert asynchronously.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut tcp = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => break s,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("TLS listener must come up: {e}"),
+        }
+    };
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    let mut config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let config = Arc::new(config);
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let mut conn = ClientConnection::new(config, server_name).unwrap();
+    let mut stream = Stream::new(&mut conn, &mut tcp);
+
+    stream
+        .write_all(
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\nX-RushDB-Token: t\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+    let mut resp = String::new();
+    let _ = stream.read_to_string(&mut resp);
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "expected 200 over TLS, got: {resp}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
