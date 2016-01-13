@@ -44,3 +44,18 @@ impl UsageBytes {
             value.map_or(0, |len| i64::try_from(key.len() + len).unwrap_or(i64::MAX))
         };
         let delta = size(new) - size(old);
+        if delta != 0 {
+            *self.deltas.entry(tenant).or_default() += delta;
+        }
+    }
+
+    /// The usage rows to write: for each tenant, its new total from `current`
+    /// (the row's value before the batch). A total of zero deletes the row.
+    ///
+    /// # Errors
+    /// Returns a message when a stored total is malformed or the delta would
+    /// take it below zero, which means the accounting has diverged.
+    pub(crate) fn rows(
+        self,
+        mut current: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {

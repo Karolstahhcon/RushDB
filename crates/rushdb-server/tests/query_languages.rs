@@ -574,3 +574,291 @@ fn mongodb_index_ddl() {
 
 #[test]
 fn capabilities_advertise_only_enabled_languages() {
+    let node = bootstrap();
+    let languages = describe_languages(&node);
+    assert_eq!(
+        languages.len(),
+        6,
+        "all six statement languages enabled in the suite"
+    );
+    assert!(languages.iter().all(|c| {
+        c.access
+            == match c.language {
+                StatementLanguage::SqlPgq => rushdb_protocol::StatementAccess::ReadOnly,
+                _ => rushdb_protocol::StatementAccess::ReadWrite,
+            }
+    }));
+    // Honest delivery statuses: SQL/graph-traversal/Mongo are already done;
+    // GQL and openCypher are release candidates until their conformance gates
+    // go green. No language advertises ComingSoon.
+    for c in &languages {
+        let expected = match c.language {
+            StatementLanguage::Gql | StatementLanguage::Cypher => {
+                rushdb_protocol::LanguageStatus::ReleaseCandidate
+            }
+            _ => rushdb_protocol::LanguageStatus::Stable,
+        };
+        assert_eq!(
+            c.status,
+            expected,
+            "{} must advertise {:?}, got {:?}",
+            c.language.as_str(),
+            expected,
+            c.status
+        );
+    }
+    let gql = languages
+        .iter()
+        .find(|c| c.language == StatementLanguage::Gql)
+        .unwrap();
+    assert!(gql
+        .limitations
+        .iter()
+        .any(|limit| limit == "noFullIsoGqlConformance"));
+    for limit in [
+        "singlePrimaryLabelPerRecord",
+        "statementLabelMutationUnavailable",
+    ] {
+        assert!(
+            gql.limitations.iter().any(|actual| actual == limit),
+            "GQL profile must advertise {limit}"
+        );
+    }
+    let cypher = languages
+        .iter()
+        .find(|c| c.language == StatementLanguage::Cypher)
+        .unwrap();
+    // Every exclusion of the openCypher TCK profile is advertised.
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../conformance/opencypher-tck-v2024.2-profile.json"
+    ))
+    .unwrap();
+    let mut exclusions = 0;
+    for category in profile["categories"].as_object().unwrap().values() {
+        if category["kind"] != "exclusion" {
+            continue;
+        }
+        for limit in category["limitations"].as_array().unwrap() {
+            exclusions += 1;
+            let limit = limit.as_str().unwrap();
+            assert!(
+                cypher.limitations.iter().any(|actual| actual == limit),
+                "Cypher profile must advertise {limit}"
+            );
+        }
+    }
+    assert!(exclusions > 0);
+    assert!(cypher
+        .limitations
+        .iter()
+        .any(|limit| limit == "noFullOpenCypherTckConformance"));
+    assert!(
+        !cypher
+            .limitations
+            .iter()
+            .any(|limit| limit == "noCypherIndexDdl"),
+        "Cypher index DDL works (cypher_conformance index-ddl), so it is no limitation"
+    );
+}
+
+// ── disabled-language refusal (default config) ──────────────────────────────
+
+#[test]
+fn disabled_language_is_refused() {
+    let mut cfg = ServerConfig {
+        languages: rushdb_protocol::LanguageSet::NONE, // searchquery-only
+        ..ServerConfig::default()
+    };
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let envelope = RequestEnvelope {
+        protocol_version: 1,
+        request_id: None,
+        context: RequestContext::default(),
+        operation: Operation::Query {
+            query: Query::Statement {
+                language: StatementLanguage::Mongo,
+                statement: r#"{"collection":"X","filter":{}}"#.into(),
+                parameters: None,
+            },
+        },
+    };
+    let err = rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+        .execute(envelope)
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::LanguageDisabled);
+    // searchquery still works.
+    let envelope = RequestEnvelope {
+        protocol_version: 1,
+        request_id: None,
+        context: RequestContext::default(),
+        operation: Operation::Query {
+            query: Query::Records {
+                query: QueryDocument::default(),
+            },
+        },
+    };
+    let _ = rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+        .execute(envelope)
+        .unwrap();
+}
+#[test]
+fn build_info_reports_identity_bindings_and_limits() {
+    use rushdb_protocol::{Describe, Operation, RequestContext, RequestEnvelope, Response};
+    let node = bootstrap();
+    let envelope = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("build-info".into()),
+        context: RequestContext::default(),
+        operation: Operation::Describe {
+            describe: Describe::BuildInfo,
+        },
+    };
+    let response = rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+        .execute(envelope)
+        .unwrap();
+    let Response::BuildInfo { build } = response.response else {
+        panic!("expected BuildInfo response");
+    };
+    assert_eq!(build.engine, "rushdb-lmpg");
+    assert_eq!(build.protocol_version, rushdb_protocol::PROTOCOL_VERSION);
+    assert!(!build.version.is_empty());
+    // Every transport has a binding; the port is the configured value (0 when
+    // ephemeral). `tls` reflects whether the listener serves HTTPS.
+    let http = build
+        .transports
+        .iter()
+        .find(|t| t.transport == "http")
+        .expect("http transport binding");
+    assert!(!http.tls);
+    // Limits are populated.
+    assert!(build.limits.contains_key("maxRequestBytes"));
+    assert!(build.limits.contains_key("storageBudgetBytes"));
+}
+
+#[test]
+fn mongo_unsupported_forms_fail_with_typed_error() {
+    use rushdb_protocol::{ErrorCode, Operation, Query, RequestContext, RequestEnvelope};
+    let node = bootstrap();
+    let statements = [
+        // aggregate stages that are recognized-but-unsupported
+        r#"{"collection":"X","aggregate":[{"$match":{"a":1}},{"$lookup":{"from":"Y","localField":"a","foreignField":"b","as":"c"}}]}"#,
+        r#"{"collection":"X","aggregate":[{"$match":{"a":1}},{"$geoNear":{"near":{"type":"Point","coordinates":[0,0]},"distanceField":"d"}}]}"#,
+        r#"{"collection":"X","aggregate":[{"$match":{}},{"$unwind":"$arr"}]}"#,
+    ];
+    for stmt in statements {
+        let envelope = RequestEnvelope {
+            protocol_version: 1,
+            request_id: Some("mongo-unsupported".into()),
+            context: RequestContext::default(),
+            operation: Operation::Query {
+                query: Query::Statement {
+                    language: StatementLanguage::Mongo,
+                    statement: stmt.into(),
+                    parameters: None,
+                },
+            },
+        };
+        let err = rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+            .execute(envelope)
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::Unsupported,
+            "statement {stmt} must fail with Unsupported, got {err:?}"
+        );
+        assert!(
+            err.message.contains("unsupported"),
+            "message must explain: {err:?}"
+        );
+    }
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one maintenance-mode contract test covers reads, writes, indexes, purge, and rollback"
+)]
+fn maintenance_mode_rejects_writes_but_serves_reads() {
+    use rushdb_protocol::{
+        ErrorCode, IndexOperation, Mutation, Operation, Query, RequestContext, RequestEnvelope,
+        TransactionOperation, VectorIndexDefinition,
+    };
+    let mut cfg = config();
+    cfg.maintenance = true;
+    let node = Node::bootstrap(&mut cfg).unwrap();
+
+    // Reads still work.
+    let read = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("read-in-maintenance".into()),
+        context: RequestContext::default(),
+        operation: Operation::Query {
+            query: Query::Records {
+                query: QueryDocument::default(),
+            },
+        },
+    };
+    let _ = rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+        .execute(read)
+        .unwrap();
+
+    // Writes are rejected with Unavailable.
+    let write = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("write-in-maintenance".into()),
+        context: RequestContext::default(),
+        operation: Operation::Mutate {
+            mutation: Mutation::PutRecord {
+                mode: rushdb_protocol::PutMode::Create,
+                id: None,
+                label: Some("NOTE".into()),
+                properties: serde_json::json!({ "text": "x" }),
+                vectors: vec![],
+                options: serde_json::json!({}),
+            },
+        },
+    };
+    let err = rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+        .execute(write)
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{err:?}");
+    assert!(err.message.contains("maintenance"));
+
+    let index = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("index-in-maintenance".into()),
+        context: RequestContext::default(),
+        operation: Operation::Index {
+            index: IndexOperation::CreateVector {
+                definition: VectorIndexDefinition {
+                    name: Some("maintenance-index".into()),
+                    label: "NOTE".into(),
+                    property: "embedding".into(),
+                    dimensions: 2,
+                    similarity: "cosine".into(),
+                    model: None,
+                    owner: None,
+                },
+            },
+        },
+    };
+    assert_eq!(
+        rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+            .execute(index)
+            .unwrap_err()
+            .code,
+        ErrorCode::Unavailable
+    );
+
+    let purge = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("purge-in-maintenance".into()),
+        context: RequestContext::default(),
+        operation: Operation::PurgeTenant,
+    };
+    assert_eq!(
+        rushdb_server::protocol::ProtocolExecutor::new(&node, None)
+            .execute(purge)
+            .unwrap_err()
+            .code,
+        ErrorCode::Unavailable
