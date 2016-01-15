@@ -53,3 +53,115 @@ async fn connect(port: u16, _token: &str) -> tonic::client::Grpc<Channel> {
         .expect("connect");
     tonic::client::Grpc::new(channel)
 }
+
+async fn execute(
+    grpc: &mut tonic::client::Grpc<Channel>,
+    token: &str,
+    envelope: serde_json::Value,
+) -> Result<BytesEnvelope, tonic::Status> {
+    let mut req = Request::new(BytesEnvelope {
+        json: serde_json::to_vec(&envelope).expect("serialize envelope"),
+    });
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("token metadata"),
+    );
+    let codec = ProstCodec::<BytesEnvelope, BytesEnvelope>::default();
+    grpc.ready()
+        .await
+        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let path = tonic::codegen::http::uri::PathAndQuery::from_static("/rushdb.v1.Database/Execute");
+    let resp = grpc.unary(req, path, codec).await?;
+    Ok(resp.into_inner())
+}
+
+fn put_envelope(label: &str, id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": 1,
+        "operation": {
+            "kind": "mutate",
+            "mutation": {
+                "kind": "putRecord",
+                "mode": "create",
+                "label": label,
+                "properties": { "name": id },
+                "options": {}
+            }
+        }
+    })
+}
+
+fn query_envelope(label: &str) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": 1,
+        "operation": {
+            "kind": "query",
+            "query": {
+                "kind": "records",
+                "query": {
+                    "labels": [label],
+                    "predicate": {},
+                    "offset": 0,
+                    "limit": 100
+                }
+            }
+        }
+    })
+}
+
+fn ranked_put_envelope(id: &str, rank: u64) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": 1,
+        "operation": {
+            "kind": "mutate",
+            "mutation": {
+                "kind": "putRecord", "mode": "create", "label": "CURSOR_ITEM",
+                "properties": { "name": id, "rank": rank }, "options": {}
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn grpc_round_trip_insert_and_query() {
+    let port = boot("grpc-token", LanguageSet::default());
+    let mut grpc = connect(port, "grpc-token").await;
+    let resp = execute(&mut grpc, "grpc-token", put_envelope("Artist", "a1"))
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&resp.json).unwrap();
+    assert_eq!(value["response"]["kind"], "record");
+    assert_eq!(value["response"]["record"]["properties"]["name"], "a1");
+
+    let resp = execute(&mut grpc, "grpc-token", query_envelope("Artist"))
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&resp.json).unwrap();
+    assert_eq!(value["response"]["kind"], "records");
+    let records = value["response"]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["properties"]["name"], "a1");
+}
+
+#[tokio::test]
+async fn grpc_carries_native_snapshot_cursor_envelopes() {
+    let port = boot("grpc-token", LanguageSet::default());
+    let mut grpc = connect(port, "grpc-token").await;
+    for (id, rank) in [("c1", 1), ("c2", 2), ("c3", 3)] {
+        execute(&mut grpc, "grpc-token", ranked_put_envelope(id, rank))
+            .await
+            .unwrap();
+    }
+    let first = execute(
+        &mut grpc,
+        "grpc-token",
+        serde_json::json!({
+            "protocolVersion": 1,
+            "operation": { "kind": "query", "query": { "kind": "records", "query": {
+                "labels": ["CURSOR_ITEM"], "predicate": {}, "order": {"rank":"asc"},
+                "limit": 2, "cursorTtlMs": 1000
+            }}}
+        }),
+    )
+    .await
+    .unwrap();

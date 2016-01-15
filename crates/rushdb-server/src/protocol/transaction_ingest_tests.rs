@@ -66,37 +66,3 @@ fn a_staged_json_import_lands_on_commit_with_its_relationships() {
         &node,
         &tx,
         &serde_json::json!({"kind": "documents", "label": "Author", "documents": [
-            {"name": "Herbert", "book": {"title": "Dune"}},
-            {"name": "Le Guin", "book": [{"title": "Earthsea"}, {"title": "Lathe"}]},
-        ]}),
-    )
-    .unwrap();
-    assert_eq!(staged["kind"], "transactionIngested");
-    assert_eq!(staged["count"], 5);
-    assert_eq!(staged["relationships"], 3);
-    assert_eq!(count(&node, "Author"), 0);
-    assert_eq!(links(&node), 0);
-
-    assert_eq!(
-        transaction(&node, &tx, "commit", &serde_json::json!({}))["status"],
-        "committed"
-    );
-    assert_eq!(count(&node, "Author"), 2);
-    assert_eq!(count(&node, "book"), 3);
-    assert_eq!(links(&node), 3);
-}
-
-#[test]
-fn a_staged_csv_import_rolls_back_with_its_transaction() {
-    let node = Node::bootstrap(&mut super::tests::config(false)).unwrap();
-    let tx = begin(&node);
-    let staged = stage_ingest(
-        &node,
-        &tx,
-        &serde_json::json!({"kind": "csv", "label": "Book", "data": "title,pages\nDune,412\nEmma,474\n",
-            "options": {"suggestTypes": true}}),
-    )
-    .unwrap();
-    assert_eq!(staged["count"], 2);
-    transaction(&node, &tx, "rollback", &serde_json::json!({}));
-    assert_eq!(count(&node, "Book"), 0);
