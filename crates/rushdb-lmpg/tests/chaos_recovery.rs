@@ -146,3 +146,77 @@ fn crash_at_every_commit_boundary_converges() {
         let rec_store = Arc::new(Store::new_in_memory());
         drop(Lmpg::new(Arc::clone(&rec_store), tenant));
         rec_store.try_replay(prefix).unwrap();
+
+        let rec_store2 = Arc::new(Store::new_in_memory());
+        drop(Lmpg::new(Arc::clone(&rec_store2), tenant));
+        rec_store2.try_replay(prefix).unwrap();
+
+        assert_eq!(
+            state_fingerprint(rec_store.as_ref()),
+            state_fingerprint(rec_store2.as_ref()),
+            "replay instability at boundary {cut}"
+        );
+    }
+
+    // torn tails (partially flushed final line) must not poison the file
+    for cut in 1..full_log.len() {
+        let mut truncated = full_log[..cut].to_vec();
+        truncated.push(full_log[cut][..8.min(full_log[cut].len())].to_vec());
+
+        let good: Vec<Vec<u8>> = truncated
+            .iter()
+            .filter(|raw| rushdb_types::command_codec::decode(raw).is_ok())
+            .cloned()
+            .collect();
+
+        let st = Arc::new(Store::new_in_memory());
+        drop(Lmpg::new(Arc::clone(&st), tenant));
+        st.try_replay(&good).unwrap();
+        assert!(
+            st.as_ref().committed_version() >= cut as u64 || cut == full_log.len(),
+            "torn tail at {cut} lost committed data"
+        );
+    }
+}
+
+#[test]
+fn scrub_invariants_hold_after_workload_and_replay() {
+    let primary = Arc::new(Store::new_in_memory());
+    let tenant = TenantId::from_ordinal(13);
+    {
+        let eng = Lmpg::new(Arc::clone(&primary), tenant);
+        for i in 0..5u64 {
+            import_document(
+                &eng,
+                "Note",
+                &serde_json::json!({"n": i, "body": format!("note {i}"), "flag": i % 2 == 0}),
+            )
+            .unwrap();
+        }
+        let a = eng.create_record("A", None, vec![]).unwrap();
+        let b = eng.create_record("B", None, vec![]).unwrap();
+        let rel = eng
+            .create_relationship(
+                "R",
+                a,
+                b,
+                vec![("w".into(), FieldChange::Set(serde_json::json!(3)))],
+            )
+            .unwrap();
+        let _ = rel;
+        eng.delete_record(b).unwrap(); // cascade removes rel + occurrences
+    }
+
+    let log = primary.take_log_for_crash();
+    let rec_store = Arc::new(Store::new_in_memory());
+    drop(Lmpg::new(Arc::clone(&rec_store), tenant));
+    rec_store.try_replay(&log).unwrap();
+
+    let view_replayed = rec_store.read_view().unwrap();
+    let report = rushdb_lmpg::scrub::scrub_report(&view_replayed, tenant).unwrap();
+    assert!(report.complete);
+    assert!(report.occurrence_rows > 0);
+    assert!(report.derived_rows > 0);
+    assert!(
+        report.violations.is_empty(),
+        "invariant violations after replay: {:?}",
