@@ -19,25 +19,3 @@ impl Replicator for DelayedAcknowledgement {
         let store = self.store.upgrade().ok_or("store closed")?;
         store
             .apply_replicated_batch_with_payload(batch, Some(payload))
-            .map_err(|error| error.to_string())?;
-        // Publication has succeeded. Delay only its acknowledgement, so this
-        // checks the committed outcome rather than racing planning cancellation.
-        std::thread::sleep(
-            self.deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
-        );
-        Ok(())
-    }
-}
-
-#[test]
-fn committed_import_succeeds_when_acknowledgement_passes_deadline() {
-    let engine = Engine::new_in_memory();
-    let mut context = engine
-        .context(
-            None,
-            OperationClass::Write,
-            Some(Duration::from_secs(2)),
-            None,
-        )
-        .unwrap();
-    engine

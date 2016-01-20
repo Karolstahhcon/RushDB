@@ -1017,3 +1017,343 @@ impl RequestScope<'_> {
         view: &rushdb_storage::ReadView,
         meta: &PropertyMetadata,
         label: &str,
+        pid: u64,
+    ) -> Result<Option<(serde_json::Value, serde_json::Value)>, String> {
+        use rushdb_types::model::LogicalType;
+        let Some(ty) = meta
+            .values()
+            .flatten()
+            .find_map(|(id, _, _, logical)| (*id == pid).then_some(*logical))
+        else {
+            return Ok(None);
+        };
+        let scope = [label.to_string()];
+        if !self.dictionary_answers(view, pid, &scope)? {
+            return Ok(None);
+        }
+        let mut first: Option<Vec<u8>> = None;
+        let mut last: Option<Vec<u8>> = None;
+        rushdb_lmpg::derived::for_each_dictionary_entry(
+            view,
+            self.tenant(),
+            OwnerKind::Record,
+            pid,
+            &scope,
+            &mut |entry, count| {
+                if count > 0 {
+                    if first.is_none() {
+                        first = Some(entry.to_vec());
+                    }
+                    last = Some(entry.to_vec());
+                }
+                true
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let decode = |entry: Option<Vec<u8>>| -> Result<Option<serde_json::Value>, String> {
+            let Some(entry) = entry else {
+                return Ok(None);
+            };
+            let payload = entry
+                .get(1..)
+                .ok_or_else(|| "corrupt value dictionary entry".to_string())?;
+            let scalar = rushdb_types::encoding::decode_order_preserving(ty, payload)
+                .map_err(|e| e.to_string())?;
+            Ok(Some(match scalar {
+                rushdb_types::value::Scalar::DateTime(ms) if ty == LogicalType::DateTime => {
+                    serde_json::Value::String(rushdb_types::datetime::ms_to_datetime_string(ms))
+                }
+                other => rushdb_types::value::scalar_to_json(&other),
+            }))
+        };
+        Ok(decode(first)?.zip(decode(last)?))
+    }
+
+    /// Resolve either a stable property identifier or a raw property name.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn resolve_property_name(&self, id: &str) -> Result<String, String> {
+        let view = self.store.read_view().map_err(|e| e.to_string())?;
+        self.resolve_property_name_in_view(&view, id)
+    }
+
+    /// The untyped definition every explicit `null` of a record property
+    /// lands on: `(pid, display name)` per family that has one. Described as
+    /// the property's `null` entry, beside any typed entries.
+    pub(super) fn null_properties_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+    ) -> Result<Vec<(u64, String)>, String> {
+        use rushdb_types::keys::{key, P_FAMILY};
+        let tenant = self.tenant();
+        let mut families = std::collections::BTreeMap::new();
+        for (_, raw) in view
+            .range_prefix(&key(tenant, &[P_FAMILY, b""]))
+            .map_err(|e| e.to_string())?
+        {
+            let fam: rushdb_types::occurrence::PropertyFamily = serde_json::from_slice(&raw)
+                .map_err(|e| format!("corrupt property family: {e}"))?;
+            families.insert(fam.family_id, fam);
+        }
+        let mut untyped = Vec::new();
+        for (_, raw) in view
+            .range_prefix(&key(tenant, &[b"property-row", b""]))
+            .map_err(|e| e.to_string())?
+        {
+            let def: rushdb_types::occurrence::PropertyDefinition = serde_json::from_slice(&raw)
+                .map_err(|e| format!("corrupt property definition: {e}"))?;
+            if def.type_state == rushdb_types::model::TypeState::Unresolved {
+                untyped.push((def.family_id, def.property_id));
+            }
+        }
+        Ok(untyped
+            .into_iter()
+            .filter_map(|(family, pid)| {
+                let fam = families.get(&family)?;
+                (fam.namespace == "default" && fam.owner_scope == OwnerKind::Record)
+                    .then(|| (pid, fam.display_name.clone()))
+            })
+            .collect())
+    }
+
+    /// Resolve a property identifier against a caller-owned pinned view.
+    pub(crate) fn resolve_property_name_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+        id: &str,
+    ) -> Result<String, String> {
+        if id.starts_with('p') {
+            for (norm, defs) in self.property_meta_in_view(view)? {
+                for (pid, _, _, _) in defs {
+                    if Self::public_property_id(pid) == id {
+                        return Ok(norm);
+                    }
+                }
+            }
+        }
+        Ok(rushdb_types::value::normalize_name(id))
+    }
+
+    /// Describe property definitions, types, support counts, and value statistics for matching records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn describe_properties(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<Vec<rushdb_protocol::PropertyDescription>, String> {
+        let view = Arc::new(self.store.read_view().map_err(|e| e.to_string())?);
+        self.describe_properties_in_view(&view, body, None, &|| false)
+    }
+
+    /// Describe properties from a caller-owned pinned snapshot.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        reason = "single linear operation/reader; splitting it would scatter shared borrows and hurt auditability"
+    )]
+    pub(crate) fn describe_properties_in_view(
+        &self,
+        view: &Arc<rushdb_storage::ReadView>,
+        body: &serde_json::Value,
+        matched: Option<&[u64]>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<rushdb_protocol::PropertyDescription>, String> {
+        let meta = self.property_meta_in_view(view)?;
+        let null_only = self.null_properties_in_view(view)?;
+        // E8 type-split siblings: every definition sharing a normalized name
+        // carries the other canonical types present for that name, so a
+        // client cached on a single-type definition can detect partitioned
+        // support mechanically instead of silently under-reading. Siblings
+        // are logical type names (`int64` vs `float64`): the display
+        // `value_type` collapses both to `number`, which is exactly the
+        // false-certainty hazard this flag exists to dispel.
+        let mut sibling_map: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (norm, defs) in &meta {
+            let mut types: Vec<String> = defs
+                .iter()
+                .map(|(_, _, _, logical)| logical_type_name(*logical))
+                .collect();
+            types.sort();
+            types.dedup();
+            if types.len() > 1 {
+                sibling_map.insert(norm.clone(), types);
+            }
+        }
+        let siblings_of = |norm: &str, logical: &rushdb_types::model::LogicalType| -> Vec<String> {
+            let here = logical_type_name(*logical);
+            sibling_map
+                .get(norm)
+                .map(|types| {
+                    types
+                        .iter()
+                        .filter(|t| t.as_str() != here)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // E2 entry pagination: slice of the returned entry list, independent
+        // of the stats scan window below.
+        let entry_skip = body
+            .get("entry_skip")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let entry_limit = body
+            .get("entry_limit")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize);
+        // E2 catalog detail: names, types, exact support counts, array shape
+        // and sibling flags from catalog indexes alone (no record scan).
+        // A filtered (`where`) catalog read is refused — filtering needs the
+        // record scan, which is exactly what `Full` (the default) does.
+        let catalog = body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .is_some_and(|d| d == "catalog");
+        let where_empty = match body.get("where") {
+            None => true,
+            Some(v) => v.is_null() || v.as_object().is_some_and(serde_json::Map::is_empty),
+        };
+        if catalog {
+            if !where_empty {
+                return Err(
+                    "catalog detail does not support `where`; use full detail or a label filter"
+                        .to_string(),
+                );
+            }
+            let mut out = merge_number_definitions(
+                self.describe_properties_catalog(view, &meta, &null_only, &siblings_of, body)?,
+                &meta,
+            );
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok(paginate_entries(out, entry_skip, entry_limit));
+        }
+        // Resolve the match set to ordinals through the shared search path,
+        // then attribute statistics per (label, pid) from occurrence rows, so
+        // one describe.schema call yields per-label properties without
+        // building record JSON. Filtered support counts cover every match
+        // (an oversized match set fails on the query working-set cap rather
+        // than returning a partial count disguised as an exact one); the
+        // unfiltered read samples the first 10k records and takes exact
+        // counts from the catalog below.
+        let document = serde_json::json!({
+            "labels": body.get("labels").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+            "where": body.get("where").cloned().unwrap_or_else(|| serde_json::json!({})),
+        });
+        let parsed =
+            rushdb_query::document::parse_document(&document).map_err(|e| e.to_string())?;
+        let resolved;
+        let ords: &[u64] = match matched {
+            // The caller resolved this filtered query's match set already.
+            Some(ords) if !where_empty => ords,
+            _ => {
+                resolved = self.facet_ordinals(view, &parsed.search, is_cancelled)?;
+                &resolved
+            }
+        };
+        let ords = if where_empty {
+            &ords[..ords.len().min(10_000)]
+        } else {
+            ords
+        };
+        let described: std::collections::HashSet<u64> = meta
+            .values()
+            .flat_map(|defs| defs.iter().map(|(pid, _, _, _)| *pid))
+            .chain(null_only.iter().map(|(pid, _)| *pid))
+            .collect();
+        let stats = self.facet_property_stats(view.as_ref(), ords, &described, is_cancelled)?;
+        let catalog_view = where_empty.then(|| Arc::clone(view));
+        // The types each name holds on each label within the match set.
+        let present: std::collections::BTreeSet<(&str, &str, String)> = stats
+            .keys()
+            .filter_map(|(label, pid)| {
+                meta.iter().find_map(|(norm, defs)| {
+                    defs.iter()
+                        .find(|(id, _, _, _)| id == pid)
+                        .map(|(_, _, _, logical)| {
+                            (label.as_str(), norm.as_str(), logical_type_name(*logical))
+                        })
+                })
+            })
+            .collect();
+        let mut out: Vec<rushdb_protocol::PropertyDescription> = stats
+            .iter()
+            .filter_map(|((label, pid), s)| {
+                let typed = meta
+                    .values()
+                    .flat_map(|defs| defs.iter())
+                    .find(|(definition_pid, _, _, _)| definition_pid == pid);
+                let (name, value_type, sibling_types) = if let Some((_, name, ty, logical)) = typed
+                {
+                    let norm = rushdb_types::value::normalize_name(name);
+                    let siblings = siblings_of(&norm, logical)
+                        .into_iter()
+                        .filter(|sibling| {
+                            present.contains(&(label.as_str(), norm.as_str(), sibling.clone()))
+                        })
+                        .collect();
+                    (name.clone(), ty.clone(), siblings)
+                } else {
+                    let (_, name) = null_only.iter().find(|(null_pid, _)| null_pid == pid)?;
+                    (name.clone(), "null".to_string(), Vec::new())
+                };
+                // Datetimes are stored as epoch milliseconds, which order
+                // by instant; describe them as the records response renders
+                // them.
+                let render = |value: &serde_json::Value| match value.as_i64() {
+                    Some(ms) if value_type == "datetime" => {
+                        serde_json::Value::String(rushdb_types::datetime::ms_to_datetime_string(ms))
+                    }
+                    _ => value.clone(),
+                };
+                Some(rushdb_protocol::PropertyDescription {
+                    id: Self::public_property_id(*pid),
+                    records_count: s.records_count as u64,
+                    label: Some(label.clone()),
+                    is_array: s.is_array,
+                    sibling_types,
+                    sample_values: s.samples.iter().map(render).collect(),
+                    min: s.min.as_ref().map(render),
+                    max: s.max.as_ref().map(render),
+                    name,
+                    value_type,
+                })
+            })
+            .collect();
+        if where_empty {
+            // The bounded scan above supplies samples and ranges. Replace its
+            // support facts with the exact maintained `(label, pid)` catalog;
+            // this also removes typed siblings that were not actually present
+            // on a sampled label.
+            let Some(catalog_view) = catalog_view.as_ref() else {
+                unreachable!("unfiltered scan retains its catalog view")
+            };
+            let mut exact: std::collections::BTreeMap<
+                (String, String),
+                rushdb_protocol::PropertyDescription,
+            > = self
+                .describe_properties_catalog(catalog_view, &meta, &null_only, &siblings_of, body)?
+                .into_iter()
+                .filter_map(|entry| Some(((entry.label.clone()?, entry.id.clone()), entry)))
+                .collect();
+            out.retain_mut(|entry| {
+                let Some(label) = entry.label.as_ref() else {
+                    return false;
+                };
+                let Some(catalog_entry) = exact.remove(&(label.clone(), entry.id.clone())) else {
+                    return false;
+                };
+                entry.records_count = catalog_entry.records_count;
+                entry.is_array = catalog_entry.is_array;
+                // Type splits on this label, not elsewhere in the tenant.
+                entry.sibling_types = catalog_entry.sibling_types;
+                true
+            });
+            // Catalog entries outside the bounded sample remain part of the
+            // schema, with empty sample fields from the catalog row.
+            out.extend(exact.into_values());
+            // The sample's range would describe the first records only:
