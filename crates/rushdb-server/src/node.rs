@@ -316,3 +316,640 @@ pub(crate) struct ValueDomainIndex {
 impl ValueDomainIndex {
     pub(crate) fn distinct_total(&self) -> u64 {
         self.distinct + u64::from(self.null_present)
+    }
+}
+
+/// E2 entry pagination: slice of an already-sorted property-entry list.
+/// `skip` past the end yields an empty list; `limit: None` takes the tail.
+fn paginate_entries(
+    entries: Vec<rushdb_protocol::PropertyDescription>,
+    skip: usize,
+    limit: Option<usize>,
+) -> Vec<rushdb_protocol::PropertyDescription> {
+    if skip >= entries.len() {
+        return Vec::new();
+    }
+    let mut out = entries.into_iter().skip(skip);
+    match limit {
+        Some(n) => out.by_ref().take(n).collect(),
+        None => out.collect(),
+    }
+}
+
+impl PropertyScanStats {
+    fn observe(&mut self, value: &serde_json::Value) {
+        if !value.is_number() && !value.is_string() && !value.is_boolean() {
+            return;
+        }
+        if self.samples.len() < SCHEMA_SAMPLE_CAP && !self.samples.contains(value) {
+            self.samples.push(value.clone());
+        }
+        if !(value.is_number() || value.is_string()) {
+            return;
+        }
+        let cmp = |current: &serde_json::Value| -> std::cmp::Ordering {
+            match (value, current) {
+                (serde_json::Value::Number(_), serde_json::Value::Number(_)) => {
+                    rushdb_types::value::json_scalar_cmp(value, current)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+                (serde_json::Value::String(a), serde_json::Value::String(b)) => a.cmp(b),
+                _ => std::cmp::Ordering::Equal,
+            }
+        };
+        if self
+            .min
+            .as_ref()
+            .is_none_or(|current| cmp(current) == std::cmp::Ordering::Less)
+        {
+            self.min = Some(value.clone());
+        }
+        if self
+            .max
+            .as_ref()
+            .is_none_or(|current| cmp(current) == std::cmp::Ordering::Greater)
+        {
+            self.max = Some(value.clone());
+        }
+    }
+}
+
+/// Lower bound of [`Node::read_lease_ms`].
+const READ_LEASE_FLOOR_MS: u64 = 60_000;
+/// Slack past the longest legitimate reader before its lease expires.
+const READ_LEASE_GRACE_MS: u64 = 5_000;
+
+impl Node {
+    /// The node's text indexes, the one searcher every query surface uses.
+    pub(crate) fn text_indexes(&self) -> &std::sync::Arc<rushdb_textsearch::TextIndexes> {
+        &self.text
+    }
+
+    /// The shared storage engine. Used by background maintenance (GC worker).
+    pub(crate) fn store(&self) -> Arc<rushdb_storage::Store> {
+        self.store.clone()
+    }
+
+    /// Current committed commit index. Public for offline backup tooling.
+    #[must_use]
+    pub fn committed_version(&self) -> u64 {
+        self.store.committed_version()
+    }
+
+    /// `true` while `--replica-of` is polling/applying;
+    /// writes are rejected until [`Self::request_promotion`] stops it.
+    #[must_use]
+    pub fn is_following(&self) -> bool {
+        self.following.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tracker every background maintenance closure is spawned through.
+    pub(crate) fn maintenance_work(&self) -> &crate::lifecycle::MaintenanceWork {
+        &self.maintenance_work
+    }
+
+    /// The index builder's wake-up signal (see `http::spawn_index_builder`).
+    pub(crate) fn index_build_wake(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.index_build_wake)
+    }
+
+    /// Request this follower stop replicating and accept local writes.
+    /// Asynchronous — only the task clears [`Self::is_following`] once it
+    /// actually stops, so poll it until `false` before treating promotion
+    /// as complete; this rules out a write racing a still-mid-apply batch.
+    pub fn request_promotion(&self) {
+        self.follower_stop_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Polled by the replication task itself; see [`Self::request_promotion`].
+    pub(crate) fn follower_stop_requested(&self) -> bool {
+        self.follower_stop_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Called right before the task exits on a stop request; this allows writes, not `request_promotion`.
+    pub(crate) fn finish_following(&self) {
+        self.following
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Boot a node from `cfg`: validate/apply the stored config, open or create
+    /// the store, optionally start raft replication, and build the runtime
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the stored config is missing or invalid, resource
+    /// or transaction limits are rejected, the raft cluster cannot start, or
+    /// the store cannot be opened or created.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed nonzero transport scheduler configuration is
+    /// rejected, which indicates a programming error.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single linear bootstrap: store, optional raft, engine caches, metrics, and transports"
+    )]
+    pub fn bootstrap(cfg: &mut crate::ServerConfig) -> Result<Self, String> {
+        cfg.validate_boot_security()?;
+        let boot_started = std::time::Instant::now();
+        let mut boot_phases = Vec::with_capacity(4);
+        let phase_started = std::time::Instant::now();
+        // Resource limits must take effect before opening redb or allocating
+        // caches. Read once so a concurrent file edit cannot change the config
+        // between preflight and the opened Store.
+        let stored_config = cfg
+            .data_dir
+            .as_deref()
+            .map(crate::config::ConfigFile::load)
+            .transpose()?
+            .flatten();
+        if let Some(file) = &stored_config {
+            crate::config::validate_config(file, cfg)?;
+        }
+        let resources = cfg.resources.storage()?;
+        cfg.transactions.validate(&cfg.resources)?;
+        if cfg.raft.as_ref().is_some_and(|raft| raft.size == 0) {
+            return Err("raft replication requires at least one node".into());
+        }
+        boot_phases.push(("config", phase_started.elapsed()));
+        let multitenant = cfg.multitenant;
+        let tenant = TenantId::single();
+        let mut raft_runtime = None;
+        let phase_started = std::time::Instant::now();
+        crate::boot::set_phase("opening-storage");
+        let store = Arc::new(match &cfg.data_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                rushdb_lmpg::open_store_with_resources(&dir.join("rushdb.redb"), resources)
+                    .map_err(|e| format!("open redb store: {e}"))?
+            }
+            None => rushdb_storage::Store::new_with_resources(resources)
+                .map_err(|e| format!("create memory store: {e}"))?,
+        });
+        boot_phases.push(("storage", phase_started.elapsed()));
+        match store.copy_on_write() {
+            Some(rushdb_storage::CopyOnWrite::On { paths, reason }) => tracing::warn!(
+                ?paths,
+                %reason,
+                "data files still copy on write: checkpoint fsyncs can stall every tenant for seconds"
+            ),
+            Some(rushdb_storage::CopyOnWrite::Off) => {
+                tracing::info!("data directory has copy-on-write off");
+            }
+            Some(rushdb_storage::CopyOnWrite::NotApplicable) | None => {}
+        }
+
+        if let Some(dir) = &cfg.data_dir {
+            if stored_config.is_none() {
+                if store.committed_version() > 0 {
+                    return Err("existing data directory has no config.yml; migrate it explicitly before reuse".into());
+                }
+                crate::config::write_config(dir, cfg)?;
+            }
+        }
+
+        // Register deterministic command expansion for forward commits and
+        // OpenRaft state-machine application.
+        {
+            let _wire = rushdb_lmpg::Lmpg::new(Arc::clone(&store), tenant);
+        }
+        crate::boot::set_phase("starting-engines");
+
+        // Optional raft replication: boot an in-process OpenRaft cluster and
+        // route local commits through the elected leader. This node's store is
+        // registered as node 0's state machine, so every replicated batch is
+        // applied here before the commit returns; the cluster runtime is kept
+        // alive for the node's lifetime.
+        if let Some(raft_cfg) = &cfg.raft {
+            let phase_started = std::time::Instant::now();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let cluster = runtime
+                .block_on(rushdb_raft::OpenRaftCluster::new_with_local_store(
+                    raft_cfg.size,
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(200),
+                    Some(Arc::clone(&store)),
+                ))
+                .map_err(|e| format!("raft bootstrap: {e}"))?;
+            let cluster = std::sync::Arc::new(cluster);
+            store.set_replicator(Some(std::sync::Arc::new(
+                rushdb_raft::ClusterReplicator::new(cluster.clone(), runtime.handle().clone()),
+            )));
+            runtime
+                .block_on(cluster.leader(std::time::Duration::from_secs(5)))
+                .map_err(|e| format!("raft leader election: {e}"))?;
+            // Keep the runtime owned by the node; dropping the node now also
+            // shuts down the replication workers and releases their handles.
+            raft_runtime = Some(runtime);
+            boot_phases.push(("raft", phase_started.elapsed()));
+        }
+
+        let metadata_cache = store
+            .cache_budget()
+            .map(rushdb_storage::cache::LogicalCache::new)
+            .transpose()
+            .map_err(|error| format!("create metadata cache: {error}"))?;
+        let property_cache = store
+            .cache_budget()
+            .map(rushdb_storage::cache::LogicalCache::new)
+            .transpose()
+            .map_err(|error| format!("create property cache: {error}"))?;
+
+        let node = Node {
+            store: Arc::clone(&store),
+            base_tenant: tenant,
+            multitenant,
+            maintenance: cfg.maintenance,
+            transactions: cfg.transactions,
+            languages: cfg.languages,
+            residency: residency::TenantResidency::new(
+                std::time::Duration::from_secs(cfg.resources.tenant_idle_seconds),
+                cfg.resources.tenant_resident_bytes.0,
+                Arc::new(Instant::now),
+            ),
+            wal_archive_dir: cfg.resources.wal_archive_dir.clone(),
+            metrics_per_tenant: (cfg.resources.metrics_tenant_limit > 0)
+                .then_some(cfg.resources.metrics_tenant_limit),
+            text: std::sync::Arc::new(rushdb_textsearch::TextIndexes::new(Arc::clone(&store))),
+            metrics: Metrics::new(),
+            bindings: vec![
+                ("http".to_string(), cfg.port, cfg.tls_cert.is_some()),
+                ("pgwire".to_string(), cfg.pgwire_port, false),
+                ("grpc".to_string(), cfg.grpc_port, false),
+                ("bolt".to_string(), cfg.bolt_port, false),
+            ],
+            max_request_bytes: cfg.max_request_bytes,
+            cursors: std::sync::Mutex::new(HashMap::new()),
+            cursor_bytes: std::sync::Mutex::new(0),
+            metadata_cache: std::sync::Mutex::new(metadata_cache),
+            property_cache: std::sync::Mutex::new(property_cache),
+            storage_stats: std::sync::Mutex::new(None),
+            records_by_tenant_cache: std::sync::Mutex::new(None),
+            slow_call_threshold_ms: cfg.resources.logs_query_threshold_ms,
+            bulk_share: crate::bulk_share::BulkShare::new(cfg.resources.tenant_bulk_concurrency),
+            metrics_prefix: cfg.resources.metrics_prefix.clone(),
+            metrics_filter: cfg.resources.metrics_filter.clone(),
+            disk_space_threshold_percent: cfg.resources.disk_space_threshold_percent,
+            request_timeout_ms: cfg.request_timeout_ms,
+            data_dir: cfg.data_dir.clone(),
+            advertised_address: cfg.resources.advertised_address.clone(),
+            require_vector_index_name: cfg.resources.require_vector_index_name,
+            vector_exact_max_pool: cfg.resources.vector_exact_max_pool,
+            vector_default_ef: cfg.resources.vector_default_ef,
+            introspection_value_max_chars: cfg.resources.introspection_value_max_chars,
+            retention_consumers: std::sync::Mutex::new(
+                crate::retention::RetentionConsumers::with_lease(std::time::Duration::from_secs(
+                    cfg.resources.retention_consumer_lease_seconds,
+                )),
+            ),
+            raft_runtime,
+            scheduler: {
+                let (workers, queue_capacity) = cfg.resources.scheduler_shape();
+                // RM-3: the scheduler is the single admission owner (no
+                // separate Node-level tenant-slot gate). `0` means "no
+                // configured per-tenant cap", which must mean "as unlimited
+                // as the system allows" (the full queue), not a silently
+                // different hardcoded default — a prior version of this
+                // code capped at 64 here even when the operator asked for 0
+                // (unlimited) at `Node::try_acquire_tenant_slot`, which this
+                // consolidation also removes.
+                let max_per_tenant = if cfg.max_concurrent_requests_per_tenant == 0 {
+                    queue_capacity
+                } else {
+                    cfg.max_concurrent_requests_per_tenant
+                };
+                std::sync::Arc::new(
+                    rushdb_engine::BoundedScheduler::new_with_tenant_limit(
+                        workers,
+                        queue_capacity,
+                        max_per_tenant,
+                    )
+                    .expect("node scheduler configuration is valid"),
+                )
+            },
+            following: std::sync::atomic::AtomicBool::new(cfg.resources.replica_of.is_some()),
+            follower_stop_requested: std::sync::atomic::AtomicBool::new(false),
+            maintenance_work: crate::lifecycle::MaintenanceWork::default(),
+            index_build_wake: std::sync::Arc::default(),
+        };
+        node.restore_retention_consumers()?;
+        // Every durable commit feeds the latency histogram (C0: it was never
+        // observed, so `rushdb_commit_latency_seconds` stayed empty).
+        node.store
+            .set_commit_observer(node.metrics.commit_observer());
+        for (phase, elapsed) in boot_phases {
+            node.metrics
+                .observe_boot_phase(phase, elapsed.as_secs_f64());
+        }
+        node.metrics
+            .observe_boot_phase("total", boot_started.elapsed().as_secs_f64());
+        crate::boot::set_phase("ready");
+        Ok(node)
+    }
+    /// Version/build identity, transport bindings, and configured limits for
+    /// `Describe::BuildInfo`. Budgets are read live from the store so the
+    /// reported limits match the running node.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "these casts narrow engine counters and sizes that are bounded by the process address space or clamped before conversion, so truncation cannot occur on supported 64-bit targets"
+    )]
+    pub fn build_info(&self) -> rushdb_protocol::BuildInfo {
+        let mut limits = std::collections::BTreeMap::new();
+        limits.insert(
+            "maxRequestBytes".to_string(),
+            self.max_request_bytes.min(u64::MAX as usize) as u64,
+        );
+        limits.insert(
+            "txMaxStagedBytes".to_string(),
+            self.transactions.max_staged_bytes.0.min(u64::MAX as usize) as u64,
+        );
+        limits.insert(
+            "storageBudgetBytes".to_string(),
+            self.store
+                .resource_budget()
+                .snapshot()
+                .limit
+                .min(u64::MAX as usize) as u64,
+        );
+        limits.insert(
+            "transactionBudgetBytes".to_string(),
+            self.store
+                .transaction_budget()
+                .snapshot()
+                .limit
+                .min(u64::MAX as usize) as u64,
+        );
+        rushdb_protocol::BuildInfo {
+            engine: "rushdb-lmpg".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build_revision: option_env!("RUSHDB_BUILD_REVISION").map(str::to_string),
+            protocol_version: rushdb_protocol::PROTOCOL_VERSION,
+            transports: self
+                .bindings
+                .iter()
+                .map(|(transport, port, tls)| rushdb_protocol::TransportBinding {
+                    transport: transport.clone(),
+                    port: *port,
+                    tls: *tls,
+                })
+                .collect(),
+            limits,
+            advertised_address: self.advertised_address.clone(),
+        }
+    }
+
+    /// Slow-call log threshold in milliseconds (0 = disabled).
+    pub fn slow_call_threshold_ms(&self) -> u64 {
+        self.slow_call_threshold_ms
+    }
+
+    /// The per-tenant bulk share.
+    pub(crate) fn bulk_share(&self) -> &crate::bulk_share::BulkShare {
+        &self.bulk_share
+    }
+
+    /// Server-side request deadline in milliseconds (0 = none).
+    pub fn request_timeout_ms(&self) -> u64 {
+        self.request_timeout_ms
+    }
+
+    /// How long a read view may live before GC treats it as abandoned and
+    /// cancels it. It must outlast every legitimate reader: a transaction or
+    /// cursor snapshot (both capped by `tx-max-age-seconds`) and a request
+    /// running up to `request-timeout-ms`; never below one minute.
+    pub fn read_lease_ms(&self) -> u64 {
+        let transaction_ms =
+            u64::try_from(self.transactions.max_ttl().as_millis()).unwrap_or(u64::MAX);
+        READ_LEASE_FLOOR_MS
+            .max(transaction_ms)
+            .max(self.request_timeout_ms)
+            .saturating_add(READ_LEASE_GRACE_MS)
+    }
+
+    /// Configured free-disk readiness threshold percentage (0 = disabled).
+    pub fn disk_space_threshold_percent(&self) -> u8 {
+        self.disk_space_threshold_percent
+    }
+
+    /// Configured prefix applied to exported Prometheus metric names.
+    pub fn metrics_prefix(&self) -> Option<&str> {
+        self.metrics_prefix.as_deref()
+    }
+
+    /// Configured substring filter selecting which metric families are exported.
+    pub fn metrics_filter(&self) -> Option<&str> {
+        self.metrics_filter.as_deref()
+    }
+
+    /// Readiness disk guard: true when the data filesystem has at least the
+    /// configured free percentage (or the guard is disabled / unsupported).
+    pub fn disk_space_ok(&self) -> bool {
+        if self.disk_space_threshold_percent == 0 {
+            return true;
+        }
+        let path = self
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        disk_free_ok(&path, self.disk_space_threshold_percent).unwrap_or(true)
+    }
+
+    /// Reclaim old MVCC versions and compact the redb backing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the store cannot complete compaction.
+    pub fn compact_now(&self) -> Result<u64, String> {
+        self.store.compact().map_err(|e| e.to_string())
+    }
+
+    /// The startup language-enablement set (`searchquery` is always on).
+    pub fn languages(&self) -> rushdb_protocol::LanguageSet {
+        self.languages
+    }
+
+    fn reap_idle_engines(&self) -> usize {
+        self.residency.evict_idle().len()
+    }
+
+    /// Apply pending changes of every tenant's text indexes, within
+    /// `budget`. Tenants without text indexes cost one catalog read. Returns
+    /// the owners applied.
+    pub(crate) fn apply_text_indexes(&self, budget: std::time::Duration) -> usize {
+        let started = std::time::Instant::now();
+        let tenants = match self.durable_tenants() {
+            Ok(tenants) => tenants,
+            Err(error) => {
+                tracing::warn!(%error, "text applier cannot enumerate tenants");
+                return 0;
+            }
+        };
+        let mut applied = 0usize;
+        for tenant in tenants {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let has_text = self
+                .store
+                .read_view()
+                .map_err(|e| e.to_string())
+                .and_then(|view| {
+                    rushdb_lmpg::index::definitions(&view, tenant).map_err(|e| e.to_string())
+                })
+                .map(|defs| {
+                    defs.iter()
+                        .any(|def| matches!(def.kind, rushdb_types::index::IndexKind::Text { .. }))
+                });
+            match has_text {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(error) => {
+                    tracing::warn!(%error, %tenant, "text applier cannot read the catalog");
+                    continue;
+                }
+            }
+            let lmpg = rushdb_lmpg::Lmpg::new(Arc::clone(&self.store), tenant);
+            match self.text.apply_tenant(&lmpg, remaining) {
+                Ok(count) => applied = applied.saturating_add(count),
+                Err(error) => tracing::warn!(%error, %tenant, "text apply failed"),
+            }
+        }
+        applied
+    }
+    /// Node-wide sweep; does not require or inspect request tenant scope.
+    pub(crate) fn reap_expired_transactions(&self) -> usize {
+        self.reap_expired_transactions_as(rushdb_engine::OperationClass::Maintenance)
+    }
+
+    /// Execute expiry as an explicitly classified maintenance operation. This
+    /// keeps background expiry publication separate from transport writes when
+    /// the reaper is called from shutdown or maintenance scheduling.
+    fn reap_expired_transactions_as(&self, operation: rushdb_engine::OperationClass) -> usize {
+        debug_assert_eq!(operation, rushdb_engine::OperationClass::Maintenance);
+        let coordinators = self.residency.coordinators();
+        let expired: usize = coordinators
+            .iter()
+            .map(|coordinator| {
+                if self.maintenance() {
+                    coordinator.reap_expired_without_autocommit()
+                } else {
+                    coordinator.reap_expired()
+                }
+            })
+            .sum();
+        drop(coordinators);
+        expired + self.reap_expired_cursors() + self.reap_idle_engines()
+    }
+
+    pub(crate) fn reap_expired_cursors(&self) -> usize {
+        let now = Instant::now();
+        let mut cursors = self
+            .cursors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut expired = 0usize;
+        let mut reclaimed = 0usize;
+        let mut released = Vec::new();
+        cursors.retain(|_, cursor| {
+            if cursor.expires_at > now {
+                true
+            } else {
+                expired = expired.saturating_add(1);
+                reclaimed = reclaimed.saturating_add(cursor_resident_bytes(cursor));
+                released.push(cursor.retention_consumer.clone());
+                false
+            }
+        });
+        drop(cursors);
+        for consumer in released {
+            self.release_ephemeral_retention_consumer(&consumer);
+        }
+        if reclaimed > 0 {
+            let mut cursor_bytes = self
+                .cursor_bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *cursor_bytes = cursor_bytes.saturating_sub(reclaimed);
+        }
+        expired
+    }
+    /// True when the node requires a request scope selecting the tenant keyspace.
+    pub fn multitenant(&self) -> bool {
+        self.multitenant
+    }
+
+    pub(crate) fn max_response_bytes(&self) -> usize {
+        self.max_request_bytes
+    }
+
+    pub(crate) fn base_tenant_id(&self) -> TenantId {
+        self.base_tenant
+    }
+
+    /// Resolve a transport scope to its tenant ordinal. No scope is the
+    /// node's base tenant. A scope the directory has never seen is registered
+    /// on first use, except on a follower, which cannot commit and resolves it
+    /// to [`TenantId::UNREGISTERED`] (owns no keys, so reads are empty).
+    ///
+    /// # Errors
+    /// Returns the storage error when the directory cannot be read or the
+    /// registration commit fails.
+    pub(crate) fn resolve_scope(&self, scope: Option<&str>) -> Result<TenantId, String> {
+        let Some(scope) = scope else {
+            return Ok(self.base_tenant);
+        };
+        let digest = rushdb_types::ids::TenantScope::of(scope);
+        if self.following.load(std::sync::atomic::Ordering::Acquire) {
+            return self
+                .store
+                .resolve_tenant(&digest)
+                .map(|tenant| tenant.unwrap_or(TenantId::UNREGISTERED))
+                .map_err(|error| error.to_string());
+        }
+        rushdb_lmpg::tenancy::resolve_or_register(&self.store, &digest)
+            .map_err(|error| format!("tenant directory: {error}"))
+    }
+
+    /// Scheduler fairness key for a transport scope: its resolved tenant, or
+    /// the unregistered sentinel when resolution fails (the executor then
+    /// reports the failure).
+    pub(crate) fn schedule_key(&self, scope: Option<&str>) -> TenantId {
+        self.resolve_scope(scope).unwrap_or(TenantId::UNREGISTERED)
+    }
+
+    /// True while maintenance mode is active (writes rejected, `/ready` 503).
+    pub fn maintenance(&self) -> bool {
+        self.maintenance
+    }
+
+    /// Convenience [`RequestScope`] resolving to the fixed base tenant.
+    ///
+    /// For single-tenant/embedded callers only — the production request path
+    /// (transports → `ProtocolExecutor`) always constructs an explicit
+    /// `RequestScope` from the transport-authenticated scope instead of this.
+    /// Safe by construction, not by convention: in single-tenant mode a
+    /// `RequestScope` always resolves to the same base tenant regardless of
+    /// scope input, so there is no ambient/ordering hazard here — this is a
+    /// pure, repeatable function of `self`, not state any earlier call could
+    /// have left behind. In multitenant mode, callers that need a specific
+    /// tenant must build their own `RequestScope::new(node, Some(scope))`.
+    #[must_use]
+    pub fn scope(&self) -> RequestScope<'_> {
+        RequestScope::new(self, None)
+    }
+
+    /// Run a transport operation through the node-wide bounded scheduler.
+    ///
+    /// RM-3: this is the **single** admission owner for tenant concurrency.
+    /// A prior version additionally gated on a separate Node-level
+    /// `tenant_inflight` counter here, duplicating the scheduler's own
+    /// per-tenant cap at every transport call site; the two were always
+    /// configured from the same value and always checked together, so the
+    /// duplicate added drift risk (see the scheduler-construction comment)
