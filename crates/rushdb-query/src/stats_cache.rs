@@ -13,19 +13,3 @@ use rushdb_types::stats::Histogram;
 
 use crate::QueryError;
 
-/// The value distribution of `(kind, label, pid)` (`label` `None` = every
-/// label), cached per store when `snap` is a committed snapshot.
-pub(crate) fn distribution<R: TryRead>(
-    snap: &R,
-    tenant: TenantId,
-    kind: OwnerKind,
-    label: Option<&str>,
-    pid: u64,
-) -> Result<Option<Arc<Histogram>>, QueryError> {
-    let load = || -> Result<Option<Arc<Histogram>>, QueryError> {
-        Ok(
-            value_distribution(snap, tenant, kind, label, pid, WalkBudget::default())?
-                .map(Arc::new),
-        )
-    };
-    let Some((cache, ci)) = snap.planner_stats() else {
