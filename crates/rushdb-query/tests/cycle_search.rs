@@ -83,3 +83,46 @@ fn a_long_ring_inside_branching_traffic_is_found_promptly() {
     );
     for i in 0..20 {
         assert!(
+            found.contains(&format!("ring-{i:02}")),
+            "ring-{i:02} missing"
+        );
+    }
+    // The 20-hop ring is invisible below 20 hops.
+    let short = matches(&lmpg, &cycle_query("TX", "out", 2, 19)).unwrap();
+    assert!(short.iter().all(|name| !name.starts_with("ring-")));
+}
+
+#[test]
+fn a_trail_longer_than_the_shortest_cycle_still_counts() {
+    let lmpg = setup();
+    // A figure-eight: a→b→a (2 hops) and a→c→d→a (3 hops). The whole figure
+    // is a 5-hop trail through each of its records.
+    let [a, b, c, d] = ["a", "b", "c", "d"].map(|name| record(&lmpg, "N", name));
+    link(&lmpg, a, b);
+    link(&lmpg, b, a);
+    link(&lmpg, a, c);
+    link(&lmpg, c, d);
+    link(&lmpg, d, a);
+    assert_eq!(
+        matches(&lmpg, &cycle_query("N", "out", 4, 5)).unwrap(),
+        vec!["a", "b", "c", "d"]
+    );
+    assert!(matches(&lmpg, &cycle_query("N", "out", 6, 9))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn a_single_relationship_is_not_an_undirected_cycle() {
+    let lmpg = setup();
+    let [left, right] = ["x", "y"].map(|name| record(&lmpg, "U", name));
+    link(&lmpg, left, right);
+    assert!(matches(&lmpg, &cycle_query("U", "both", 2, 3))
+        .unwrap()
+        .is_empty());
+
+    // A triangle is, whichever way its relationships point.
+    let [first, second, third] = ["p", "q", "r"].map(|name| record(&lmpg, "T", name));
+    link(&lmpg, first, second);
+    link(&lmpg, third, second);
+    link(&lmpg, first, third);
