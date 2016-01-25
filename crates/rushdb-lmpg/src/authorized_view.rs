@@ -44,3 +44,49 @@ impl<'a, R: TryRead> AuthorizedView<'a, R> {
 
     /// The tenant this view's policy was resolved for.
     #[must_use]
+    pub fn tenant(&self) -> TenantId {
+        self.tenant
+    }
+
+    /// The smallest group a catalog read may report (POL-2 small-count
+    /// suppression); 0 when there is no enforced policy or no threshold.
+    #[must_use]
+    pub fn min_count(&self) -> u64 {
+        min_count(self.policy)
+    }
+
+    /// Whether `label` is in the authorized domain. Always `true` when the
+    /// tenant has no policy, or its policy is `BoundaryOnly`.
+    #[must_use]
+    pub fn label_allowed(&self, label: &str) -> bool {
+        label_allowed(self.policy, label)
+    }
+
+    /// Whether traversal through `rel_type` is authorized. Always `true`
+    /// when the tenant has no policy, or its policy is `BoundaryOnly`.
+    #[must_use]
+    pub fn rel_type_allowed(&self, rel_type: &str) -> bool {
+        rel_type_allowed(self.policy, rel_type)
+    }
+
+    /// Whether `property` is exposed for `label` — `label` itself must be
+    /// allowed, and, when the label has a configured property mask, `name`
+    /// must be one of its fields. Always `true` when the tenant has no
+    /// policy, or its policy is `BoundaryOnly`.
+    #[must_use]
+    pub fn property_allowed(&self, label: &str, property: &str) -> bool {
+        property_allowed(self.policy, label, property)
+    }
+
+    /// Gates `label` and, when allowed, retains only its authorized
+    /// properties in `properties`. Returns `false` when `label` itself is
+    /// denied, in which case the caller must drop the record rather than
+    /// trust `properties`' contents.
+    #[must_use]
+    pub fn authorize_properties(&self, label: &str, properties: &mut Map<String, Json>) -> bool {
+        if !self.label_allowed(label) {
+            return false;
+        }
+        let Some(active) = self.policy else {
+            return true;
+        };
