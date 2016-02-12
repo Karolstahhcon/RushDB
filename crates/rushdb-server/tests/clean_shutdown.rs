@@ -35,22 +35,3 @@ fn signalled_shutdown_leaves_redb_without_repair() {
     cfg.resources.checkpoint_interval_seconds = 1;
     let (mut router, port) = new_router(cfg).unwrap();
     let stop = router.shutdown_handle();
-    let server = std::thread::spawn(move || router.serve_forever());
-
-    let writing = Arc::new(AtomicBool::new(true));
-    let writer = {
-        let writing = Arc::clone(&writing);
-        std::thread::spawn(move || {
-            let docs: Vec<String> = (0..200).map(|i| format!(r#"{{"n":{i}}}"#)).collect();
-            let body = format!(
-                r#"{{"protocolVersion":1,"context":{{}},"operation":{{"kind":"ingest","ingest":{{"kind":"documents","label":"Doc","documents":[{}],"options":{{}}}}}}}}"#,
-                docs.join(",")
-            );
-            while writing.load(Ordering::Acquire) {
-                post(port, &body);
-            }
-        })
-    };
-    std::thread::sleep(Duration::from_millis(2_500));
-    stop();
-    writing.store(false, Ordering::Release);
