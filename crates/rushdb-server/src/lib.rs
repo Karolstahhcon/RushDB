@@ -73,3 +73,78 @@ pub struct ServerConfig {
     pub capability_secret: Option<Vec<u8>>,
     /// Optional raft replication: when `Some`, the node boots an in-process
     /// `OpenRaft` cluster of `size` nodes and routes every local commit through
+    /// the elected leader. The leader replicates to the quorum and each node's
+    /// store applies the batch deterministically before the commit returns.
+    /// Note: the transport adapter is in-process (engine tests / single-host
+    /// HA preview); external TCP transports can be plugged into
+    /// `RaftNetworkFactory` without changing the store contract.
+    pub raft: Option<RaftConfig>,
+    /// Storage resource budgets and maintenance policy.
+    pub resources: resource_config::ResourceConfig,
+    /// Transaction coordinator limits.
+    pub transactions: resource_config::TransactionConfig,
+    /// Startup query-language enablement. `searchquery` is always on; the
+    /// statement languages (`sql`, `gql`, `cypher`, `gremlin`, `sql-pgq`,
+    /// `mongodb`) are opt-in via `config.yml` / `--languages`.
+    pub languages: rushdb_protocol::LanguageSet,
+    /// Maximum protocol payload in bytes: HTTP request body limit, gRPC
+    /// per-message limit, and the response output budget. Configurable via
+    /// `config.yml` `server.body-limit` (default 16MiB).
+    pub max_request_bytes: usize,
+    /// Maintenance mode: `/health` reports `maintenance`, `/ready` returns 503,
+    /// and write operations are rejected with `Unavailable` until cleared.
+    pub maintenance: bool,
+    /// Explicit acknowledgement that pgwire/gRPC/Bolt (cleartext transports)
+    /// may bind a non-loopback `--listen` address without TLS. Loopback binds
+    /// never require this.
+    pub allow_insecure_listen: bool,
+    /// When true, `/ready` reports 503 until every configured vector index has
+    /// caught up with its source records (no unindexed or stale bindings).
+    /// Default false: readiness reflects store writability only. Enabling it
+    /// lets orchestration avoid routing reads to a node whose ANN indexes are
+    /// still warming. Single-tenant only; multitenant readiness never gates on
+    /// a cross-tenant scan.
+    pub require_index_warmup: bool,
+    /// Request execution deadline (ms). Queries that exceed it are cancelled
+    /// with `Cancelled`. 0 = no deadline.
+    pub request_timeout_ms: u64,
+    /// Per-tenant concurrent request cap in multitenant mode (0 = unlimited).
+    /// A tenant that exceeds the cap is refused with `Unavailable` instead of
+    /// starving its neighbors through the shared pools.
+    pub max_concurrent_requests_per_tenant: usize,
+    /// Long names of the CLI flags (or their environment variables) the
+    /// operator set explicitly for this boot. The data directory's
+    /// `config.yml` is the single source of truth: a stored value that
+    /// disagrees with an explicitly supplied one is a startup error naming
+    /// both, never a silent override.
+    pub explicit_flags: std::collections::BTreeSet<String>,
+}
+
+/// In-process raft replication settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RaftConfig {
+    /// Number of state machines in the cluster (including this node).
+    pub size: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: 3000,
+            listen_addr: "127.0.0.1".into(),
+            tls_cert: None,
+            tls_key: None,
+            pgwire_port: 5432,
+            grpc_port: 0,
+            bolt_port: 0,
+            token: DEFAULT_TOKEN.into(),
+            data_dir: None,
+            multitenant: false,
+            capability_secret: None,
+            raft: None,
+            resources: resource_config::ResourceConfig::default(),
+            transactions: resource_config::TransactionConfig::default(),
+            languages: rushdb_protocol::LanguageSet::default(),
+            max_request_bytes: 16 * 1024 * 1024,
+            maintenance: false,
+            allow_insecure_listen: false,
