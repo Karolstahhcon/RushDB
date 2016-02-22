@@ -1,7 +1,2 @@
 /target/
 /.rushdb/
-/.rushdb-*
-*.redb
-*.redb.compact
-*.layout.json
-.DS_Store

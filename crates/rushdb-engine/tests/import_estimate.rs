@@ -18,3 +18,23 @@ fn nested_import_still_rejects_a_tiny_budget() {
     let document = ten_level_nested_document();
     let mut context = engine
         .context(None, OperationClass::Write, None, Some(1))
+        .unwrap();
+
+    assert!(engine
+        .import_document_with_context(&mut context, "Audit", &document)
+        .is_err());
+}
+
+#[test]
+fn ten_level_nested_import_fits_a_64_mib_budget() {
+    let engine = Engine::new_in_memory();
+    let document = ten_level_nested_document();
+    assert_eq!(serde_json::to_vec(&document).unwrap().len(), 107);
+    let mut context = engine
+        .context(None, OperationClass::Write, None, Some(64 * 1024 * 1024))
+        .unwrap();
+
+    engine
+        .import_document_with_context(&mut context, "Audit", &document)
+        .expect("supported nested document should fit a 64 MiB budget");
+    let page = engine

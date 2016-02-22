@@ -90,3 +90,49 @@ impl<'a, R: TryRead> AuthorizedView<'a, R> {
         let Some(active) = self.policy else {
             return true;
         };
+        if active.mode != AuthorizationMode::PolicyEnforced {
+            return true;
+        }
+        if let Some(masked) = active
+            .policy
+            .visible_properties
+            .iter()
+            .find(|(key, _)| normalize_name(key) == normalize_name(label))
+            .map(|(_, fields)| fields)
+        {
+            properties.retain(|name, _| {
+                masked
+                    .iter()
+                    .any(|field| normalize_name(field) == normalize_name(name))
+            });
+        }
+        true
+    }
+
+    /// Applies this view's policy to an already-reconstructed flat record
+    /// ([`reconstruct::reconstruct_record`]'s `__id`/`__label` + flat-field
+    /// shape). `None` means the record's label lies outside the authorized
+    /// domain.
+    #[must_use]
+    pub fn mask_record(&self, mut record: Json) -> Option<Json> {
+        let obj = record.as_object_mut()?;
+        let label = obj
+            .get(rushdb_types::value::LABEL_FIELD)
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !self.label_allowed(&label) {
+            return None;
+        }
+        let Some(active) = self.policy else {
+            return Some(record);
+        };
+        if active.mode != AuthorizationMode::PolicyEnforced {
+            return Some(record);
+        }
+        if let Some(masked) = active
+            .policy
+            .visible_properties
+            .iter()
+            .find(|(key, _)| normalize_name(key) == normalize_name(&label))
+            .map(|(_, fields)| fields.clone())
