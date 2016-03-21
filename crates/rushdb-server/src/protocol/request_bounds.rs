@@ -20,3 +20,11 @@ pub(super) fn request_limits(
     }
     let deadline = effective_deadline_ms(context.deadline_ms, server_timeout_ms)
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+    Ok(rushdb_lmpg::RequestLimits {
+        unindexed_walk_max_owners: context.unindexed_walk_max_owners,
+        query_memory_max_bytes: context.query_memory_max_bytes,
+        deadline,
+    })
+}
+
+/// The server's request timeout (`0` = none) bounds every transport; a
