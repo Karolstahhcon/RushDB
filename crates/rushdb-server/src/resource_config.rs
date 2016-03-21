@@ -414,3 +414,211 @@ impl Default for ResourceConfig {
             http_inflight_body_bytes: ByteSize(256 * 1024 * 1024),
             advertised_address: None,
             require_vector_index_name: true,
+            vector_exact_max_pool: 5_000,
+            vector_default_ef: 64,
+            introspection_value_max_chars: 64,
+        }
+    }
+}
+impl ResourceConfig {
+    /// Request-scheduler shape `(workers, queue capacity)`. `threads = 0`
+    /// sizes the pool from the host's available parallelism; the queue holds
+    /// 32 requests per worker, clamped to `64..=4096`.
+    #[must_use]
+    pub fn scheduler_shape(&self) -> (usize, usize) {
+        let workers = if self.threads == 0 {
+            std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
+        } else {
+            self.threads
+        }
+        .clamp(2, 256);
+        (workers, workers.saturating_mul(32).clamp(64, 4096))
+    }
+
+    /// Build and validate the storage resource envelope from this config.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the shard/group limits are invalid, the
+    /// memory-headroom is zero, the disk threshold exceeds 100, the managed
+    /// limit plus headroom overflows, or that sum exceeds the declared
+    /// deployment limit.
+    pub fn storage(&self) -> Result<rushdb_storage::resources::StorageResources, String> {
+        let storage = rushdb_storage::resources::StorageResources {
+            managed_limit_bytes: self.managed_limit.0,
+            page_cache_bytes: self.storage_cache.0,
+            transaction_pool_bytes: self.transaction_pool.0,
+            durability: match self.durability {
+                DurabilityArg::Local => rushdb_storage::resources::Durability::Local,
+                DurabilityArg::Async => rushdb_storage::resources::Durability::Async,
+                DurabilityArg::Memory => rushdb_storage::resources::Durability::Memory,
+            },
+            shard_count: self.shards,
+            experimental_multi_shard: self.experimental_sharding,
+            max_group_count: self.max_group_count,
+            max_group_bytes: self.max_group_bytes,
+            max_group_delay_ms: self.max_group_delay_ms,
+            logical_cache_bytes: self.logical_cache_bytes.0,
+            // Phase admission is bounded by the whole managed envelope; the
+            // shared parent budget still caps the sum of all children. This
+            // decouples concurrency from the (smaller) logical-cache budget.
+            phase_budget_bytes: self.managed_limit.0,
+            query_memory_max_bytes: u64::try_from(self.query_memory_max.0).unwrap_or(u64::MAX),
+            unindexed_walk_max_owners: self.unindexed_walk_max_owners,
+            lock_acquisition_timeout_ms: self.lock_timeout_ms,
+            max_expanded_commit_bytes: self.max_expanded_commit_bytes.0,
+            planner_stats_bytes: self.planner_stats_bytes.0,
+            planner_stats_idle_seconds: self.planner_stats_idle_seconds,
+            planner_stats_max_age_commits: self.planner_stats_max_age_commits,
+            // Segmented-WAL rotation target (log-first). Not yet an
+            // operator knob; the default matches the storage default.
+            log_segment_bytes: 64 * 1024 * 1024,
+            idempotency_window_seconds: self.idempotency_window_seconds,
+        };
+        storage.validate().map_err(|e| e.to_string())?;
+        if self.memory_headroom.0 == 0 {
+            return Err("memory-headroom must be positive".into());
+        }
+        if self.disk_space_threshold_percent > 100 {
+            return Err("disk-space-threshold-percent must be between 0 and 100".into());
+        }
+        let total = self
+            .managed_limit
+            .0
+            .checked_add(self.memory_headroom.0)
+            .ok_or("managed-limit plus memory-headroom overflows")?;
+        if self.deployment_limit.is_some_and(|limit| total > limit.0) {
+            return Err("managed-limit plus memory-headroom exceeds deployment-limit".into());
+        }
+        Ok(storage)
+    }
+
+    /// Maintenance policy derived from the config surface (replaces the
+    /// environment-only knobs). Retention is commit-count based; byte/time
+    /// policies are deliberately not exposed because the logical log has no
+    /// per-row size/time index. `boot_token` is the fallback replication
+    /// token when `--replica-token` is unset (the common same-cluster
+    /// shared-secret case).
+    #[must_use]
+    pub fn maintenance(&self, boot_token: &str) -> crate::retention::MaintenanceConfig {
+        use crate::retention::RetentionPolicy;
+        let retention = if self.tx_log_keep_all {
+            RetentionPolicy::KeepAll
+        } else if self.tx_log_retention_commits == 0 {
+            RetentionPolicy::KeepNone
+        } else {
+            RetentionPolicy::Commits(self.tx_log_retention_commits)
+        };
+        crate::retention::MaintenanceConfig {
+            retention,
+            keep_commits: self.tx_log_keep_commits,
+            retention_bytes: (self.tx_log_retention_bytes.0 > 0)
+                .then_some(self.tx_log_retention_bytes.0 as u64),
+            compact_interval: (self.compact_interval_seconds > 0)
+                .then(|| Duration::from_secs(self.compact_interval_seconds)),
+            compact_quiesce: Duration::from_secs(self.compact_quiesce_seconds),
+            compact_growth_percent: self.compact_growth_percent,
+            rss_max_bytes: (self.rss_max.0 > 0).then_some(self.rss_max.0 as u64),
+            wal_archive_dir: self.wal_archive_dir.clone(),
+            wal_archive_retention: std::time::Duration::from_secs(
+                self.wal_archive_retention_seconds,
+            ),
+            wal_archive_retention_bytes: (self.wal_archive_retention_bytes.0 > 0)
+                .then_some(self.wal_archive_retention_bytes.0 as u64),
+            replica: self
+                .replica_of
+                .clone()
+                .map(|leader_url| crate::retention::ReplicaConfig {
+                    leader_url,
+                    follower_id: self.replica_id.clone(),
+                    token: self
+                        .replica_token
+                        .clone()
+                        .unwrap_or_else(|| boot_token.to_string()),
+                }),
+        }
+    }
+
+    /// History/GC sweep period (default 5s when unset).
+    #[must_use]
+    pub fn checkpoint_interval(&self) -> Duration {
+        if self.checkpoint_interval_seconds == 0 {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(self.checkpoint_interval_seconds)
+        }
+    }
+}
+
+/// Limits for the transaction coordinator (CLI `transactions` section and the
+/// `config.yml` `transactions` section).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, clap::Args)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TransactionConfig {
+    /// Maximum concurrently active transactions.
+    #[arg(
+        long = "tx-max-active",
+        env = "RUSHDB_TX_MAX_ACTIVE",
+        default_value_t = 128
+    )]
+    pub max_active: usize,
+    /// Maximum staged operations per transaction.
+    #[arg(
+        long = "tx-max-operations",
+        env = "RUSHDB_TX_MAX_OPERATIONS",
+        default_value_t = 10_000
+    )]
+    pub max_operations: usize,
+    /// Maximum staged payload bytes per transaction.
+    #[arg(
+        long = "tx-max-staged-bytes",
+        env = "RUSHDB_TX_MAX_STAGED_BYTES",
+        default_value = "8MiB"
+    )]
+    pub max_staged_bytes: ByteSize,
+    /// Maximum expired transaction ids tracked per sweep.
+    #[arg(
+        long = "tx-max-expired-ids",
+        env = "RUSHDB_TX_MAX_EXPIRED_IDS",
+        default_value_t = 128
+    )]
+    pub max_expired_ids: usize,
+    /// Default client transaction TTL in seconds.
+    #[arg(
+        long = "tx-default-ttl-seconds",
+        env = "RUSHDB_TX_DEFAULT_TTL_SECONDS",
+        default_value_t = 60
+    )]
+    pub default_ttl_seconds: u64,
+    /// Maximum lifetime accepted for a client-provided transaction TTL.
+    #[arg(
+        long = "tx-max-age-seconds",
+        env = "RUSHDB_TX_MAX_AGE_SECONDS",
+        default_value_t = 60
+    )]
+    pub max_age_seconds: u64,
+    /// Maximum staged transaction bytes any single tenant's coordinator may
+    /// claim from the shared transaction pool in multitenant mode (0 = share
+    /// the pool directly, today's behavior — one tenant's heavy staging can
+    /// claim the whole pool and starve another tenant's admission).
+    #[arg(
+        long = "tx-max-staged-bytes-per-tenant",
+        env = "RUSHDB_TX_MAX_STAGED_BYTES_PER_TENANT",
+        default_value = "0"
+    )]
+    pub max_staged_bytes_per_tenant: ByteSize,
+}
+impl Default for TransactionConfig {
+    fn default() -> Self {
+        let limits = rushdb_tx::TransactionLimits::default();
+        Self {
+            max_active: limits.max_active,
+            max_operations: limits.max_operations,
+            max_staged_bytes: ByteSize(limits.max_staged_bytes),
+            max_expired_ids: limits.max_expired_ids,
+            default_ttl_seconds: 60,
+            max_age_seconds: 60,
+            max_staged_bytes_per_tenant: ByteSize(0),
+        }
+    }
+}
