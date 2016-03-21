@@ -889,3 +889,449 @@ fn search_values_across_properties_and_similar_spellings() {
         panic!("expected value matches")
     };
     assert_eq!(total, 2);
+    // parentId holds f1 twice, id once.
+    assert_eq!(
+        matches
+            .iter()
+            .map(|m| (m.property.as_str(), m.count))
+            .collect::<Vec<_>>(),
+        [("parentId", 2), ("id", 1)]
+    );
+    // "spiderman" is not contained in "Spider-Man", but is spelled like it.
+    let names = |matching| {
+        let Response::PropertyValues { values, .. } = run(
+            &node,
+            Operation::Query {
+                query: Query::PropertyValues {
+                    property: "name".into(),
+                    query: document(&["CHARACTER"], &json!({})),
+                    mode: Some(PropertyValuesMode::TopK),
+                    limit: None,
+                    search: Some(search("spiderman", matching)),
+                },
+            },
+        ) else {
+            panic!("expected property values")
+        };
+        values
+    };
+    assert!(names(ValueMatch::Contains).is_empty());
+    assert_eq!(names(ValueMatch::Similar), vec![json!("Spider-Man")]);
+}
+
+fn try_run(node: &Node, operation: Operation) -> Result<Response, crate::protocol::ProtocolError> {
+    ProtocolExecutor::new(node, None)
+        .execute(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            context: RequestContext::default(),
+            operation,
+        })
+        .map(|outcome| outcome.response)
+}
+
+fn sql(node: &Node, statement: &str) -> Result<serde_json::Value, String> {
+    try_run(
+        node,
+        Operation::Query {
+            query: Query::Statement {
+                language: rushdb_protocol::StatementLanguage::Sql,
+                statement: statement.into(),
+                parameters: None,
+            },
+        },
+    )
+    .map(|response| serde_json::to_value(response).unwrap())
+    .map_err(|error| error.to_string())
+}
+
+/// POL-2: under an enforced policy, the catalog reads and SQL show the
+/// allowed labels, their visible properties and the allowed relationship
+/// types only; hidden ones are never named, counted or suggested.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fixture checked through every catalog read and SQL"
+)]
+fn enforced_policy_scopes_the_catalog_and_sql() {
+    let node = seeded_node();
+    let create = |label: &str, properties: serde_json::Value| {
+        let v = properties["v"].clone();
+        node.scope()
+            .create_record(label, &properties, &[], &json!({}))
+            .unwrap();
+        matched_ids(&node, &document(&[label], &json!({ "v": v })))
+            .into_iter()
+            .next()
+            .unwrap()
+    };
+    let a1 = create("Allowed", json!({"v": 1, "secret": "x"}));
+    let a2 = create("Allowed", json!({"v": 2, "secret": "y"}));
+    let d = create("Denied", json!({"v": 3, "secret": "z"}));
+    for (rel, source, target) in [("OK", &a1, &a2), ("OK", &a1, &d), ("HIDDEN", &a2, &a1)] {
+        node.scope()
+            .link_records_by_id(&rushdb_protocol::RelationshipIdsMutation {
+                relation_type: rel.into(),
+                direction: rushdb_protocol::Direction::default(),
+                source_ids: vec![source.clone()],
+                target_ids: vec![target.clone()],
+                properties: json!({}),
+            })
+            .unwrap();
+    }
+    node.scope()
+        .security_put_policy(
+            &rushdb_authz::DataAccessPolicy {
+                allowed_labels: vec!["Allowed".into()],
+                denied_rel_types: vec!["HIDDEN".into()],
+                visible_properties: BTreeMap::from([("Allowed".into(), vec!["v".into()])]),
+                ..Default::default()
+            },
+            rushdb_authz::AuthorizationMode::PolicyEnforced,
+        )
+        .unwrap();
+
+    let Response::Labels { labels } = describe(
+        &node,
+        Describe::Labels {
+            query: QueryDocument::default(),
+        },
+    ) else {
+        panic!("expected labels")
+    };
+    assert_eq!(labels, vec!["Allowed".to_string()]);
+    let Response::Schema { schema } = describe(
+        &node,
+        Describe::Schema {
+            query: QueryDocument::default(),
+            detail: Some(rushdb_protocol::PropertyDetail::Catalog),
+            skip: None,
+            limit: None,
+        },
+    ) else {
+        panic!("expected a schema")
+    };
+    assert_eq!(
+        schema
+            .labels
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Allowed"]
+    );
+    assert_eq!(
+        schema
+            .properties
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["v"]
+    );
+    assert_eq!(
+        schema
+            .relationships
+            .iter()
+            .map(|r| (
+                r.relationship_type.as_str(),
+                r.target_label.as_str(),
+                r.count
+            ))
+            .collect::<Vec<_>>(),
+        [("OK", "Allowed", 1)]
+    );
+    let Response::SchemaSummary { labels } = describe(
+        &node,
+        Describe::SchemaSummary {
+            labels: Vec::new(),
+            few_values: None,
+        },
+    ) else {
+        panic!("expected a summary")
+    };
+    assert_eq!(labels.len(), 1);
+    assert_eq!(
+        labels[0]
+            .properties
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["v"]
+    );
+    assert_eq!(labels[0].relationships.len(), 1);
+    for text in ["secret", "Denied", "Person"] {
+        let Response::Names { names } = describe(
+            &node,
+            Describe::Names {
+                text: text.into(),
+                limit: None,
+            },
+        ) else {
+            panic!("expected names")
+        };
+        assert!(names.is_empty(), "{text}: {names:?}");
+    }
+    let Response::ValueMatches { matches, .. } = run(
+        &node,
+        Operation::Query {
+            query: Query::SearchValues {
+                search: rushdb_protocol::ValueSearch {
+                    text: "x".into(),
+                    matching: rushdb_protocol::ValueMatch::Exact,
+                    case_sensitive: false,
+                    domain_on_miss: None,
+                    min_similarity: None,
+                },
+                labels: Vec::new(),
+                limit: None,
+            },
+        },
+    ) else {
+        panic!("expected value matches")
+    };
+    assert!(matches.is_empty());
+
+    // SQL sees the allowed table and its visible column only.
+    let rows = sql(&node, "SELECT v FROM allowed ORDER BY v").unwrap();
+    assert_eq!(rows["rows"], json!([{"v": 1}, {"v": 2}]), "{rows}");
+    let all = sql(&node, "SELECT * FROM allowed").unwrap();
+    assert!(!all.to_string().contains("secret"), "{all}");
+    for hidden in [
+        "SELECT secret FROM allowed",
+        "SELECT * FROM denied",
+        "SELECT * FROM person",
+        "SELECT * FROM rushdb_edges.hidden",
+    ] {
+        let error = sql(&node, hidden).unwrap_err();
+        assert!(
+            !error.contains("Denied") && !error.contains("secret "),
+            "{hidden}: {error}"
+        );
+    }
+    // Edges between allowed labels only.
+    let edges = sql(&node, "SELECT COUNT(*) AS c FROM rushdb_edges.ok").unwrap();
+    assert_eq!(edges["rows"], json!([{"c": 1}]), "{edges}");
+    // Still closed: other statement languages and explain.
+    assert!(try_run(
+        &node,
+        Operation::Query {
+            query: Query::Statement {
+                language: rushdb_protocol::StatementLanguage::Cypher,
+                statement: "MATCH (n) RETURN n".into(),
+                parameters: None,
+            },
+        },
+    )
+    .is_err());
+}
+
+/// POL-2 small-count threshold: under an enforced policy with `minCount`,
+/// catalog reads withhold labels, properties, values and relationship shapes
+/// counted over fewer records, and drop samples and extremes.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fixture checked through every catalog read"
+)]
+fn enforced_policy_withholds_small_counts() {
+    let node = seeded_node();
+    for properties in [
+        json!({"v": 1}),
+        json!({"v": 1}),
+        json!({"v": 2, "rare": "x"}),
+    ] {
+        node.scope()
+            .create_record("Allowed", &properties, &[], &json!({}))
+            .unwrap();
+    }
+    node.scope()
+        .create_record("Small", &json!({"v": 1}), &[], &json!({}))
+        .unwrap();
+    let ids: Vec<String> = matched_ids(&node, &document(&["Allowed"], &json!({})))
+        .into_iter()
+        .collect();
+    node.scope()
+        .link_records_by_id(&rushdb_protocol::RelationshipIdsMutation {
+            relation_type: "ONCE".into(),
+            direction: rushdb_protocol::Direction::default(),
+            source_ids: vec![ids[0].clone()],
+            target_ids: vec![ids[1].clone()],
+            properties: json!({}),
+        })
+        .unwrap();
+    let Response::Policy { .. } = run(
+        &node,
+        Operation::Policy {
+            policy: rushdb_protocol::PolicyOperation::Put {
+                policy: json!({"allowedLabels": ["Allowed", "Small"], "minCount": 2}),
+                enforced: true,
+            },
+        },
+    ) else {
+        panic!("policy installed")
+    };
+    let Response::Policy {
+        policy: Some(stored),
+        ..
+    } = run(
+        &node,
+        Operation::Policy {
+            policy: rushdb_protocol::PolicyOperation::Get,
+        },
+    )
+    else {
+        panic!("policy read")
+    };
+    assert_eq!(stored["minCount"], 2);
+
+    // A label with one record is withheld.
+    let Response::Labels { labels } = describe(
+        &node,
+        Describe::Labels {
+            query: QueryDocument::default(),
+        },
+    ) else {
+        panic!("expected labels")
+    };
+    assert_eq!(labels, vec!["Allowed".to_string()]);
+    // A property on one record and a one-edge shape are withheld; samples and
+    // extremes are dropped.
+    let Response::Schema { schema } = describe(
+        &node,
+        Describe::Schema {
+            query: document(&["Allowed"], &json!({})),
+            detail: None,
+            skip: None,
+            limit: None,
+        },
+    ) else {
+        panic!("expected a schema")
+    };
+    assert_eq!(
+        schema
+            .properties
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["v"]
+    );
+    assert!(schema
+        .properties
+        .iter()
+        .all(|p| p.sample_values.is_empty() && p.min.is_none() && p.max.is_none()));
+    assert!(schema.relationships.is_empty());
+    // A value held by one record is withheld, in every mode.
+    let values = |mode| {
+        let Response::PropertyValues {
+            values,
+            distinct_count,
+            min,
+            max,
+            ..
+        } = run(
+            &node,
+            Operation::Query {
+                query: Query::PropertyValues {
+                    property: "v".into(),
+                    query: document(&["Allowed"], &json!({})),
+                    mode,
+                    limit: None,
+                    search: None,
+                },
+            },
+        )
+        else {
+            panic!("expected property values")
+        };
+        (values, distinct_count, min, max)
+    };
+    assert_eq!(values(None).0, vec![json!(1)]);
+    assert_eq!(values(Some(PropertyValuesMode::Count)).1, Some(1));
+    let (_, _, min, max) = values(Some(PropertyValuesMode::Range));
+    assert_eq!((min, max), (Some(json!(1)), Some(json!(1))));
+    // The summary and name suggestions follow.
+    let Response::SchemaSummary { labels } = describe(
+        &node,
+        Describe::SchemaSummary {
+            labels: Vec::new(),
+            few_values: None,
+        },
+    ) else {
+        panic!("expected a summary")
+    };
+    assert_eq!(labels.len(), 1);
+    let v = &labels[0].properties[0];
+    assert_eq!((v.name.as_str(), v.values.clone()), ("v", vec![json!(1)]));
+    assert!(v.min.is_none() && v.max.is_none());
+    assert!(labels[0].relationships.is_empty());
+    for text in ["rare", "Small"] {
+        let Response::Names { names } = describe(
+            &node,
+            Describe::Names {
+                text: text.into(),
+                limit: None,
+            },
+        ) else {
+            panic!("expected names")
+        };
+        assert!(names.is_empty(), "{text}: {names:?}");
+    }
+}
+
+/// `similar` also works on values too long for the dictionary (record scan):
+/// a misspelled phrase finds the long text that contains it.
+#[test]
+fn similar_search_reaches_long_values() {
+    use rushdb_protocol::{ValueMatch, ValueSearch};
+    let node = seeded_node();
+    let long = |text: &str| {
+        format!(
+            "{text} {}",
+            "lorem ".repeat(rushdb_types::keys::DICT_MAX_VALUE_BYTES)
+        )
+    };
+    for body in [long("Orange County, Virginia"), long("Kings County")] {
+        ingest(&node, "Note", json!([{ "body": body }]));
+    }
+    let Response::PropertyValues { values, .. } = run(
+        &node,
+        Operation::Query {
+            query: Query::PropertyValues {
+                property: "body".into(),
+                query: document(&["Note"], &json!({})),
+                mode: Some(PropertyValuesMode::TopK),
+                limit: None,
+                search: Some(ValueSearch {
+                    text: "orange cuonty virginia".into(),
+                    matching: ValueMatch::Similar,
+                    case_sensitive: false,
+                    domain_on_miss: None,
+                    min_similarity: None,
+                }),
+            },
+        },
+    ) else {
+        panic!("expected property values")
+    };
+    assert_eq!(values, vec![json!(long("Orange County, Virginia"))]);
+}
+
+/// Clients discover the catalog reads by capability flag, not by error.
+#[test]
+fn catalog_reads_are_advertised() {
+    let node = seeded_node();
+    let Response::Capabilities { capabilities } = describe(&node, Describe::Capabilities) else {
+        panic!("expected capabilities")
+    };
+    for flag in [
+        "valueSearch",
+        "searchValues",
+        "describeNames",
+        "schemaSummary",
+        "valueOverlap",
+    ] {
+        assert!(capabilities.iter().any(|c| c == flag), "{flag}");
+    }
+}
+
+fn put_policy(node: &Node, policy: serde_json::Value) {
+    let Response::Policy { .. } = run(

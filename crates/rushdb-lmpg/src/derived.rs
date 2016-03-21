@@ -466,3 +466,471 @@ impl Deriver for LmpgDeriver {
                 };
                 derive_shape_support(
                     &mut changes,
+                    tenant,
+                    pid,
+                    shape_before.as_ref().filter(|_| old.presence.is_some()),
+                    shape_after.as_ref().filter(|_| new.presence.is_some()),
+                );
+            }
+        }
+        crate::index::derive(&touched.index, before, &after, &mut changes.rows)?;
+        materialize(changes, before)
+    }
+
+    fn is_derived_key(&self, key: &[u8]) -> bool {
+        k::parse_tenant(key).is_some() && is_derived_family(key.get(TENANT_PREFIX_LEN).copied())
+    }
+
+    fn prefix_reaches_derived(&self, prefix: &[u8]) -> bool {
+        match prefix.first() {
+            None => true,
+            Some(&k::TENANT_NS) => {
+                prefix.len() <= TENANT_PREFIX_LEN
+                    || is_derived_family(prefix.get(TENANT_PREFIX_LEN).copied())
+            }
+            Some(_) => false,
+        }
+    }
+}
+
+fn is_derived_family(family: Option<u8>) -> bool {
+    matches!(
+        family,
+        Some(k::F_COUNTER | k::F_VALUE_DICT | k::F_MARKER | k::F_PRESENCE | k::F_INDEX_ENTRY)
+    )
+}
+
+fn derive_pid(
+    changes: &mut Changes,
+    tenant: TenantId,
+    kind: OwnerKind,
+    owner: u64,
+    pid: u64,
+    (label_before, old): (Option<&str>, &PidState),
+    (label_after, new): (Option<&str>, &PidState),
+) {
+    // Null occurrences are label-independent.
+    changes.bump(k::null_count_key(tenant, kind, pid), new.nulls - old.nulls);
+    // Presence and owner support.
+    let had = label_before.zip(old.presence);
+    let has = label_after.zip(new.presence);
+    if had != has {
+        if let Some((label, presence)) = had {
+            changes.rows.insert(
+                k::presence_key(tenant, kind, label, pid, presence.nullness(), owner),
+                None,
+            );
+            changes.bump(k::support_by_pid_key(tenant, kind, pid, label), -1);
+            changes.bump(k::support_by_label_key(tenant, kind, label, pid), -1);
+        }
+        if let Some((label, presence)) = has {
+            changes.rows.insert(
+                k::presence_key(tenant, kind, label, pid, presence.nullness(), owner),
+                Some(Vec::new()),
+            );
+            changes.bump(k::support_by_pid_key(tenant, kind, pid, label), 1);
+            changes.bump(k::support_by_label_key(tenant, kind, label, pid), 1);
+        }
+        changes.bump(
+            k::support_total_key(tenant, kind, pid),
+            i64::from(has.is_some()) - i64::from(had.is_some()),
+        );
+    }
+    // Value dictionary (short values); long values are refcounted by digest,
+    // so their distinct count is exact without a scan.
+    let mut entry_delta = |label: &str, entry: &[u8], delta: i64| {
+        let (key, distinct) = if entry.len() > k::DICT_MAX_VALUE_BYTES {
+            changes.bump(k::long_values_key(tenant, kind, label, pid), delta);
+            let digest = k::long_value_digest(entry);
+            (
+                k::long_value_key(tenant, kind, label, pid, &digest),
+                k::long_distinct_key(tenant, kind, label, pid),
+            )
+        } else {
+            (
+                k::value_dict_key(tenant, kind, label, pid, entry),
+                k::distinct_key(tenant, kind, label, pid),
+            )
+        };
+        changes.dict.entry(key).or_insert_with(|| (distinct, 0)).1 += delta;
+    };
+    if let Some(label) = label_before {
+        for entry in &old.entries {
+            entry_delta(label, entry, -1);
+        }
+    }
+    if let Some(label) = label_after {
+        for entry in &new.entries {
+            entry_delta(label, entry, 1);
+        }
+    }
+    // Array markers: an exact count of array-holding owners per label, so
+    // the marker is a function of the current base rows.
+    let was = label_before.filter(|_| old.array);
+    let is = label_after.filter(|_| new.array);
+    if was != is {
+        if let Some(label) = was {
+            changes.bump(k::array_label_marker_key(tenant, kind, pid, label), -1);
+        }
+        if let Some(label) = is {
+            changes.bump(k::array_label_marker_key(tenant, kind, pid, label), 1);
+        }
+    }
+}
+
+/// Relationship property support per shape: a relationship counts
+/// under its creation-time `(type, source, target)` for every pid it carries.
+fn derive_shape_support(
+    changes: &mut Changes,
+    tenant: TenantId,
+    pid: u64,
+    had: Option<&RelShape>,
+    has: Option<&RelShape>,
+) {
+    if had == has {
+        return;
+    }
+    let key = |(rel_type, source, target): &RelShape| {
+        k::rel_shape_prop_key(tenant, (rel_type, source, target), pid)
+    };
+    if let Some(shape) = had {
+        changes.bump(key(shape), -1);
+    }
+    if let Some(shape) = has {
+        changes.bump(key(shape), 1);
+    }
+}
+
+fn apply_delta(current: u64, delta: i64) -> Result<u64, StorageError> {
+    current
+        .checked_add_signed(delta)
+        .ok_or(StorageError::CorruptLog)
+}
+
+/// Fold this commit's label, relationship-catalog and record-support counter
+/// changes into the tenant-wide usage totals (`C_USAGE`): records and
+/// relationships are the sums of their catalogs, labels and properties the
+/// number of those counters that are non-zero. A read of the totals is then
+/// one `get` per metric, independent of the tenant's size.
+fn derive_usage(changes: &mut Changes, before: &dyn DeriveRead) -> Result<(), StorageError> {
+    let record_support = [OwnerKind::Record.as_byte()];
+    let mut usage: Vec<(Vec<u8>, i64)> = Vec::new();
+    for (key, &delta) in &changes.counters {
+        if delta == 0 || key.get(TENANT_PREFIX_LEN) != Some(&k::F_COUNTER) {
+            continue;
+        }
+        let Some(tenant) = k::parse_tenant(key) else {
+            continue;
+        };
+        let sub = key.get(TENANT_PREFIX_LEN + 1).copied();
+        let transition = |metric: u8, usage: &mut Vec<(Vec<u8>, i64)>| {
+            let current =
+                k::decode_counter(before.get(key)?.as_deref()).ok_or(StorageError::CorruptLog)?;
+            let next = apply_delta(current, delta)?;
+            let step = i64::from(next > 0) - i64::from(current > 0);
+            if step != 0 {
+                usage.push((k::usage_count_key(tenant, metric), step));
+            }
+            Ok::<_, StorageError>(())
+        };
+        match sub {
+            Some(k::C_LABEL) => {
+                usage.push((k::usage_count_key(tenant, k::U_RECORDS), delta));
+                transition(k::U_LABELS, &mut usage)?;
+            }
+            Some(k::C_REL_CATALOG) => {
+                usage.push((k::usage_count_key(tenant, k::U_RELATIONSHIPS), delta));
+            }
+            Some(k::C_SUPPORT_TOTAL)
+                if key.get(TENANT_PREFIX_LEN + 2..TENANT_PREFIX_LEN + 3)
+                    == Some(&record_support[..]) =>
+            {
+                transition(k::U_PROPERTIES, &mut usage)?;
+            }
+            _ => {}
+        }
+    }
+    for (key, delta) in usage {
+        changes.bump(key, delta);
+    }
+    Ok(())
+}
+
+fn materialize(mut changes: Changes, before: &dyn DeriveRead) -> Result<Vec<Op>, StorageError> {
+    for (key, (distinct, delta)) in std::mem::take(&mut changes.dict) {
+        if delta == 0 {
+            continue;
+        }
+        let current =
+            k::decode_counter(before.get(&key)?.as_deref()).ok_or(StorageError::CorruptLog)?;
+        let next = apply_delta(current, delta)?;
+        if current == 0 && next > 0 {
+            changes.bump(distinct, 1);
+        } else if current > 0 && next == 0 {
+            changes.bump(distinct, -1);
+        }
+        changes
+            .rows
+            .insert(key, (next > 0).then(|| next.to_be_bytes().to_vec()));
+    }
+    derive_usage(&mut changes, before)?;
+    let mut out = Vec::with_capacity(changes.counters.len() + changes.rows.len());
+    for (key, delta) in changes.counters {
+        if delta == 0 {
+            continue;
+        }
+        let current =
+            k::decode_counter(before.get(&key)?.as_deref()).ok_or(StorageError::CorruptLog)?;
+        let next = apply_delta(current, delta)?;
+        out.push(if next == 0 {
+            Op::Del(key)
+        } else {
+            Op::Put(key, next.to_be_bytes().to_vec())
+        });
+    }
+    for (key, value) in changes.rows {
+        out.push(match value {
+            Some(value) => Op::Put(key, value),
+            None => Op::Del(key),
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Read API
+// ---------------------------------------------------------------------------
+
+fn counter<R: TryRead + ?Sized>(r: &R, key: &[u8]) -> Result<u64, StorageError> {
+    k::decode_counter(r.get(key)?.as_deref()).ok_or(StorageError::CorruptLog)
+}
+
+/// Direction of an adjacency degree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AdjDirection {
+    /// Outgoing edges (the node is the source).
+    Out,
+    /// Incoming edges (the node is the target).
+    In,
+}
+
+/// A tenant's usage totals at one snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantUsage {
+    /// Live records.
+    pub records: u64,
+    /// Live relationships.
+    pub relationships: u64,
+    /// Labels with at least one live record.
+    pub labels: u64,
+    /// Property ids carried by at least one live record.
+    pub properties: u64,
+    /// Logical stored bytes: key + value lengths of the tenant's rows. The
+    /// file pages holding them are larger (pages run partly full).
+    pub logical_bytes: u64,
+    /// Ready vectors per embedding space, in space-id order.
+    pub vectors: Vec<SpaceVectors>,
+}
+
+/// Ready vectors of one embedding space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceVectors {
+    /// Dense space id.
+    pub space_id: u64,
+    /// The space's index name.
+    pub name: String,
+    /// Bindings in `Ready` status.
+    pub vectors: u64,
+}
+
+/// A tenant's usage totals: one `get` per metric plus one per embedding
+/// space, never a scan of the tenant's data.
+///
+/// # Errors
+/// Returns [`StorageError`] if a counter or space row cannot be read or is
+/// malformed.
+pub fn tenant_usage<R: TryRead + ?Sized>(r: &R, t: TenantId) -> Result<TenantUsage, StorageError> {
+    let metric = |m: u8| counter(r, &k::usage_count_key(t, m));
+    let mut vectors = Vec::new();
+    for (_, raw) in r.range_prefix(&k::key(t, &[k::P_EMB_SPACE, b""]))? {
+        let space: rushdb_types::occurrence::EmbeddingSpaceInfo =
+            serde_json::from_slice(&raw).map_err(|_| StorageError::CorruptLog)?;
+        vectors.push(SpaceVectors {
+            vectors: counter(r, &k::emb_ready_count_key(t, space.space_id))?,
+            space_id: space.space_id,
+            name: space.name,
+        });
+    }
+    Ok(TenantUsage {
+        records: metric(k::U_RECORDS)?,
+        relationships: metric(k::U_RELATIONSHIPS)?,
+        labels: metric(k::U_LABELS)?,
+        properties: metric(k::U_PROPERTIES)?,
+        logical_bytes: counter(r, &k::usage_bytes_key(t))?,
+        vectors,
+    })
+}
+
+/// Live record count of a label.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counter cannot be read or is malformed.
+pub fn label_count<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    label: &str,
+) -> Result<u64, StorageError> {
+    counter(r, &k::label_count_key(t, label))
+}
+
+/// Every live label with its count, in first-appearance order: by the
+/// ordinal of the label's oldest live record (one bounded seek per label),
+/// then name. The order is read from live rows, not stored, so it stays a
+/// function of the base state.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counters cannot be read or are malformed.
+pub fn label_catalog<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+) -> Result<Vec<(String, u64)>, StorageError> {
+    let prefix = k::counter_prefix(t, k::C_LABEL);
+    let mut rows = Vec::new();
+    for (key, raw) in r.range_prefix(&prefix)? {
+        let (label, _) = k::read_str(&key, prefix.len()).ok_or(StorageError::CorruptLog)?;
+        let count = k::decode_counter(Some(&raw)).ok_or(StorageError::CorruptLog)?;
+        let oldest = match r.first_key(&k::label_member_prefix(t, label))? {
+            Some(member) => {
+                k::parse_label_member_key(&member)
+                    .ok_or(StorageError::CorruptLog)?
+                    .1
+            }
+            None => u64::MAX,
+        };
+        rows.push((oldest, label.to_owned(), count));
+    }
+    rows.sort();
+    Ok(rows
+        .into_iter()
+        .map(|(_, label, count)| (label, count))
+        .collect())
+}
+
+/// Live adjacency degree of a node.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counter cannot be read or is malformed.
+pub fn degree<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    direction: AdjDirection,
+    node: u64,
+) -> Result<u64, StorageError> {
+    counter(r, &k::degree_key(t, node, direction == AdjDirection::Out))
+}
+
+/// Relationships of `(type, source label, target label)`.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counter cannot be read or is malformed.
+pub fn rel_catalog_count<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    rel_type: &str,
+    source: &str,
+    target: &str,
+) -> Result<u64, StorageError> {
+    counter(r, &k::rel_catalog_key(t, rel_type, source, target))
+}
+
+/// Relationships of `(type, source label, target label)` carrying each pid:
+/// `(pid, count)`.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counters cannot be read or are malformed.
+pub fn rel_shape_prop_counts<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    rel_type: &str,
+    source: &str,
+    target: &str,
+) -> Result<Vec<(u64, u64)>, StorageError> {
+    let prefix = k::rel_shape_prop_prefix(t, rel_type, source, target);
+    let mut out = Vec::new();
+    for (key, raw) in r.range_prefix(&prefix)? {
+        let pid = k::read_u64(&key, prefix.len()).ok_or(StorageError::CorruptLog)?;
+        out.push((
+            pid,
+            k::decode_counter(Some(&raw)).ok_or(StorageError::CorruptLog)?,
+        ));
+    }
+    Ok(out)
+}
+
+/// Every relationship catalog row `(type, source, target, count)`, sorted.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counters cannot be read or are malformed.
+pub fn rel_catalog<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+) -> Result<Vec<(String, String, String, u64)>, StorageError> {
+    let prefix = k::counter_prefix(t, k::C_REL_CATALOG);
+    let mut out = Vec::new();
+    for (key, raw) in r.range_prefix(&prefix)? {
+        let (rel_type, pos) = k::read_str(&key, prefix.len()).ok_or(StorageError::CorruptLog)?;
+        let (source, pos) = k::read_str(&key, pos).ok_or(StorageError::CorruptLog)?;
+        let (target, _) = k::read_str(&key, pos).ok_or(StorageError::CorruptLog)?;
+        let count = k::decode_counter(Some(&raw)).ok_or(StorageError::CorruptLog)?;
+        out.push((
+            rel_type.to_owned(),
+            source.to_owned(),
+            target.to_owned(),
+            count,
+        ));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Owners of `kind` carrying `pid` (all labels).
+///
+/// # Errors
+/// Returns [`StorageError`] if the counter cannot be read or is malformed.
+pub fn prop_support_total<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    kind: OwnerKind,
+    pid: u64,
+) -> Result<u64, StorageError> {
+    counter(r, &k::support_total_key(t, kind, pid))
+}
+
+/// Owners of `kind` carrying `pid` under each label, by label name.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counters cannot be read or are malformed.
+pub fn prop_support_by_label<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    kind: OwnerKind,
+    pid: u64,
+) -> Result<Vec<(String, u64)>, StorageError> {
+    let prefix = k::support_by_pid_prefix(t, kind, pid);
+    let mut out = Vec::new();
+    for (key, raw) in r.range_prefix(&prefix)? {
+        let (label, _) = k::read_str(&key, prefix.len()).ok_or(StorageError::CorruptLog)?;
+        out.push((
+            label.to_owned(),
+            k::decode_counter(Some(&raw)).ok_or(StorageError::CorruptLog)?,
+        ));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Owners of `kind` under `label` carrying `pid`.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counter cannot be read or is malformed.
+pub fn prop_support_label<R: TryRead + ?Sized>(
