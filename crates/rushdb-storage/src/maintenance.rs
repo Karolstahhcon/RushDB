@@ -220,3 +220,114 @@ impl Store {
         self.retire_before_locked(commit_index)?;
         // Compact every shard file concurrently (independent files).
         self.for_each_backend_parallel(|backend| backend.compact())?;
+        self.compactions.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(commit_index))
+    }
+
+    /// Idle compaction gated by quiescence and a growth ratio. This is what
+    /// the background worker uses; its ticker is the rate limit (a cooldown
+    /// here, stamped when a compaction finished, refused every other tick:
+    /// effective period 2× the interval, measured 2026-10-10). It never
+    /// rewrites the file while commits are flowing (quiescence), and only
+    /// once the file has grown by `growth_percent` since the last
+    /// compaction or at least [`PURGED_KEYS_TO_COMPACT`] keys were purged
+    /// (a tenant purge frees space without growing the file). Returns why it
+    /// deferred, or the commit index it compacted at.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if reclamation or compaction fails.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn compact_if_needed(
+        &self,
+        quiesce: std::time::Duration,
+        growth_percent: u32,
+    ) -> Result<CompactOutcome, StorageError> {
+        self.check_health()?;
+        let now = wal::now_ms();
+        let quiesce_ms = u64::try_from(quiesce.as_millis()).unwrap_or(u64::MAX);
+        let last_commit = self.last_commit_ms.load(Ordering::Relaxed);
+        if last_commit != 0 && now.saturating_sub(last_commit) < quiesce_ms {
+            return Ok(CompactOutcome::CommitsRecent);
+        }
+        let Some(file) = self.storage_file_bytes() else {
+            return Ok(CompactOutcome::NotDurable);
+        };
+        let last_file = self.last_compacted_file_bytes.load(Ordering::Relaxed);
+        let grown = last_file == 0
+            || file.saturating_mul(100) >= last_file.saturating_mul(u64::from(growth_percent));
+        // A purge frees pages without growing the file.
+        let purged = self.purged_since_compaction.load(Ordering::Relaxed) >= PURGED_KEYS_TO_COMPACT;
+        if !grown && !purged {
+            return Ok(CompactOutcome::BelowThreshold);
+        }
+        let deadline = std::time::Instant::now() + COMPACT_BUSY_RETRY;
+        let compacted = loop {
+            let attempt = self.compact_if_idle();
+            let reader_open = match &attempt {
+                Ok(None) => true,
+                Err(StorageError::Durability(error)) => error == crate::backend::COMPACT_BUSY,
+                _ => false,
+            };
+            if reader_open && std::time::Instant::now() < deadline {
+                // Retry with every lock released: waiting under the publish
+                // or database lock would stall the reader we wait for.
+                std::thread::sleep(COMPACT_BUSY_PAUSE);
+                continue;
+            }
+            break attempt?;
+        };
+        match compacted {
+            Some(ci) => {
+                self.purged_since_compaction.store(0, Ordering::Relaxed);
+                self.last_compacted_file_bytes
+                    .store(self.storage_file_bytes().unwrap_or(file), Ordering::Relaxed);
+                Ok(CompactOutcome::Compacted(ci))
+            }
+            None => Ok(CompactOutcome::ReadersPinned),
+        }
+    }
+
+    /// Apparent size of the primary durable file, if this store is
+    /// disk-backed. Operator metric only; not a durability or capacity input.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn storage_file_bytes(&self) -> Option<u64> {
+        let path = self.health.cleanup(self.data_path.lock()).clone()?;
+        std::fs::metadata(path).ok().map(|meta| meta.len())
+    }
+
+    /// Durable byte accounting by key family (see [`StorageStatistics`]).
+    /// Aggregates every shard. Scans the key space once, so callers should
+    /// sample it on a maintenance schedule, not per request.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Durability`] if a shard cannot be read.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn storage_stats(&self) -> Result<StorageStatistics, StorageError> {
+        self.check_health()?;
+        // Every store aggregates its backend(s); the in-memory backend computes
+        // the same accounting from its maps.
+        let mut total = StorageStatistics::default();
+        for backend in self.all_backends() {
+            if self.maintenance_aborted() {
+                return Err(StorageError::Cancelled);
+            }
+            let s = match backend.storage_stats() {
+                Ok(stats) => stats,
+                Err(error) if error == "maintenance cancelled" => {
+                    return Err(StorageError::Cancelled);
+                }
+                Err(error) => return Err(StorageError::Durability(error)),
+            };
+            total.data_keys += s.data_keys;
+            total.data_bytes += s.data_bytes;
+            total.history_keys += s.history_keys;
+            total.history_bytes += s.history_bytes;
+            total.log_keys += s.log_keys;
+            total.log_bytes += s.log_bytes;
+            total.receipt_keys += s.receipt_keys;
+            total.receipt_bytes += s.receipt_bytes;
+        }
+        total.admission_waits = self.admission_waits.load(Ordering::Relaxed);
