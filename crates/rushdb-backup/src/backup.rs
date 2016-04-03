@@ -34,3 +34,76 @@ fn restore_record(lmpg: &Lmpg, v: &serde_json::Value) -> Result<(), String> {
     let label = v
         .get("label")
         .and_then(|x| x.as_str())
+        .ok_or("backup record missing label")?
+        .to_string();
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .ok_or("backup record missing id")?;
+    let properties = v
+        .get("properties")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let mut doc = properties.as_object().cloned().unwrap_or_default();
+    doc.insert("__id".to_string(), serde_json::json!(id));
+    doc.insert("__label".to_string(), serde_json::json!(label));
+    rushdb_lmpg::import::upsert_document(lmpg, &label, &serde_json::Value::Object(doc))
+        .map_err(|e| e.to_reason())?;
+    Ok(())
+}
+
+/// Restore one relationship line: link endpoints by decoded hex ids, writing
+/// the supplied properties onto the new edge. Idempotent on re-run: an edge
+/// with the same type between the same endpoints is left untouched.
+fn restore_relationship(lmpg: &Lmpg, v: &serde_json::Value) -> Result<(), String> {
+    let relationship_id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .and_then(rushdb_lmpg::import::decode_simple_hex)
+        .ok_or("backup relationship missing stable id")?;
+    let rel_type = v
+        .get("type")
+        .and_then(|x| x.as_str())
+        .ok_or("backup relationship missing type")?
+        .to_string();
+    let src = v
+        .get("source")
+        .and_then(|x| x.as_str())
+        .and_then(rushdb_lmpg::import::decode_simple_hex)
+        .ok_or("backup relationship bad source id")?;
+    let tgt = v
+        .get("target")
+        .and_then(|x| x.as_str())
+        .and_then(rushdb_lmpg::import::decode_simple_hex)
+        .ok_or("backup relationship bad target id")?;
+    let fields: Vec<(String, rushdb_lmpg::plan::FieldChange)> = v
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|o| {
+            o.iter()
+                .map(|(k, val)| {
+                    let change = if val.is_null() {
+                        rushdb_lmpg::plan::FieldChange::ExplicitNull
+                    } else {
+                        rushdb_lmpg::plan::FieldChange::Set(val.clone())
+                    };
+                    (k.clone(), change)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let snap = lmpg.store.read_view().map_err(|e| e.to_string())?;
+    let s_hdr = rushdb_lmpg::reader::try_access::record_by_id(
+        &snap,
+        lmpg.tenant,
+        &rushdb_types::ids::RecordId(src),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "restore: source record not found".to_string())?;
+    let t_hdr = rushdb_lmpg::reader::try_access::record_by_id(
+        &snap,
+        lmpg.tenant,
+        &rushdb_types::ids::RecordId(tgt),
+    )
+    .map_err(|e| e.to_string())?
