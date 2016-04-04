@@ -83,3 +83,88 @@ fn csv_rows_become_typed_records_and_export_renders_them() {
     let dune = stored
         .iter()
         .find(|record| record["properties"]["title"] == "Dune")
+        .expect("Dune");
+    assert_eq!(dune["properties"]["pages"], 412);
+    assert_eq!(dune["properties"]["in_print"], true);
+    let smith = stored
+        .iter()
+        .find(|record| record["properties"]["title"] == "Smith, J")
+        .expect("Smith, J");
+    assert!(
+        smith["properties"].get("pages").is_none(),
+        "an empty typed cell is left out"
+    );
+
+    let Response::Csv { content, count } = execute(
+        &node,
+        Operation::Query {
+            query: Query::ExportCsv { query: books() },
+        },
+    ) else {
+        panic!("expected csv");
+    };
+    assert_eq!(count, 2);
+    assert_eq!(content, csv::render(&stored));
+    assert!(
+        content.starts_with("__id,__label,in_print,pages,title\r\n"),
+        "{content}"
+    );
+    assert!(content.contains(",Book,true,412,Dune"), "{content}");
+    assert!(content.contains(",Book,false,,\"Smith, J\""), "{content}");
+}
+
+#[test]
+fn csv_rows_carry_their_inline_vectors() {
+    let node = Node::bootstrap(&mut super::tests::config(false)).unwrap();
+    execute(
+        &node,
+        Operation::Index {
+            index: IndexOperation::CreateVector {
+                definition: VectorIndexDefinition {
+                    label: "Book".into(),
+                    property: "title".into(),
+                    dimensions: 2,
+                    similarity: "cosine".into(),
+                    name: Some("book-titles".into()),
+                    model: None,
+                    owner: None,
+                },
+            },
+        },
+    );
+    let vector = |x: f32, y: f32| serde_json::json!([{ "propertyName": "title", "vector": [x, y], "index": "book-titles" }]);
+    execute(
+        &node,
+        ingest_csv(
+            "Book",
+            "title\nDune\nEmma\n",
+            serde_json::json!({}),
+            vec![vector(1.0, 0.0), vector(0.0, 1.0)],
+        ),
+    );
+    let Response::Records { records, .. } = execute(
+        &node,
+        Operation::Query {
+            query: Query::Vector {
+                query: VectorQuery {
+                    labels: vec!["Book".into()],
+                    property: "title".into(),
+                    vector: vec![0.0, 1.0],
+                    similarity: "cosine".into(),
+                    index: Some("book-titles".into()),
+                    predicate: serde_json::json!({}),
+                    offset: 0,
+                    limit: 1,
+                    ef: None,
+                    mode: None,
+                    score_threshold: None,
+                },
+            },
+        },
+    ) else {
+        panic!("expected records");
+    };
+    assert_eq!(records[0]["properties"]["title"], "Emma");
+}
+
+#[test]
