@@ -83,3 +83,89 @@ where
     #[must_use]
     pub fn limit(&self) -> usize {
         self.budget.snapshot().limit
+    }
+
+    /// Look up `key`, marking it most-recently-used on a hit.
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        let seq = self.next_seq();
+        let Some(entry) = self.entries.get_mut(key) else {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        };
+        self.hits = self.hits.saturating_add(1);
+        self.order.remove(&entry.seq);
+        entry.seq = seq;
+        self.order.insert(seq, key.clone());
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+
+    /// Insert or replace an entry whose retained size is `bytes`. Evicts LRU
+    /// entries until it fits; a value larger than the whole budget is not
+    /// cached. Returns whether the entry is now resident.
+    pub fn insert(&mut self, key: K, value: V, bytes: usize) -> bool {
+        // Never evict live entries to make room for one that cannot fit.
+        if bytes > self.limit() {
+            return false;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.order.remove(&old.seq);
+            let _ = self
+                .reserved
+                .resize(self.reserved.bytes().saturating_sub(old.bytes));
+        }
+        while self.reserved.bytes().saturating_add(bytes) > self.limit() {
+            if !self.evict_one() {
+                return false;
+            }
+        }
+        if self
+            .reserved
+            .resize(self.reserved.bytes().saturating_add(bytes))
+            .is_err()
+        {
+            return false;
+        }
+        let seq = self.next_seq();
+        self.order.insert(seq, key.clone());
+        self.entries.insert(key, Entry { value, bytes, seq });
+        true
+    }
+
+    /// Remove the least-recently-used entry. Returns false when empty.
+    fn evict_one(&mut self) -> bool {
+        let Some((&seq, key)) = self.order.iter().next() else {
+            return false;
+        };
+        let key = key.clone();
+        self.order.remove(&seq);
+        if let Some(entry) = self.entries.remove(&key) {
+            let _ = self
+                .reserved
+                .resize(self.reserved.bytes().saturating_sub(entry.bytes));
+            self.evictions = self.evictions.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    /// Drop every entry `keep` rejects, releasing its bytes (counted as
+    /// evictions). Returns how many entries were dropped.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) -> usize {
+        let doomed: Vec<K> = self
+            .entries
+            .iter()
+            .filter(|(key, entry)| !keep(key, &entry.value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &doomed {
+            if let Some(entry) = self.entries.remove(key) {
+                self.order.remove(&entry.seq);
+                let _ = self
+                    .reserved
+                    .resize(self.reserved.bytes().saturating_sub(entry.bytes));
+                self.evictions = self.evictions.saturating_add(1);
+            }
+        }
+        doomed.len()
+    }
+
