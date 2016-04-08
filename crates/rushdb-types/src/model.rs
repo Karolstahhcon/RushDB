@@ -34,15 +34,3 @@ impl fmt::Display for LogicalType {
 pub enum TypeState {
     /// No value has been observed yet, so no type is committed.
     Unresolved,
-    /// A concrete logical type has been observed.
-    Known(LogicalType),
-}
-
-/// How many values a property may hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Cardinality {
-    /// Exactly one value per owner.
-    Single,
-    /// Multiple values whose order is significant.
-    OrderedMany,
-    /// Multiple values treated as an unordered set.

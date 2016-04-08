@@ -40,3 +40,45 @@ fn repeated_searches_hold_no_memory_and_leave_no_files() {
     let dir = rushdb_storage::TempPath::dir("vector-search-leaks");
     std::fs::create_dir_all(&dir).unwrap();
     let store = Arc::new(
+        rushdb_lmpg::open_store_with_resources(
+            &dir.join("rushdb.redb"),
+            StorageResources {
+                logical_cache_bytes: 64 * 1024 * 1024,
+                ..StorageResources::default()
+            },
+        )
+        .unwrap(),
+    );
+    let budget = store.cache_budget().unwrap();
+    let engine = VectorEngine::new(Arc::new(Lmpg::new(
+        Arc::clone(&store),
+        TenantId::from_ordinal(31),
+    )));
+    engine.ensure_space("docs", 8).unwrap();
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        f32::from(u16::try_from(seed % 2_000).unwrap()) / 1_000.0 - 1.0
+    };
+    for i in 0..500 {
+        let record = engine
+            .lmpg
+            .create_record("Doc", None, vec![("i".into(), FieldChange::Set(json!(i)))])
+            .unwrap();
+        let vector: Vec<f32> = (0..8).map(|_| next()).collect();
+        engine
+            .bind_external(
+                "docs",
+                SourceRef {
+                    kind: OwnerKind::Record,
+                    owner_ord: record.ordinal,
+                    pid: 0,
+                    elem: 0,
+                },
+                &vector,
+            )
+            .unwrap();
+    }
+    engine.build_ann("docs").unwrap();
