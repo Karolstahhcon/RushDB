@@ -76,3 +76,81 @@ fn scan<R: TryRead>(
         }
     }
     Ok(())
+}
+
+fn entry_of(ty: LogicalType, scalar: &Scalar) -> Option<Vec<u8>> {
+    let mut entry = vec![logical_tag(ty)];
+    entry.extend(encode_order_preserving(ty, scalar).ok()?);
+    Some(entry)
+}
+
+/// Owners whose value equals any of `values` (every type variant a value
+/// may be stored under, as the presence path probes).
+fn equal<R: TryRead>(
+    snap: &R,
+    tenant: TenantId,
+    defs: &[IndexDef],
+    values: &[Json],
+    owner_limit: usize,
+) -> Result<Option<OwnerSet>, QueryError> {
+    let mut owners = OwnerSet::new();
+    for value in values {
+        let Some(variants) = scalar_variants(value) else {
+            return Ok(None);
+        };
+        for (ty, scalar) in variants {
+            let Some(entry) = entry_of(ty, &scalar) else {
+                return Ok(None);
+            };
+            let (start, end) = prefix_bounds(entry.clone());
+            scan(
+                snap,
+                tenant,
+                defs,
+                (&start, &end),
+                &|found| found == entry.as_slice(),
+                &mut owners,
+                owner_limit,
+            )?;
+        }
+    }
+    Ok(Some(owners))
+}
+
+/// Owners holding a numeric value satisfying `op bound`.
+fn range<R: TryRead>(
+    snap: &R,
+    tenant: TenantId,
+    defs: &[IndexDef],
+    op: RangeOp,
+    bound: f64,
+    owner_limit: usize,
+) -> Result<Option<OwnerSet>, QueryError> {
+    let mut owners = OwnerSet::new();
+    let above = matches!(op, RangeOp::Gt | RangeOp::Gte);
+    for ty in [
+        LogicalType::Int64,
+        LogicalType::Float64,
+        LogicalType::DateTime,
+    ] {
+        let tag = logical_tag(ty);
+        // Bound the scan at the bound's encoding, rounded outward for the
+        // integer domains; the exact comparison happens on each entry.
+        let edge = match ty {
+            LogicalType::Float64 => Scalar::Float64(bound),
+            LogicalType::Int64 => Scalar::Int64(outward(bound, above)),
+            _ => Scalar::DateTime(outward(bound, above)),
+        };
+        let Some(edge) = entry_of(ty, &edge) else {
+            continue;
+        };
+        let (start, end) = if above {
+            (edge, vec![tag + 1])
+        } else {
+            (vec![tag], rushdb_storage::prefix_range(&edge).1)
+        };
+        scan(
+            snap,
+            tenant,
+            defs,
+            (&start, &end),

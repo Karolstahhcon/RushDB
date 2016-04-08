@@ -84,3 +84,46 @@ fn commit_retry_is_idempotent_and_discoverable() {
         "retry returns same index"
     );
 
+    let snap = lmpg.store.read_view().unwrap();
+    assert_eq!(
+        try_access::label_members(&snap, lmpg.tenant, "A")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn rollback_records_aborted_outcome() {
+    let (lmpg, coord) = setup(Duration::from_secs(60));
+    let tx = coord.begin().unwrap();
+    coord.stage(&tx, create_op("A", 1)).unwrap();
+    coord.rollback(&tx).unwrap();
+
+    // a later commit attempt reports the durable aborted outcome
+    match coord.commit(&tx) {
+        TxOutcome::Aborted(_) => {}
+        other => panic!("expected aborted, got {other:?}"),
+    }
+    let snap = lmpg.store.read_view().unwrap();
+    assert_eq!(
+        try_access::label_members(&snap, lmpg.tenant, "A")
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn expired_transaction_never_commits() {
+    let (lmpg, coord) = setup(Duration::from_millis(50));
+    let tx = coord.begin().unwrap();
+    coord.stage(&tx, create_op("A", 1)).unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+
+    match coord.commit(&tx) {
+        TxOutcome::Expired => {}
+        other => panic!("expected expired, got {other:?}"),
+    }
+    let snap = lmpg.store.read_view().unwrap();
+    assert_eq!(
