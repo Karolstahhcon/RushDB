@@ -173,3 +173,91 @@ async fn standard_client_runs_simple_and_extended_queries() {
         .unwrap();
     let names: Vec<&str> = row
         .columns()
+        .iter()
+        .map(tokio_postgres::SimpleColumn::name)
+        .collect();
+    assert_eq!(names, ["position", "name", "active"]);
+    assert_eq!(row.get(1), Some("alpha"));
+
+    let rows = client.query("SELECT version()", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get::<_, String>(0).starts_with("RushDB pgwire"));
+
+    let rows = client.query("SELECT name FROM NOTE", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>("name"), "alpha");
+
+    let rows = client
+        .query(
+            "SELECT name FROM NOTE WHERE position > $1 AND active = $2",
+            &[&6_i64, &true],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>("name"), "alpha");
+
+    let statement = client
+        .prepare("SELECT position, active FROM NOTE WHERE position > $1")
+        .await
+        .unwrap();
+    assert_eq!(statement.params(), &[tokio_postgres::types::Type::INT8]);
+    assert_eq!(statement.columns().len(), 2);
+    let rows = client.query(&statement, &[&100_i64]).await.unwrap();
+    assert!(rows.is_empty());
+
+    let rows = client.query(&statement, &[&6_i64]).await.unwrap();
+    assert_eq!(rows[0].get::<_, i64>("position"), 7);
+    assert!(rows[0].get::<_, bool>("active"));
+}
+
+#[tokio::test]
+async fn standard_client_runs_atomic_sql_mutations() {
+    let (http_port, port) = start_gateway(false, None, true);
+    // Labels are schema-bearing record tables. Seed the label through the
+    // canonical API, then exercise DML wholly through a standard pgwire client.
+    put_record(
+        http_port,
+        None,
+        "NOTE",
+        &serde_json::json!({ "name": "seed", "position": 0 }),
+    );
+    let client = connect(port, "rushdb", "pgwire-token").await.unwrap();
+
+    // `execute` uses the extended Parse/Bind/Execute flow. The mutation is
+    // committed by the same canonical SQL operation as native Protocol v1 and
+    // comes back as a PostgreSQL CommandComplete tag with an affected count.
+    assert_eq!(
+        client
+            .execute(
+                "INSERT INTO NOTE (name, position) VALUES ($1, $2)",
+                &[&"through-pgwire", &7_i64],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        client
+            .execute(
+                "UPDATE NOTE SET position = $1 WHERE name = $2",
+                &[&8_i64, &"through-pgwire"],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let rows = client
+        .query(
+            "SELECT position FROM NOTE WHERE name = $1",
+            &[&"through-pgwire"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>("position"), 8);
+    assert_eq!(
+        client
+            .execute("DELETE FROM NOTE WHERE name = $1", &[&"through-pgwire"])
+            .await
+            .unwrap(),
