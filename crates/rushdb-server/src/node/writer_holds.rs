@@ -38,23 +38,3 @@ impl WriterHoldCollector {
 }
 
 impl Collector for WriterHoldCollector {
-    fn desc(&self) -> Vec<&Desc> {
-        vec![&self.desc]
-    }
-
-    fn collect(&self) -> Vec<proto::MetricFamily> {
-        let snapshot = self
-            .snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let mut family = proto::MetricFamily::default();
-        family.set_name(NAME.into());
-        family.set_help(HELP.into());
-        family.set_field_type(proto::MetricType::HISTOGRAM);
-        for (holder, holds) in snapshot {
-            let mut histogram = proto::Histogram::default();
-            let mut buckets = Vec::with_capacity(rushdb_storage::WRITER_HOLD_BOUNDS.len());
-            let mut cumulative = 0u64;
-            for (bound, count) in rushdb_storage::WRITER_HOLD_BOUNDS.iter().zip(holds.counts) {
-                cumulative = cumulative.saturating_add(count);

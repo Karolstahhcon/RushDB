@@ -24,3 +24,16 @@ crates='
 rushdb-types
 rushdb-storage
 rushdb-lmpg
+rushdb-query
+rushdb-authz
+rushdb-tx
+rushdb-protocol
+rushdb-bolt
+rushdb-grpc
+rushdb-vector
+rushdb-textsearch
+rushdb-raft
+rushdb-backup
+rushdb-sql
+rushdb-language
+rushdb-mongodb
