@@ -63,3 +63,35 @@ impl<'a> RequestScope<'a> {
         };
         RequestScope {
             node,
+            tenant,
+            scope,
+            resolution_error,
+            limits: rushdb_lmpg::RequestLimits::default(),
+        }
+    }
+
+    /// Construct directly from an already-resolved tenant, for callers (the
+    /// scheduler dispatch closures) that resolved the tenant before the
+    /// scope string was available to move into the closure, or test code
+    /// that wants a specific tenant without going through scope-string
+    /// derivation.
+    #[must_use]
+    pub fn for_tenant(node: &'a Node, tenant: TenantId, scope: Option<String>) -> Self {
+        RequestScope {
+            node,
+            tenant,
+            scope,
+            resolution_error: None,
+            limits: rushdb_lmpg::RequestLimits::default(),
+        }
+    }
+
+    /// This scope with a request's own bounds.
+    #[must_use]
+    pub fn with_request_limits(mut self, limits: rushdb_lmpg::RequestLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The request's own bounds.
+    #[must_use]
