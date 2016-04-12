@@ -29,3 +29,34 @@ impl PlannedCandidates {
         self.exact
     }
 }
+
+impl Iterator for PlannedCandidates {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        self.ords.next()
+    }
+}
+
+/// Candidates for records of `labels` matching every one of `conditions`.
+///
+/// `conditions` are the conjuncts of the caller's filter that it can state
+/// as native predicates; an empty slice is a filter none of whose
+/// conditions can be stated. `Ok(None)` means no index answers them and
+/// the caller walks the labels' records.
+///
+/// # Errors
+///
+/// Returns [`QueryError::UnindexedWalk`] when no index answers and the walk
+/// would check more records than the handle's unindexed-walk limit,
+/// [`QueryError::ResourceLimit`] when the candidate set exceeds
+/// `query-memory-max`, [`QueryError::Cancelled`] when the probe requests a
+/// stop, and storage read errors.
+pub fn planned_candidates(
+    lmpg: &Lmpg,
+    snap: &QuerySnapshot,
+    labels: &[String],
+    conditions: &[Expr],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<PlannedCandidates>, QueryError> {
+    let req = SearchRequest {
