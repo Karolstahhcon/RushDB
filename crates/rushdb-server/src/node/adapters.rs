@@ -121,3 +121,126 @@ impl RequestScope<'_> {
     /// with the rest of the transaction's snapshot. Also returns the index's
     /// changes not yet applied when the search ran.
     ///
+    /// # Errors
+    /// Returns an error message when the search or record lookup fails.
+    pub fn text_search_in_view(
+        &self,
+        index: &str,
+        query: &str,
+        opts: rushdb_textsearch::LexicalOptions,
+        limit: usize,
+        view: &rushdb_storage::ReadView,
+    ) -> Result<(Vec<serde_json::Value>, u64), String> {
+        let found = self.text.search(
+            self.tenant(),
+            view,
+            rushdb_textsearch::TextQuery {
+                index,
+                query,
+                opts,
+                top_k: limit,
+            },
+            None,
+        )?;
+        let mut rows = Vec::with_capacity(found.hits.len());
+        for hit in found.hits {
+            let Some(header) = access::record_by_ord(view, self.tenant(), hit.owner_ord)
+                .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            rows.push(serde_json::json!({
+                "id": uuid::Uuid::from_bytes(header.record_id).to_string(),
+                "score": hit.score,
+            }));
+        }
+        Ok((rows, found.pending))
+    }
+
+    // ---- vectors -----------------------------------------------------------
+
+    /// Create a vector space with the default similarity metric.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn ensure_space(&self, alias: &str, dims: u32) -> Result<(), String> {
+        self.vector_engine()?
+            .ensure_space(alias, dims)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Ensure a vector space with an explicit similarity metric. The engine
+    /// carries vectors only — no embedding source/model concept.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn ensure_space_similarity(
+        &self,
+        alias: &str,
+        dims: u32,
+        similarity: rushdb_types::occurrence::Similarity,
+    ) -> Result<(), String> {
+        self.vector_engine()?
+            .ensure_space_similarity(alias, dims, similarity)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Resolves the family id for a record-owned field from the catalog
+    /// signature index and binds the caller's vector through the shared
+    /// deterministic path.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn bind_field_vector(
+        &self,
+        alias: &str,
+        record_hex: &str,
+        field: &str,
+        vector: &[f32],
+    ) -> Result<u64, String> {
+        let id = RecordId(bytes_from_hex(record_hex)?);
+        let tenant = self.tenant();
+        let snap = Arc::new(self.store.read_view().map_err(|e| e.to_string())?);
+        let hdr = access::record_by_id(&snap, tenant, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("record `{record_hex}` not found"))?;
+
+        let norm = rushdb_types::value::normalize_name(field);
+        let sig = key(
+            tenant,
+            &[
+                P_FAMILY_SIG,
+                b"default",
+                &[OwnerKind::Record.as_byte()],
+                norm.as_bytes(),
+            ],
+        );
+        let raw = snap
+            .get(&sig)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("family `{field}` does not exist yet"))?;
+        let pid = u64::from_be_bytes(
+            raw.as_slice()
+                .try_into()
+                .map_err(|_| "corrupt property family signature")?,
+        );
+
+        self.vector_engine()?
+            .bind(
+                alias,
+                rushdb_vector::SourceRef {
+                    kind: OwnerKind::Record,
+                    owner_ord: hdr.ordinal,
+                    pid,
+                    elem: 0,
+                },
+                vector,
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// Bind a managed vector only when the source still matches the hash
+    /// captured before an external embedding provider was invoked. This keeps
