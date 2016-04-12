@@ -154,3 +154,81 @@ fn range<R: TryRead>(
             tenant,
             defs,
             (&start, &end),
+            &|entry| {
+                entry.split_first().is_some_and(|(&found, payload)| {
+                    found == tag
+                        && decode_order_preserving(ty, payload)
+                            .is_ok_and(|scalar| range_scalar_matches(&scalar, op, bound))
+                })
+            },
+            &mut owners,
+            owner_limit,
+        )?;
+    }
+    Ok(Some(owners))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "floor/ceil made the bound integral; `as` saturates at the i64 edges"
+)]
+fn outward(bound: f64, above: bool) -> i64 {
+    if above {
+        bound.floor() as i64
+    } else {
+        bound.ceil() as i64
+    }
+}
+
+/// Owners holding a string starting with `prefix`.
+fn starts_with<R: TryRead>(
+    snap: &R,
+    tenant: TenantId,
+    defs: &[IndexDef],
+    prefix: &str,
+    owner_limit: usize,
+) -> Result<Option<OwnerSet>, QueryError> {
+    let mut entry = vec![logical_tag(LogicalType::Utf8)];
+    entry.extend_from_slice(prefix.as_bytes());
+    let (start, end) = prefix_bounds(entry);
+    let mut owners = OwnerSet::new();
+    scan(
+        snap,
+        tenant,
+        defs,
+        (&start, &end),
+        &|entry| {
+            decode_order_preserving(LogicalType::Utf8, &entry[1..]).is_ok_and(
+                |scalar| matches!(scalar, Scalar::Utf8(text) if text.starts_with(prefix)),
+            )
+        },
+        &mut owners,
+        owner_limit,
+    )?;
+    Ok(Some(owners))
+}
+
+/// The leaf's property name when an ordered index can answer it.
+fn indexed_property(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Field(
+            FieldPred::Eq(name, _)
+            | FieldPred::In(name, _)
+            | FieldPred::Gt(name, _)
+            | FieldPred::Gte(name, _)
+            | FieldPred::Lt(name, _)
+            | FieldPred::Lte(name, _)
+            | FieldPred::StartsWith(name, _),
+        ) => Some(name),
+        _ => None,
+    }
+}
+
+/// Exact owners of `expr` from declared indexes, or `None` when no `Ready`
+/// ordered index covers it for every label in `labels`.
+pub(crate) fn leaf_owners<R: TryRead>(
+    snap: &R,
+    tenant: TenantId,
+    expr: &Expr,
+    labels: &[String],
+    owner_limit: usize,
