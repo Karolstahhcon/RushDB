@@ -44,19 +44,3 @@ impl Iterator for PlannedCandidates {
 /// as native predicates; an empty slice is a filter none of whose
 /// conditions can be stated. `Ok(None)` means no index answers them and
 /// the caller walks the labels' records.
-///
-/// # Errors
-///
-/// Returns [`QueryError::UnindexedWalk`] when no index answers and the walk
-/// would check more records than the handle's unindexed-walk limit,
-/// [`QueryError::ResourceLimit`] when the candidate set exceeds
-/// `query-memory-max`, [`QueryError::Cancelled`] when the probe requests a
-/// stop, and storage read errors.
-pub fn planned_candidates(
-    lmpg: &Lmpg,
-    snap: &QuerySnapshot,
-    labels: &[String],
-    conditions: &[Expr],
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<Option<PlannedCandidates>, QueryError> {
-    let req = SearchRequest {
