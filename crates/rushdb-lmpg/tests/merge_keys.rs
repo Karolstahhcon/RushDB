@@ -46,3 +46,52 @@ fn records(lmpg: &Lmpg, label: &str) -> Vec<Value> {
         })
         .collect()
 }
+
+fn has_property(lmpg: &Lmpg, name: &str) -> bool {
+    let snap = lmpg.store.read_view().unwrap();
+    let key = rushdb_lmpg::reader::keys_ext::family_sig_key(
+        lmpg.tenant,
+        "default",
+        OwnerKind::Record,
+        name,
+    );
+    snap.get(&key).unwrap().is_some()
+}
+
+#[test]
+fn an_upsert_by_id_finds_the_record_by_id_and_never_stores_an_id_property() {
+    let lmpg = engine(0);
+    let id = "0192f1f0c0de7000a000000000000001";
+    upsert(
+        &lmpg,
+        &json!({ "Hero": [{ "__id": id, "name": "Luke" }] }),
+        &["__id"],
+    )
+    .unwrap();
+    let created = records(&lmpg, "Hero");
+    assert_eq!(created.len(), 1, "a miss creates the record");
+    assert_eq!(created[0]["__id"], id, "with the given id");
+
+    let dashed = "0192f1f0-c0de-7000-a000-000000000001";
+    upsert(
+        &lmpg,
+        &json!({ "Hero": [{ "__id": dashed, "name": "Han" }] }),
+        &["__id"],
+    )
+    .unwrap();
+    let updated = records(&lmpg, "Hero");
+    assert_eq!(updated.len(), 1, "a hit updates in place: {updated:?}");
+    assert_eq!(updated[0]["name"], "Han");
+    assert!(
+        !has_property(&lmpg, "__id"),
+        "`__id` is the identity, not a property"
+    );
+
+    // Every incoming key (merge: true) includes the id; a different value of
+    // another key means no match, so the create collides with the id.
+    let error = upsert(
+        &lmpg,
+        &json!({ "Hero": [{ "__id": id, "name": "Leia" }] }),
+        &[],
+    )
+    .unwrap_err();
