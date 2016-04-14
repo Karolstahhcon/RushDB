@@ -16,22 +16,3 @@ fn post(port: u16, body: &str) {
         "POST /protocol/v1/execute HTTP/1.1\r\nhost: x\r\nauthorization: Bearer local-token\r\n\
          content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
-    );
-    stream.write_all(request.as_bytes()).unwrap();
-    let mut out = Vec::new();
-    let _ = stream.read_to_end(&mut out);
-}
-
-#[test]
-fn signalled_shutdown_leaves_redb_without_repair() {
-    let dir = rushdb_storage::TempPath::dir("clean-shutdown");
-    let mut cfg = ServerConfig {
-        data_dir: Some(dir.to_path_buf()),
-        port: 0,
-        pgwire_port: 0,
-        ..Default::default()
-    };
-    // Tick maintenance (GC, retention, checkpoint) constantly during the test.
-    cfg.resources.checkpoint_interval_seconds = 1;
-    let (mut router, port) = new_router(cfg).unwrap();
-    let stop = router.shutdown_handle();
