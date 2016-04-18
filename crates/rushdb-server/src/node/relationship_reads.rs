@@ -138,3 +138,143 @@ impl RequestScope<'_> {
         &self,
         query: &rushdb_protocol::RelationshipQuery,
         snap: &Arc<rushdb_storage::ReadView>,
+    ) -> Result<Option<Vec<rushdb_types::occurrence::RelationshipHeader>>, String> {
+        let tenant = self.tenant();
+        let rel_type = query.relation_type.as_deref();
+        let ends = |predicate: &Option<serde_json::Value>,
+                    labels: &[String],
+                    outgoing: bool|
+         -> Result<Option<std::collections::BTreeSet<u64>>, String> {
+            let Some(predicate) = predicate else {
+                return Ok(None);
+            };
+            let document = serde_json::json!({ "labels": labels, "where": predicate });
+            let parsed =
+                rushdb_query::document::parse_document(&document).map_err(|e| e.to_string())?;
+            let records = rushdb_query::matching_ordinals(
+                &self.lmpg(),
+                &parsed.search,
+                &|| false,
+                Arc::clone(snap),
+            )
+            .map_err(|e| e.to_string())?;
+            let mut rels = std::collections::BTreeSet::new();
+            for ord in records {
+                let edges = if outgoing {
+                    access::adj_out(snap, tenant, ord, rel_type)
+                } else {
+                    access::adj_in(snap, tenant, ord, rel_type)
+                }
+                .map_err(|e| e.to_string())?;
+                rels.extend(edges.into_iter().map(|(_, _, rel)| rel));
+            }
+            Ok(Some(rels))
+        };
+        let sources = ends(&query.source_predicate, &query.source_labels, true)?;
+        let targets = ends(&query.target_predicate, &query.target_labels, false)?;
+        let rels = match (sources, targets) {
+            (None, None) => return Ok(None),
+            (Some(rels), None) | (None, Some(rels)) => rels,
+            (Some(sources), Some(targets)) => sources.intersection(&targets).copied().collect(),
+        };
+        let mut headers = Vec::with_capacity(rels.len());
+        for rel in rels {
+            if let Some(hdr) =
+                access::relationship_by_ord(snap, tenant, rel).map_err(|e| e.to_string())?
+            {
+                headers.push(hdr);
+            }
+        }
+        headers.sort_by_key(|hdr| hdr.relationship_id);
+        Ok(Some(headers))
+    }
+
+    /// Exact relationship topology for the current request scope.
+    ///
+    /// Unlike the relationship listing operation this is not page-limited: schema
+    /// cardinalities describe the complete scoped graph. Concrete edges are reduced
+    /// immediately into label/type triples, so the protocol response remains small.
+    /// Catalog-backed relationship description: group counts and per-type
+    /// property owner counts from maintained rows, with a scan fallback for
+    /// data written before the relationship catalog existed.
+    /// # Errors
+    ///
+    /// Returns an error message when the operation fails.
+    pub fn describe_relationships(
+        &self,
+    ) -> Result<Vec<rushdb_protocol::RelationshipDescription>, String> {
+        let view = std::sync::Arc::new(self.store.read_view().map_err(|e| e.to_string())?);
+        self.describe_relationships_in_view(&view)
+    }
+
+    /// Describe relationship topology from a caller-owned pinned snapshot.
+    pub(crate) fn describe_relationships_in_view(
+        &self,
+        view: &Arc<rushdb_storage::ReadView>,
+    ) -> Result<Vec<rushdb_protocol::RelationshipDescription>, String> {
+        let catalog = rushdb_lmpg::reader::try_access::relationship_catalog(view, self.tenant())
+            .map_err(|e| e.to_string())?;
+        if catalog.is_empty() {
+            return self.describe_relationships_scan_in_view(view);
+        }
+        let meta = self.relationship_property_meta_in_view(view)?;
+        let mut out: Vec<rushdb_protocol::RelationshipDescription> =
+            Vec::with_capacity(catalog.len());
+        for (relationship_type, source_label, target_label, count) in catalog {
+            let mut properties: Vec<rushdb_protocol::RelationshipPropertyDescription> =
+                rushdb_lmpg::reader::try_access::rel_prop_counts(
+                    view,
+                    self.tenant(),
+                    (&relationship_type, &source_label, &target_label),
+                )
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter_map(|(pid, relationships_count)| {
+                    meta.get(&pid).map(|(name, value_type)| {
+                        rushdb_protocol::RelationshipPropertyDescription {
+                            name: name.clone(),
+                            value_type: value_type.clone(),
+                            relationships_count,
+                        }
+                    })
+                })
+                .collect();
+            properties.sort_by(|a, b| a.name.cmp(&b.name));
+            out.push(rushdb_protocol::RelationshipDescription {
+                source_label,
+                target_label,
+                relationship_type,
+                count,
+                properties,
+            });
+        }
+        out.sort_by(|a, b| {
+            (&a.source_label, &a.relationship_type, &a.target_label).cmp(&(
+                &b.source_label,
+                &b.relationship_type,
+                &b.target_label,
+            ))
+        });
+        Ok(out)
+    }
+
+    /// Map of relationship property id -> (display name, type), from families
+    /// scoped to relationships.
+    pub(super) fn relationship_property_meta_in_view(
+        &self,
+        view: &rushdb_storage::ReadView,
+    ) -> Result<BTreeMap<u64, (String, String)>, String> {
+        use rushdb_types::keys::{key, P_FAMILY};
+        let tenant = self.tenant();
+        let mut families = BTreeMap::new();
+        for (_, raw) in view
+            .range_prefix(&key(tenant, &[P_FAMILY, b""]))
+            .map_err(|e| e.to_string())?
+        {
+            let fam: rushdb_types::occurrence::PropertyFamily = serde_json::from_slice(&raw)
+                .map_err(|e| format!("corrupt property family: {e}"))?;
+            families.insert(fam.family_id, fam);
+        }
+        let mut out = BTreeMap::new();
+        for (_, raw) in view
+            .range_prefix(&key(tenant, &[b"property-row", b""]))

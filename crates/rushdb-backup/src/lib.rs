@@ -2,3 +2,8 @@
 //!
 //! This crate owns the JSONL backup surface only. It is **not** a migration
 //! tool: migrations from other stores are performed outside the engine (see
+//! the manual's "Upgrading from `RushDB` 2.x"). The surface is:
+//!
+//! - streaming tenant JSONL export ([`export`]); and
+//! - JSONL backup restore ([`restore_backup`], [`restore_backup_reader`]).
+
