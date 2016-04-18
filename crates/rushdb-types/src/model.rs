@@ -22,15 +22,3 @@ impl fmt::Display for LogicalType {
             LogicalType::Boolean => "boolean",
             LogicalType::Int64 => "int64",
             LogicalType::Float64 => "float64",
-            LogicalType::Utf8 => "utf8",
-            LogicalType::DateTime => "datetime",
-        };
-        f.write_str(name)
-    }
-}
-
-/// Catalog state: definitions are Unresolved until type evidence exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TypeState {
-    /// No value has been observed yet, so no type is committed.
-    Unresolved,

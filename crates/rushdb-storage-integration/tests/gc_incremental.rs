@@ -121,3 +121,64 @@ fn incremental_gc_watermark_survives_reopen() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn background_gc_tick_resumes_and_completes_sweeps() {
+    let dir = std::env::temp_dir().join(format!(
+        "rushdb-gc-tick-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (store, _lmpg) = seed_history(&dir);
+    let watermark = store.committed_version();
+
+    // Drive the same API a background worker would: small bounded ticks. Some
+    // ticks return "not done" (mid-sweep) and eventually the sweep completes.
+    let mut ticks = 0usize;
+    loop {
+        let done = store.gc_tick(4).unwrap();
+        ticks += 1;
+        if done {
+            break;
+        }
+        assert!(ticks <= 100, "gc_tick never completed");
+    }
+    // A full sweep across the seeded history needs multiple bounded ticks.
+    assert!(
+        ticks >= 2,
+        "expected a resumable multi-tick sweep, got {ticks}"
+    );
+    assert_eq!(store.gc_watermark(), watermark);
+
+    // A second sweep with no new history completes immediately and the
+    // checkpoint floor is monotonic (never moves backward).
+    assert!(
+        store.gc_tick(4).unwrap(),
+        "idle sweep completes in one tick"
+    );
+    assert_eq!(store.gc_watermark(), watermark);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn gc_with_no_expired_versions_completes_without_walking_history() {
+    // P06 regression: with the expiry-ordered index, a batch whose watermark
+    // covers no retained version finishes immediately instead of walking every
+    // history key. Under the pre-index sweep this returned `Some` after
+    // `max_keys` history keys even though nothing was reclaimable.
+    let dir = std::env::temp_dir().join(format!(
+        "rushdb-gc-expiry-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (store, _lmpg) = seed_history(&dir);
+    assert_eq!(
+        store.retire_before_batch(0, None, 1).unwrap(),
+        None,
+        "no expired version => the sweep is a no-op"
+    );
+

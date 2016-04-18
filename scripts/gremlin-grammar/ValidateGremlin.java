@@ -9,3 +9,25 @@ import java.nio.charset.StandardCharsets;
 
 import org.antlr.v4.runtime.BaseErrorListener;
 import org.antlr.v4.runtime.CharStreams;
+import org.antlr.v4.runtime.CommonTokenStream;
+import org.antlr.v4.runtime.RecognitionException;
+import org.antlr.v4.runtime.Recognizer;
+
+public final class ValidateGremlin {
+    private static final class Collect extends BaseErrorListener {
+        String error;
+
+        @Override
+        public void syntaxError(Recognizer<?, ?> recognizer, Object symbol, int line, int column,
+                String message, RecognitionException cause) {
+            if (error == null) {
+                error = column + ": " + message;
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        BufferedReader input = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        int total = 0;
+        int failed = 0;
+        String line;
