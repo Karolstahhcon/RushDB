@@ -30,3 +30,35 @@ fn put(mode: PutMode, id: Option<&str>, label: Option<&str>, v: i64) -> Operatio
             label: label.map(str::to_string),
             properties: json!({"v": v}),
             vectors: Vec::new(),
+            options: json!({}),
+        },
+    }
+}
+
+fn records(node: &Node, predicate: serde_json::Value) -> Vec<serde_json::Value> {
+    let Ok(Response::Records { records, .. }) = run(
+        node,
+        Operation::Query {
+            query: Query::Records {
+                query: QueryDocument {
+                    predicate,
+                    ..QueryDocument::default()
+                },
+            },
+        },
+    ) else {
+        panic!("expected records")
+    };
+    records
+}
+
+#[test]
+fn an_unknown_query_document_key_is_rejected_by_name() {
+    let node = node();
+    node.scope()
+        .create_record("Doc", &json!({"v": 1}), &[], &json!({}))
+        .unwrap();
+    let body = json!({
+        "protocolVersion": 1,
+        "operation": {"kind": "query", "query": {"kind": "records",
+            "query": {"labels": ["Doc"], "where": {"v": 2}}}},

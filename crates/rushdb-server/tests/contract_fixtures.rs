@@ -72,3 +72,152 @@ fn http_execute(port: u16, token: &str, envelope: &serde_json::Value) -> (u16, s
     stream.read_to_string(&mut raw).unwrap();
     let status = raw
         .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = raw
+        .split_once("\r\n\r\n")
+        .and_then(|(_, v)| serde_json::from_str(v).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+async fn grpc_execute(
+    port: u16,
+    token: &str,
+    envelope: &serde_json::Value,
+) -> Result<serde_json::Value, tonic::Status> {
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+        .expect("channel")
+        .connect()
+        .await
+        .expect("connect");
+    let mut grpc = tonic::client::Grpc::new(channel);
+    let mut req = Request::new(BytesEnvelope {
+        json: serde_json::to_vec(envelope).expect("serialize"),
+    });
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("meta"),
+    );
+    let codec = ProstCodec::<BytesEnvelope, BytesEnvelope>::default();
+    grpc.ready()
+        .await
+        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let path = tonic::codegen::http::uri::PathAndQuery::from_static("/rushdb.v1.Database/Execute");
+    let resp = grpc.unary(req, path, codec).await?;
+    let json = serde_json::from_slice(&resp.into_inner().json).expect("response json");
+    Ok(json)
+}
+
+/// Make a response comparable across transports: drop generated record ids and
+/// sort arrays so record ordering does not mask an identical payload.
+fn normalize_response(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(obj) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in obj {
+                if k == "id" {
+                    continue;
+                }
+                out.insert(k.clone(), normalize_response(v));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            let mut out: Vec<serde_json::Value> = items.iter().map(normalize_response).collect();
+            out.sort_by_key(std::string::ToString::to_string);
+            serde_json::Value::Array(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn envelope(kind: &str, body: &serde_json::Value) -> serde_json::Value {
+    let mut op = serde_json::Map::new();
+    op.insert("kind".to_string(), serde_json::json!(kind));
+    if let Some(obj) = body.as_object() {
+        for (k, v) in obj {
+            op.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::json!({
+        "protocolVersion": 1,
+        "operation": op
+    })
+}
+
+fn corpus() -> Vec<(String, serde_json::Value)> {
+    vec![
+        (
+            "put-record".into(),
+            envelope(
+                "mutate",
+                &serde_json::json!({
+                    "mutation": {
+                        "kind": "putRecord",
+                        "mode": "create",
+                        "label": "BOOK",
+                        "properties": { "title": "Dune" },
+                        "options": {}
+                    }
+                }),
+            ),
+        ),
+        (
+            "find-records".into(),
+            envelope(
+                "query",
+                &serde_json::json!({
+                    "query": {
+                        "kind": "records",
+                        "query": { "labels": ["BOOK"], "limit": 10 }
+                    }
+                }),
+            ),
+        ),
+        (
+            "describe-capabilities".into(),
+            envelope(
+                "describe",
+                &serde_json::json!({ "describe": { "kind": "capabilities" } }),
+            ),
+        ),
+        (
+            "describe-languages".into(),
+            envelope(
+                "describe",
+                &serde_json::json!({ "describe": { "kind": "queryLanguages" } }),
+            ),
+        ),
+        (
+            "describe-buildinfo".into(),
+            envelope(
+                "describe",
+                &serde_json::json!({ "describe": { "kind": "buildInfo" } }),
+            ),
+        ),
+    ]
+}
+
+/// Pin the documented protocol v1 contract shape
+/// (docs/manual/reference/http-endpoints.md): every
+/// request carries `protocolVersion == 1` and an operation `kind` from the
+/// documented set; every response carries a `response.kind`.
+fn validate_envelope_shape(request: &serde_json::Value, http_body: &serde_json::Value) {
+    let kinds = [
+        "query",
+        "mutate",
+        "describe",
+        "ingest",
+        "index",
+        "transaction",
+        "purgeTenant",
+        "backup",
+    ];
+    assert_eq!(request["protocolVersion"], 1, "protocolVersion must be 1");
+    let op = request.get("operation").expect("operation present");
+    let kind = op
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .expect("operation.kind");
