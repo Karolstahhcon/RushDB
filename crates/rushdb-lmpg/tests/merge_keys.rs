@@ -95,3 +95,52 @@ fn an_upsert_by_id_finds_the_record_by_id_and_never_stores_an_id_property() {
         &[],
     )
     .unwrap_err();
+    assert!(
+        error.contains("precondition failed") && error.contains(id),
+        "{error}"
+    );
+    assert_eq!(records(&lmpg, "Hero").len(), 1);
+
+    let error = upsert(
+        &lmpg,
+        &json!({ "Hero": [{ "__id": "not-an-id" }] }),
+        &["__id"],
+    )
+    .unwrap_err();
+    assert!(error.starts_with("invalid __id"), "{error}");
+}
+
+#[test]
+fn an_underscore_id_is_an_ordinary_property() {
+    let lmpg = engine(0);
+    upsert(
+        &lmpg,
+        &json!({ "Hero": [{ "_id": "ext-1", "name": "Luke" }] }),
+        &["_id"],
+    )
+    .unwrap();
+    upsert(
+        &lmpg,
+        &json!({ "Hero": [{ "_id": "ext-1", "name": "Han" }] }),
+        &["_id"],
+    )
+    .unwrap();
+    let stored = records(&lmpg, "Hero");
+    assert_eq!(stored.len(), 1, "`_id` matched as a key: {stored:?}");
+    assert_eq!(stored[0]["_id"], "ext-1", "stored and returned as written");
+    assert_eq!(stored[0]["name"], "Han");
+    assert_ne!(
+        stored[0]["__id"], stored[0]["_id"],
+        "the identity is separate"
+    );
+    assert!(has_property(&lmpg, "_id"));
+}
+
+#[test]
+fn reserved_names_are_refused_as_properties_and_merge_keys() {
+    let lmpg = engine(0);
+    for name in ["__score", "__proptypes", "__Label", "__id_"] {
+        let error = upsert(
+            &lmpg,
+            &json!({ "Hero": [{ "name": "Luke", name: 1 }] }),
+            &["name"],
