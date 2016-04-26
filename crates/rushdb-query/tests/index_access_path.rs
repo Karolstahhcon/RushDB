@@ -43,3 +43,48 @@ fn seed(lmpg: &Lmpg) {
         None,
         set(vec![("s", json!("beta")), ("n", json!(7.0))]),
     )
+    .unwrap();
+    lmpg.create_record(
+        "A",
+        None,
+        set(vec![("s", json!("gamma")), ("n", json!(7.5))]),
+    )
+    .unwrap();
+    lmpg.create_record(
+        "A",
+        None,
+        set(vec![("s", json!("alpha")), ("tags", json!(["green"]))]),
+    )
+    .unwrap();
+    // Same value on a second label for scoping.
+    lmpg.create_record("B", None, set(vec![("s", json!("alpha"))]))
+        .unwrap();
+    // Explicit null occurrence (present, null-valued).
+    lmpg.create_record(
+        "A",
+        None,
+        vec![("nv".to_string(), FieldChange::ExplicitNull)],
+    )
+    .unwrap();
+}
+
+fn collect(page: &rushdb_query::Page) -> BTreeSet<String> {
+    page.records
+        .iter()
+        .filter_map(|r| r.get("__id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// Run one query through both the full and streaming executors against the
+/// same dataset and return their id sets.
+fn both(document: &Value) -> (BTreeSet<String>, BTreeSet<String>) {
+    let lmpg = setup();
+    seed(&lmpg);
+    let parsed = parse_document(document).expect("valid query");
+    let full = collect(&find_records(&lmpg, &parsed.search).expect("search"));
+    let snap = Arc::new(lmpg.store.read_view().unwrap());
+    let streamed = collect(
+        &find_records_streaming(&lmpg, &parsed.search, &|| false, snap).expect("streaming search"),
+    );
+    (full, streamed)
+}

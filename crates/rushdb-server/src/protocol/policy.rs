@@ -39,3 +39,23 @@ impl ProtocolExecutor<'_> {
                 let (parsed, min_count) = policy_from_wire(policy)?;
                 let mode = if enforced {
                     rushdb_authz::AuthorizationMode::PolicyEnforced
+                } else {
+                    rushdb_authz::AuthorizationMode::BoundaryOnly
+                };
+                let stored = self
+                    .node
+                    .security_put_policy_with_min_count(&parsed, mode, min_count)
+                    .map_err(execution_failed)?;
+                Ok(Response::Policy {
+                    policy: Some(policy_to_wire(&parsed, min_count)),
+                    enforced,
+                    generation: stored.get("generation").and_then(serde_json::Value::as_u64),
+                })
+            }
+        }
+    }
+}
+
+/// The wire (camelCase) form of a policy.
+fn policy_to_wire(policy: &rushdb_authz::DataAccessPolicy, min_count: u64) -> serde_json::Value {
+    serde_json::json!({
