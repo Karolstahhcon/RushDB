@@ -81,3 +81,87 @@ impl Store {
             }
         }
         drop(guard);
+        self.observe_phase(CommitPhase::WalAppendSync, sync_started);
+        Ok(())
+    }
+
+    /// Persist a drained publisher batch, fanning out durability to each
+    /// commit's physical shard backend. At `shard_count == 1` this is exactly
+    /// the historical single-backend `apply_many`; with `> 1` shards,
+    /// different tenants' commits persist in parallel.
+    pub(super) fn persist_many_sharded(
+        &self,
+        pairs: &[(u64, &[Op])],
+        batch: &[PendingCommit],
+    ) -> Result<(), StorageError> {
+        self.check_health()?;
+        self.check_publisher()?;
+        #[cfg(test)]
+        if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::Durability(
+                "injected persistence failure".into(),
+            ));
+        }
+        let purged = pairs
+            .iter()
+            .flat_map(|(_, ops)| ops.iter())
+            .filter(|op| matches!(op, Op::Purge(_)))
+            .count();
+        if purged > 0 {
+            self.purged_since_compaction
+                .fetch_add(purged as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        debug_assert_eq!(pairs.len(), batch.len());
+        // Log-first: append the group's expanded op-sets to the segmented WAL
+        // and make them durable BEFORE writing the materialization. This is the
+        // durability acknowledgement boundary (Law 4). `Async` skips the fsync
+        // and relies on a later checkpoint; the redb backends are always
+        // buffered and replayed from the WAL on recovery.
+        {
+            let records: Vec<(u64, u32, &[Op], Option<&[u8]>)> = batch
+                .iter()
+                .map(|pc| {
+                    let shard = u32::try_from(pc.shard).expect("shard index fits u32");
+                    (
+                        pc.ci,
+                        shard,
+                        pc.ops.as_slice(),
+                        Some(pc.command_payload.as_slice()),
+                    )
+                })
+                .collect();
+            self.append_log(&records)?;
+        }
+        let apply_started = std::time::Instant::now();
+        let applied = self.apply_sharded(pairs, batch);
+        self.observe_phase(CommitPhase::BackendApply, apply_started);
+        applied
+    }
+
+    /// Apply a durable group to each commit's physical shard backend.
+    pub(super) fn apply_sharded(
+        &self,
+        pairs: &[(u64, &[Op])],
+        batch: &[PendingCommit],
+    ) -> Result<(), StorageError> {
+        let mut by_shard: BTreeMap<usize, Vec<(u64, &[Op])>> = BTreeMap::new();
+        for (pc, pair) in batch.iter().zip(pairs.iter()) {
+            by_shard.entry(pc.shard).or_default().push(*pair);
+        }
+        // Persist shard groups in parallel: each shard backend
+        // serializes its own redb writer, and groups touch disjoint files,
+        // so parallel persistence keeps the same contract — one durable
+        // acknowledgement per group, first error (in shard order) wins.
+        // The single-shard path stays exactly sequential.
+        if by_shard.len() == 1 {
+            let (shard, shard_pairs) = by_shard.into_iter().next().unwrap();
+            if let Some(backend) = self.backend(shard) {
+                backend
+                    .apply_many(&shard_pairs)
+                    .map_err(StorageError::Durability)?;
+            }
+            return Ok(());
+        }
+        let backends: Vec<(usize, Option<Arc<dyn StorageBackend>>, Vec<(u64, &[Op])>)> = by_shard
+            .into_iter()
+            .map(|(shard, shard_pairs)| (shard, self.backend(shard), shard_pairs))

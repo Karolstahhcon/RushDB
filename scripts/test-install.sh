@@ -36,3 +36,23 @@ for _ in $(seq 1 50); do
 done
 
 # The script each container runs. $1 = served base URL, $2 = expected outcome.
+read -r -d '' PROBE <<'EOF' || true
+set -eu
+base="$1"
+expect="$2"
+# Minimal images lack what every real host has; install curl and tar.
+if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq curl ca-certificates tar gzip >/dev/null
+  elif command -v apk >/dev/null; then apk add -q curl tar
+  elif command -v dnf >/dev/null; then dnf install -y -q tar gzip >/dev/null
+  elif command -v yum >/dev/null; then yum install -y -q curl tar gzip >/dev/null
+  fi
+fi
+export HOME=/root SHELL=/bin/bash
+if [ "$expect" != "ok" ]; then
+  if out="$(curl -fsSL "$base/install.sh" | RUSHDB_DOWNLOAD_URL="$base" sh 2>&1)"; then
+    echo "expected the installer to refuse this system, but it succeeded"; exit 1
+  fi
+  echo "$out" | grep -q "$expect" || { echo "unexpected refusal: $out"; exit 1; }
+  echo "refused as expected: $out"
+  exit 0
