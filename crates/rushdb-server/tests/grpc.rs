@@ -165,3 +165,59 @@ async fn grpc_carries_native_snapshot_cursor_envelopes() {
     )
     .await
     .unwrap();
+    let first: serde_json::Value = serde_json::from_slice(&first.json).unwrap();
+    assert_eq!(first["response"]["records"].as_array().unwrap().len(), 2);
+    let cursor = first["response"]["cursorId"].as_str().unwrap().to_string();
+
+    let next = execute(&mut grpc, "grpc-token", serde_json::json!({
+        "protocolVersion": 1,
+        "operation": { "kind": "query", "query": { "kind": "cursor", "cursorId": cursor, "limit": 2 }}
+    })).await.unwrap();
+    let next: serde_json::Value = serde_json::from_slice(&next.json).unwrap();
+    assert_eq!(next["response"]["total"], 3);
+    assert_eq!(next["response"]["records"].as_array().unwrap().len(), 1);
+    assert!(next["response"]["cursorId"].is_null());
+}
+
+#[tokio::test]
+async fn grpc_requires_valid_bearer_token() {
+    let port = boot("grpc-token", LanguageSet::default());
+    let mut grpc = connect(port, "wrong").await;
+    let err = execute(&mut grpc, "wrong", query_envelope("Artist"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn grpc_invalid_envelope_is_invalid_argument() {
+    let port = boot("grpc-token", LanguageSet::default());
+    let mut grpc = connect(port, "grpc-token").await;
+    let mut req = Request::new(BytesEnvelope {
+        json: b"not json".to_vec(),
+    });
+    req.metadata_mut()
+        .insert("authorization", "Bearer grpc-token".parse().unwrap());
+    let codec = ProstCodec::<BytesEnvelope, BytesEnvelope>::default();
+    grpc.ready().await.unwrap();
+    let path = tonic::codegen::http::uri::PathAndQuery::from_static("/rushdb.v1.Database/Execute");
+    let err = grpc.unary(req, path, codec).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn grpc_disabled_language_is_invalid_argument() {
+    // No statement languages enabled: a SQL statement must be refused with
+    // LanguageDisabled (mapped to InvalidArgument).
+    let port = boot("grpc-token", LanguageSet::NONE);
+    let mut grpc = connect(port, "grpc-token").await;
+    let envelope = serde_json::json!({
+        "protocolVersion": 1,
+        "operation": {
+            "kind": "query",
+            "query": { "kind": "statement", "language": "sql", "statement": "SELECT 1" }
+        }
+    });
+    let err = execute(&mut grpc, "grpc-token", envelope)
+        .await
+        .unwrap_err();

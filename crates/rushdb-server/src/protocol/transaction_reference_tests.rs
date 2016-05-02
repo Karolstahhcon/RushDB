@@ -116,3 +116,62 @@ fn update_delete_and_link_committed_and_staged_records_by_id() {
     .unwrap();
     stage(
         &node,
+        &tx,
+        &serde_json::json!({"kind": "deleteRecord", "record": {"id": alan}}),
+    )
+    .unwrap();
+    let read = stage(
+        &node,
+        &tx,
+        &serde_json::json!({"kind": "getRecord", "record": {"id": ada}}),
+    )
+    .unwrap();
+    assert_eq!(read["record"]["properties"]["name"], "Ada Lovelace");
+
+    // Nothing is visible before commit.
+    assert_eq!(record(&node, &ada).unwrap()["properties"]["name"], "Ada");
+    assert!(record(&node, &alan).is_some());
+    assert_eq!(links(&node, "KNOWS"), 0);
+
+    let outcome = commit(&node, &tx);
+    assert_eq!(outcome["status"], "committed", "{outcome}");
+    assert_eq!(
+        record(&node, &ada).unwrap()["properties"]["name"],
+        "Ada Lovelace"
+    );
+    assert_eq!(
+        record(&node, STAGED).unwrap()["properties"]["name"],
+        "Grace"
+    );
+    assert!(record(&node, &alan).is_none());
+    assert_eq!(links(&node, "KNOWS"), 1);
+}
+
+#[test]
+fn unknown_record_id_fails_the_stage_and_leaves_the_transaction_usable() {
+    let node = Node::bootstrap(&mut super::tests::config(false)).unwrap();
+    let ada = committed_person(&node, "Ada");
+    let tx = begin(&node);
+
+    let missing = stage(
+        &node,
+        &tx,
+        &serde_json::json!({"kind": "updateRecord",
+            "record": {"id": "00000000-0000-0000-0000-0000000000ff"},
+            "properties": {"name": "nobody"}}),
+    )
+    .unwrap_err();
+    assert!(
+        missing
+            .message
+            .contains("record not found: 00000000-0000-0000-0000-0000000000ff"),
+        "{}",
+        missing.message
+    );
+
+    stage(
+        &node,
+        &tx,
+        &serde_json::json!({"kind": "updateRecord", "record": {"id": ada},
+            "properties": {"name": "Ada Lovelace"}}),
+    )
