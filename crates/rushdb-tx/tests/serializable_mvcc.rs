@@ -57,3 +57,62 @@ fn snapshot_time_travel_reads_older_state() {
     .unwrap()
     .unwrap();
     assert_eq!(new_json.get("v"), Some(&json!("v2")));
+}
+
+#[test]
+fn write_skew_flow_placeholder_removed() {
+    // covered precisely by serializable_conflict_errors_* below
+}
+#[test]
+fn serializable_range_overlap_aborts() {
+    let store = Arc::new(Store::new_in_memory());
+    let tenant = tenant();
+    let lmpg = Lmpg::new(store.clone(), tenant);
+    let _r = lmpg.create_record("K", None, vec![]).unwrap();
+    let snap = lmpg.store.committed_version();
+
+    // concurrent interloper publishes into the same label domain FIRST
+    let _interloper = store
+        .commit_for_tenant(&tenant, Uuid::now_v7(), |_ci, txn| {
+            let ordinal = counter_next(txn, tenant, "record");
+            Ok((
+                CommitBatch {
+                    command_version: COMMAND_VERSION,
+                    tenant,
+                    transaction_id: String::new(),
+                    commit_key: Uuid::nil(),
+                    start_index: 0,
+                    isolation: IsolationMode::Snapshot,
+                    preconditions: vec![],
+                    mutations: vec![Mutation::CreateRecordHeader {
+                        record_id: [7u8; 16],
+                        ordinal,
+                        label: "K".into(),
+                    }],
+                },
+                (),
+            ))
+        })
+        .expect("interloper");
+
+    // competing tx tracks the whole K label domain from the older snapshot
+    let mut deps = DependencySet::default();
+    let (start_key, end_key) =
+        rushdb_types::keys::prefix_range(&rushdb_types::keys::label_member_prefix(tenant, "K"));
+    deps.record(start_key, end_key);
+
+    let outcome = store.commit_serializable(Uuid::now_v7(), snap - 1, deps, |_| {
+        Ok((empty_batch_now(), ()))
+    });
+
+    match outcome.expect("storage") {
+        CommitOutcome::Conflicted(m) => assert!(m.contains("serializable_conflict")),
+        other @ CommitOutcome::Committed { .. } => {
+            panic!("expected serializable conflict, got {other:?}")
+        }
+    }
+}
+
+#[test]
+fn disjoint_serializable_commits_pass() {
+    let store = Arc::new(Store::new_in_memory());
