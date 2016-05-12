@@ -32,3 +32,14 @@ impl MutationBudget {
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes.checked_mul(4)?)
+                    .filter(|next| *next <= self.limit)
+            })
+            .is_ok();
+        if !accepted {
+            self.exceeded.store(true, Ordering::Release);
+        }
+        accepted
+    }
+
+    pub(crate) fn check(&self) -> Result<(), LanguageError> {
+        if self.exceeded.load(Ordering::Acquire) {
