@@ -186,3 +186,191 @@ fn upsert_nested_linking_reuses_child_and_relinks_new_parent() {
 
     assert_eq!(label_count(&lmpg, "Company"), 2, "new parent created");
     assert_eq!(
+        label_count(&lmpg, "department"),
+        1,
+        "child reused, not duplicated"
+    );
+
+    // both companies link to the SAME department
+    let snap = lmpg.store.read_view().unwrap();
+    let companies = try_access::label_members(&snap, lmpg.tenant, "Company").unwrap();
+    let mut linked_targets: Vec<u64> = Vec::new();
+    for ord in companies {
+        for (_, tgt, _) in
+            try_access::adj_out(&snap, lmpg.tenant, ord, Some(RUSHDB_RELATION_DEFAULT)).unwrap()
+        {
+            linked_targets.push(tgt);
+        }
+    }
+    assert_eq!(linked_targets.len(), 2);
+    assert_eq!(
+        linked_targets[0], linked_targets[1],
+        "same child linked to both parents"
+    );
+
+    // the child draft from payload B remapped to the persisted child
+    let child_draft = plan_b
+        .records
+        .iter()
+        .find(|r| r.label == "department")
+        .unwrap();
+    let mapped = idmap_b
+        .iter()
+        .find(|m| m.draft_id == child_draft.draft_id)
+        .unwrap();
+    let child_snap = lmpg.store.read_view().unwrap();
+    let existing = try_access::record_by_id(
+        &child_snap,
+        lmpg.tenant,
+        &rushdb_types::ids::RecordId(mapped.persisted_id),
+    )
+    .unwrap();
+    let child_records = try_access::label_members(&child_snap, lmpg.tenant, "department").unwrap();
+    let existing = existing.unwrap();
+    assert!(child_records.contains(&existing.ordinal));
+    let _ = RecordRef {
+        record_id: mapped.persisted_id,
+        ordinal: existing.ordinal,
+    };
+}
+
+#[test]
+fn merge_by_keys_match_existing_within_label() {
+    let lmpg = setup();
+    // first import: company keyed by name
+    let plan = serialize_bfs(
+        &json!({ "name": "Acme", "rating": 1 }),
+        "Company",
+        &ImportOptions::default(),
+    );
+    import_bfs(&lmpg, &plan, &ImportOptions::default()).unwrap();
+    assert_eq!(label_count(&lmpg, "Company"), 1);
+
+    // re-import same name with a new field: mergeBy name -> update existing
+    let opts = ImportOptions {
+        merge_by: Some(vec!["name".to_string()]),
+        ..Default::default()
+    };
+    let plan2 = serialize_bfs(
+        &json!({ "name": "Acme", "rating": 5, "ceo": "Ada" }),
+        "Company",
+        &ImportOptions::default(),
+    );
+    import_bfs(&lmpg, &plan2, &opts).unwrap();
+    assert_eq!(
+        label_count(&lmpg, "Company"),
+        1,
+        "matched existing, no duplicate"
+    );
+
+    let snap = lmpg.store.read_view().unwrap();
+    let ord = try_access::label_members(&snap, lmpg.tenant, "Company").unwrap()[0];
+    let rec = rushdb_lmpg::reconstruct::reconstruct_record(&snap, lmpg.tenant, ord)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.get("ceo"), Some(&json!("Ada")), "new field appended");
+}
+
+#[test]
+fn vectors_extracted_as_data_drafts() {
+    let plan = serialize_bfs(
+        &json!({
+            "title": "ticket",
+            "$vectors": [
+                { "propertyName": "embedding", "vector": [0.1, 0.2], "similarityFunction": "cosine" }
+            ]
+        }),
+        "Ticket",
+        &ImportOptions::default(),
+    );
+    // the record exists with title; $vectors is NOT stored as a property
+    assert_eq!(plan.records.len(), 1);
+    assert!(plan.records[0]
+        .properties
+        .iter()
+        .all(|(k, _)| k != "$vectors"));
+    assert_eq!(plan.vector_drafts.len(), 1);
+    assert_eq!(plan.vector_drafts[0].entries.len(), 1);
+    assert_eq!(plan.vector_drafts[0].entries[0].vector, vec![0.1, 0.2]);
+    assert_eq!(
+        rushdb_lmpg::import::external_space_alias("Ticket", "embedding", "cosine", 2),
+        "emb__Ticket__embedding__cosine__2"
+    );
+}
+
+/// Product parity: mixed-type arrays coerce to string arrays instead of
+/// failing (reference `isInconsistentArray ? value.map(String)`).
+#[test]
+fn mixed_type_arrays_coerce_to_strings() {
+    let lmpg = setup();
+    let opts = ImportOptions::default();
+
+    let plan = serialize_bfs(
+        &json!({
+            "name": "hero",
+            "ally_faction_ids": ["f1", 42, null],
+            "tags": ["a", "b"]
+        }),
+        "Hero",
+        &opts,
+    );
+    assert_eq!(plan.records.len(), 1);
+    import_bfs(&lmpg, &plan, &opts).unwrap();
+
+    let snap = lmpg.store.read_view().unwrap();
+    let ord = try_access::label_members(&snap, lmpg.tenant, "Hero").unwrap()[0];
+    let rec = rushdb_lmpg::reconstruct::reconstruct_record(&snap, lmpg.tenant, ord)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rec.get("ally_faction_ids"),
+        Some(&json!(["f1", "42", "null"])),
+        "mixed array coerced to strings: {rec:?}"
+    );
+    assert_eq!(
+        rec.get("tags"),
+        Some(&json!(["a", "b"])),
+        "homogeneous array untouched"
+    );
+
+    // a numeric array stays numeric
+    let plan2 = serialize_bfs(&json!({ "ids": [1, 2, 3] }), "Hero", &opts);
+    import_bfs(&lmpg, &plan2, &opts).unwrap();
+    let snap = lmpg.store.read_view().unwrap();
+    let ords = try_access::label_members(&snap, lmpg.tenant, "Hero").unwrap();
+    let rec = rushdb_lmpg::reconstruct::reconstruct_record(&snap, lmpg.tenant, ords[1])
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.get("ids"), Some(&json!([1, 2, 3])));
+}
+
+/// Empty arrays normalize to explicit null: the field reconstructs as `null`
+/// (a live null occurrence) instead of a string-typed `[]` guess that would
+/// leave zero occurrences and a phantom definition behind.
+#[test]
+fn empty_arrays_do_not_error() {
+    let lmpg = setup();
+    let opts = ImportOptions::default();
+    let plan = serialize_bfs(
+        &json!({ "ally_faction_ids": [], "name": "solo" }),
+        "Hero",
+        &opts,
+    );
+    import_bfs(&lmpg, &plan, &opts).unwrap();
+    let snap = lmpg.store.read_view().unwrap();
+    let ord = try_access::label_members(&snap, lmpg.tenant, "Hero").unwrap()[0];
+    let rec = rushdb_lmpg::reconstruct::reconstruct_record(&snap, lmpg.tenant, ord)
+        .unwrap()
+        .unwrap();
+    // the field reconstructs as a genuine empty array (prod preserves `[]`;
+    // the reference stores `property.value = []`), not explicit null
+    assert_eq!(
+        rec.get("ally_faction_ids"),
+        Some(&serde_json::Value::Array(vec![])),
+        "{rec:?}"
+    );
+    // the query path (reconstruct over a ReadView) must agree
+    let view = lmpg.store.read_view().unwrap();
+    let qrec = rushdb_lmpg::reconstruct::reconstruct_record(&view, lmpg.tenant, ord)
+        .unwrap()
+        .unwrap();
