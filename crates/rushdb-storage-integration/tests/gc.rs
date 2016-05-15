@@ -31,37 +31,3 @@ fn gc_reclaims_superseded_versions_keeps_current_state() {
             rushdb_lmpg::RecordRef {
                 ordinal: rec.ordinal,
                 record_id: rec.record_id,
-            },
-            vec![("v".into(), FieldChange::Set(json!(i)))],
-        )
-        .unwrap();
-    }
-    let after_updates = store.committed_version();
-    assert!(after_updates - before_updates >= 50);
-
-    // current state is v=50
-    let snap = lmpg.store.read_view().unwrap();
-    let rebuilt = rushdb_lmpg::reconstruct::reconstruct_record(&snap, lmpg.tenant, rec.ordinal)
-        .unwrap()
-        .unwrap();
-    assert_eq!(rebuilt.get("v"), Some(&json!(50)));
-
-    // time-travel read just before GC sees an old version
-    let key = rushdb_types::keys::record_id_key(lmpg.tenant, &rec.record_id);
-    // after many updates, reading at a mid watermark returns the version at
-    // that point (versions are preserved before GC)
-    let mid = before_updates + 10;
-    let mid_val = store.read_at(mid).unwrap().get(&key).unwrap();
-    assert!(
-        mid_val.is_some(),
-        "historical header must remain readable before GC"
-    );
-
-    // GC at the current commit: every superseded version <= after_updates is
-    // reclaimable (the snapshot view is materialized in memory/checkpoint).
-    let watermark = after_updates;
-    let reclaimed = store.gc(watermark).unwrap();
-    assert!(
-        reclaimed > 0,
-        "50 updates must produce reclaimable version entries"
-    );
