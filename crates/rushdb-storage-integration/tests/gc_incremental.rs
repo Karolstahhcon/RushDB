@@ -182,3 +182,65 @@ fn gc_with_no_expired_versions_completes_without_walking_history() {
         "no expired version => the sweep is a no-op"
     );
 
+    // The same store still reclaims once the watermark covers the history, in
+    // several bounded batches.
+    let watermark = store.committed_version();
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut batches = 0usize;
+    while let Some(k) = store.retire_before_batch(watermark, cursor, 4).unwrap() {
+        cursor = Some(k);
+        batches += 1;
+        assert!(batches < 100, "bounded sweep must terminate");
+    }
+    assert!(batches >= 3, "expected bounded batches, got {batches}");
+    assert_eq!(store.gc_watermark(), watermark);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redb_gc_reclaims_history_and_blocks_reads_below_the_floor() {
+    let dir = std::env::temp_dir().join(format!(
+        "rushdb-gc-redb-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (store, lmpg) = seed_history(&dir);
+    let old_ci = store.committed_version();
+    // A pinned read at `old_ci` must still resolve before GC.
+    let pinned = store.read_at(old_ci).unwrap();
+    drop(pinned);
+
+    let watermark = old_ci;
+    let mut cursor: Option<Vec<u8>> = None;
+    while let Some(k) = store.retire_before_batch(watermark, cursor, 8).unwrap() {
+        cursor = Some(k);
+    }
+    assert_eq!(store.gc_watermark(), watermark);
+    // The reclaimed floor blocks historical reads below it, and the current
+    // record is still reconstructible.
+    assert!(store.read_at(old_ci.saturating_sub(1)).is_err());
+    let view = store.read_view().unwrap();
+    assert!(
+        rushdb_lmpg::reconstruct::reconstruct_record(&view, lmpg.tenant, 0)
+            .unwrap()
+            .is_some(),
+        "current state survives history reclamation"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn long_history_chain_reads_and_reclaims_across_sealed_blocks() {
+    // P05 append-friendly segments: a hot key with > 2 * BLOCK_SIZE versions
+    // spans a head plus sealed blocks. Historical reads must resolve across the
+    // chain, and it must survive reopen and be fully reclaimed by GC.
+    let dir = std::env::temp_dir().join(format!(
+        "rushdb-gc-chain-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("rushdb.redb");
+    let rec = {
+        let store = Arc::new(Store::open(&db).unwrap());

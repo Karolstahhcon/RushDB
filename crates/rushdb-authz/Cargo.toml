@@ -10,9 +10,3 @@ repository.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
-
-[dependencies]
-rushdb-types = { workspace = true }
-rushdb-storage = { workspace = true }
-rushdb-lmpg = { workspace = true }
-rushdb-query = { workspace = true }
