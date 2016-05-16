@@ -96,3 +96,101 @@ pub(super) fn parse(sql: &str) -> Option<Command> {
         "SET" => {
             let rest = strip_word(rest, "SESSION").unwrap_or(rest);
             let (name, value) = rest
+                .split_once('=')
+                .or_else(|| split_word(rest, "TO"))
+                .map(|(name, value)| (name.trim(), value.trim()))?;
+            let setting = Setting::of(name)?;
+            let value = unquote(value);
+            Some(Command::Set(
+                setting,
+                (!value.eq_ignore_ascii_case("default")).then(|| value.to_owned()),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Apply `command` to the session; `SHOW` answers its one row.
+pub(super) fn apply(
+    metadata: &mut HashMap<String, String>,
+    command: Command,
+) -> PgWireResult<Option<Vec<Map<String, Value>>>> {
+    match command {
+        Command::Set(setting, Some(value)) => {
+            let value = setting
+                .normalize(&value)
+                .map_err(|reason| invalid(setting, &value, &reason))?;
+            metadata.insert(setting.name().to_owned(), value);
+        }
+        Command::Set(setting, None) => {
+            metadata.remove(setting.name());
+        }
+        Command::ResetAll => {
+            for setting in SETTINGS {
+                metadata.remove(setting.name());
+            }
+        }
+        Command::Show(setting) => {
+            let value = metadata
+                .get(setting.name())
+                .map_or_else(|| setting.unset().to_owned(), Clone::clone);
+            let mut row = Map::new();
+            row.insert(setting.name().to_owned(), Value::String(value));
+            return Ok(Some(vec![row]));
+        }
+    }
+    Ok(None)
+}
+
+/// The bounds a session's settings put on its statements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SessionLimits {
+    /// `statement_timeout` in milliseconds (`None` = unset or `0`).
+    pub(super) timeout_ms: Option<u64>,
+    pub(super) query_memory_max_bytes: Option<u64>,
+    pub(super) unindexed_walk_max_owners: Option<u64>,
+}
+
+/// The session's bounds. A startup parameter is read here, so a malformed
+/// one fails each statement with the reason.
+pub(super) fn limits(metadata: &HashMap<String, String>) -> PgWireResult<SessionLimits> {
+    let read = |setting: Setting| -> PgWireResult<Option<String>> {
+        metadata
+            .get(setting.name())
+            .map(|value| {
+                setting
+                    .normalize(value)
+                    .map_err(|reason| invalid(setting, value, &reason))
+            })
+            .transpose()
+    };
+    let timeout_ms = read(Setting::StatementTimeout)?
+        .and_then(|value| duration_ms(&value).ok())
+        .filter(|ms| *ms != 0);
+    let query_memory_max_bytes = read(Setting::WorkMem)?.and_then(|value| bytes(&value).ok());
+    let disallow = read(Setting::DisallowFullTableScans)?.is_some_and(|value| value == "on");
+    let rows = read(Setting::LargeFullScanRows)?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    Ok(SessionLimits {
+        timeout_ms,
+        query_memory_max_bytes,
+        unindexed_walk_max_owners: disallow.then_some(rows),
+    })
+}
+
+fn invalid(setting: Setting, value: &str, reason: &str) -> pgwire::error::PgWireError {
+    err(
+        "22023",
+        format!(
+            "invalid value for parameter \"{}\": \"{value}\" ({reason})",
+            setting.name()
+        ),
+    )
+}
+
+/// Milliseconds: a bare number is milliseconds, as in PostgreSQL; units
+/// `us`, `ms`, `s`, `min`, `h`, `d`.
+fn duration_ms(value: &str) -> Result<u64, String> {
+    let (number, unit) = number_and_unit(value)?;
+    let scale = match unit.to_ascii_lowercase().as_str() {
