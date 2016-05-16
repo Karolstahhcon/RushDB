@@ -107,3 +107,39 @@ fn restore_relationship(lmpg: &Lmpg, v: &serde_json::Value) -> Result<(), String
         &rushdb_types::ids::RecordId(tgt),
     )
     .map_err(|e| e.to_string())?
+    .ok_or_else(|| "restore: target record not found".to_string())?;
+    // P16 resume idempotency: preserve the source relationship identity so
+    // parallel edges are distinct and retries skip exactly the same edge.
+    if rushdb_lmpg::reader::try_access::relationship_by_id(
+        &snap,
+        lmpg.tenant,
+        &rushdb_types::ids::RelationshipId(relationship_id),
+    )
+    .map_err(|e| e.to_string())?
+    .is_none()
+    {
+        lmpg.create_relationship_with_id(
+            &rel_type,
+            rushdb_lmpg::RecordRef {
+                record_id: src,
+                ordinal: s_hdr.ordinal,
+            },
+            rushdb_lmpg::RecordRef {
+                record_id: tgt,
+                ordinal: t_hdr.ordinal,
+            },
+            relationship_id,
+            fields,
+        )
+        .map_err(|e| e.to_reason())?;
+    }
+    Ok(())
+}
+
+/// Restore a JSONL backup into a live engine. Records upsert by `__id`
+/// (preserving public identity), relationships are linked by endpoint ids,
+/// relationship properties are written onto the new edges. Returns the number
+/// of records and relationships materialized.
+///
+/// # Errors
+///
