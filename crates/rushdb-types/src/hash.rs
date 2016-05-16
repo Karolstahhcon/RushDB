@@ -10,15 +10,3 @@ fn prefix64(bytes: &[u8; 32]) -> u64 {
 /// Stable 64-bit digest of arbitrary bytes, independent of process state.
 #[must_use]
 pub fn stable_hash64(bytes: &[u8]) -> u64 {
-    prefix64(blake3::hash(bytes).as_bytes())
-}
-
-/// Domain-separated 64-bit hash of a type tag and payload.
-#[must_use]
-pub fn hash_domain(domain: &[u8], ty: u8, payload: &[u8]) -> u64 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(domain);
-    hasher.update(&[ty]);
-    hasher.update(payload);
-    prefix64(hasher.finalize().as_bytes())
-}

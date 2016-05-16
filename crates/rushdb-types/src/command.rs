@@ -215,3 +215,75 @@ pub enum Mutation {
         info: EmbeddingSpaceInfo,
         /// Whether this creates a new space.
         new: bool,
+    },
+    /// Insert or update an embedding binding.
+    UpsertEmbeddingBinding {
+        /// Binding to persist.
+        binding: EmbeddingBinding,
+        /// Vector payload to store, if any.
+        vector: Option<Vec<f32>>,
+        /// When set, statuses are recomputed against this expected live hash.
+        expect_live_hash: bool,
+    },
+    /// v3: resolve and remove canonical binary vector keys at apply time.
+    /// The alias must still identify this space; counters and the immutable
+    /// space definition remain so a recreated alias receives a fresh space ID.
+    ClearEmbeddingSpace {
+        /// Alias of the space to clear.
+        alias: String,
+        /// Dense id of the space.
+        space_id: u64,
+    },
+    /// Replicated meta bookkeeping (projection watermarks and similar);
+    /// value semantics are opaque to the state machine.
+    SetMetaValue {
+        /// Logical meta key.
+        key: String,
+        /// New integer value.
+        value: u64,
+    },
+    /// Replicated opaque blob (policies, configuration); replayed verbatim
+    /// by the deterministic state machine like any other mutation.
+    SetMetaBlob {
+        /// Logical meta key.
+        key: String,
+        /// New blob value.
+        value: Vec<u8>,
+    },
+    /// Deterministic deletion of a replicated meta blob (index registry rows).
+    DeleteMetaBlob {
+        /// Logical meta key.
+        key: String,
+    },
+    /// Delete one tenant-scoped raw key during an explicit maintenance repair.
+    /// The maintenance caller must validate the key belongs to its tenant.
+    DeleteRawKey {
+        /// Canonical tenant-scoped key to remove.
+        key: Vec<u8>,
+    },
+    /// Put one tenant-scoped raw key during an explicit maintenance fixture
+    /// or rebuild operation.
+    PutRawKey {
+        /// Canonical tenant-scoped key to write.
+        key: Vec<u8>,
+        /// Value bytes to store.
+        value: Vec<u8>,
+    },
+    /// One bounded, resumable purge step: delete up to `max_keys` of the
+    /// smallest remaining purgeable keys (tenant keyspace excluding the
+    /// security subrange, then vector/ANN metadata), without retaining MVCC
+    /// history for erased keys. The driver loops commits until nothing
+    /// remains; expansion is a pure function of (state, batch), so replay
+    /// reproduces the same sequence.
+    PurgeTenantChunk {
+        /// Maximum number of keys this step may delete.
+        max_keys: u64,
+    },
+    /// Register a tenant scope in the directory: assign the next
+    /// ordinal unless the scope already has an active one. Expansion reads
+    /// and bumps the directory sequence, so replay reproduces the ordinal.
+    RegisterTenant {
+        /// SHA-256 digest of the scope value (the scope string is never
+        /// stored).
+        scope: crate::ids::TenantScope,
+    },
