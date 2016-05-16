@@ -191,3 +191,197 @@ fn header_rows(
     typed: impl Fn(String) -> Option<Value>,
 ) -> Result<Vec<Value>, String> {
     for row in &rows {
+        if row.len() != fields.len() {
+            let kind = if row.len() < fields.len() {
+                "Too few"
+            } else {
+                "Too many"
+            };
+            return Err(format!(
+                "{kind} fields: expected {} fields but parsed {}",
+                fields.len(),
+                row.len()
+            ));
+        }
+    }
+    let names = property_names(fields);
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let mut object = Map::new();
+            for ((field, name), value) in fields.iter().zip(&names).zip(row) {
+                // A blank header cell names no property; an empty cell typed
+                // to null is left out.
+                if field.is_empty() {
+                    continue;
+                }
+                if let Some(value) = typed(value) {
+                    object.insert(name.clone(), value);
+                }
+            }
+            Value::Object(object)
+        })
+        .collect())
+}
+
+fn single_char(value: &str, name: &str) -> Result<char, String> {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c != '\r' && c != '\n' => Ok(c),
+        _ => Err(format!(
+            "{name} must be a single character other than a line break"
+        )),
+    }
+}
+
+/// JavaScript's `String.prototype.trim`.
+fn js_trim(value: &str) -> &str {
+    value.trim_matches(|c: char| c.is_whitespace() || c == BYTE_ORDER_MARK)
+}
+
+/// Papa Parse's line-ending guess: `\n` unless `\r` comes first, then `\r\n`
+/// when at least half of the `\r`-separated pieces start with `\n`. Quoted
+/// text (from the first megabyte) is ignored.
+fn guess_line_endings(text: &str, quote: char) -> &'static str {
+    let mut end = text.len().min(1024 * 1024);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut unquoted = String::with_capacity(end);
+    let mut rest = &text[..end];
+    while let Some(open) = rest.find(quote) {
+        let after = &rest[open + quote.len_utf8()..];
+        match after.find(quote) {
+            Some(close) => {
+                unquoted.push_str(&rest[..open]);
+                rest = &after[close + quote.len_utf8()..];
+            }
+            None => break,
+        }
+    }
+    unquoted.push_str(rest);
+
+    let r: Vec<&str> = unquoted.split('\r').collect();
+    let n: Vec<&str> = unquoted.split('\n').collect();
+    let n_appears_first = n.len() > 1 && n[0].len() < r[0].len();
+    if r.len() == 1 || n_appears_first {
+        return "\n";
+    }
+    let with_n = r.iter().filter(|piece| piece.starts_with('\n')).count();
+    if with_n * 2 >= r.len() {
+        "\r\n"
+    } else {
+        "\r"
+    }
+}
+
+/// Papa Parse renames repeated header names on the raw first line (split on
+/// the delimiter, quotes not considered): the second `a` becomes `a_1`, and a
+/// name already taken gets `_<count>` appended until it is free.
+fn rename_duplicate_headers(text: &str, delimiter: &str, newline: &str) -> Option<String> {
+    let first_line = text.split(newline).next().unwrap_or("");
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut duplicated = false;
+    for header in first_line.split(delimiter) {
+        let count = counts.get(header).copied().unwrap_or(0);
+        let mut name = header.to_string();
+        if count > 0 {
+            duplicated = true;
+            name = format!("{header}_{count}");
+        }
+        counts.insert(header, count + 1);
+        while names.contains(&name) {
+            name = format!("{name}_{count}");
+        }
+        names.push(name);
+    }
+    if !duplicated {
+        return None;
+    }
+    let rest = &text[first_line.len()..];
+    Some(format!("{}{rest}", names.join(delimiter)))
+}
+
+/// The platform's header clean-up: null bytes removed, trimmed, a blank name
+/// becomes `column_<n>`, whitespace runs become `_`, a name not starting with
+/// an ASCII letter or `_` gets a `_` prefix, and a repeated name gets `_2`,
+/// `_3`, ...
+fn property_names(fields: &[String]) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            let without_nul: String = raw.chars().filter(|c| *c != '\0').collect();
+            let mut name = js_trim(&without_nul).to_string();
+            if name.is_empty() {
+                name = format!("column_{}", index + 1);
+            }
+            name = collapse_whitespace(&name);
+            if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                name = format!("_{name}");
+            }
+            if seen.contains(&name) {
+                let base = name.clone();
+                let mut counter = 2;
+                while seen.contains(&format!("{base}_{counter}")) {
+                    counter += 1;
+                }
+                name = format!("{base}_{counter}");
+            }
+            seen.insert(name.clone());
+            name
+        })
+        .collect()
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_space = false;
+    for c in value.chars() {
+        if c.is_whitespace() || c == BYTE_ORDER_MARK {
+            if !in_space {
+                out.push('_');
+            }
+            in_space = true;
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
+}
+
+/// Papa Parse's `dynamicTyping`: `true`/`TRUE`/`false`/`FALSE`, numbers below
+/// 2^53 in magnitude, ISO datetimes with a time zone (normalised to UTC with
+/// milliseconds; an invalid date is a JSON null that is kept), and the empty
+/// string as `None` (Papa Parse's `null`). Everything else stays text.
+fn dynamic_value(value: String) -> Option<Value> {
+    match value.as_str() {
+        "true" | "TRUE" => return Some(Value::Bool(true)),
+        "false" | "FALSE" => return Some(Value::Bool(false)),
+        "" => return None,
+        _ => {}
+    }
+    if is_js_float(&value) {
+        if let Ok(number) = js_trim(&value).parse::<f64>() {
+            if number > -MAX_DYNAMIC_FLOAT && number < MAX_DYNAMIC_FLOAT {
+                return Some(js_number_value(number));
+            }
+        }
+    }
+    match iso_datetime(&value) {
+        IsoDatetime::Instant(instant) => return Some(Value::String(instant)),
+        IsoDatetime::Invalid => return Some(Value::Null),
+        IsoDatetime::NotIso => {}
+    }
+    Some(Value::String(value))
+}
+
+/// A JS number as JSON: integral values as integers (so `-0` is `0`).
+fn js_number_value(number: f64) -> Value {
+    if number.fract() == 0.0 && number.abs() < MAX_DYNAMIC_FLOAT {
+        #[allow(clippy::cast_possible_truncation)]
+        return Value::from(number as i64);
+    }

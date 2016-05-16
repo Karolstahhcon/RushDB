@@ -136,3 +136,49 @@ impl<'a, R: TryRead> AuthorizedView<'a, R> {
             .iter()
             .find(|(key, _)| normalize_name(key) == normalize_name(&label))
             .map(|(_, fields)| fields.clone())
+        {
+            obj.retain(|key, _| {
+                rushdb_types::value::is_reserved_name(key)
+                    || masked
+                        .iter()
+                        .any(|field| normalize_name(field) == normalize_name(key))
+            });
+        }
+        Some(record)
+    }
+
+    /// Applies this view's relationship-type deny-list to an already-
+    /// reconstructed relationship. `None` means the type is denied.
+    #[must_use]
+    pub fn mask_relationship(&self, relationship: Json) -> Option<Json> {
+        let rel_type = relationship
+            .as_object()?
+            .get(rushdb_types::value::TYPE_FIELD)?
+            .as_str()?;
+        if self.rel_type_allowed(rel_type) {
+            Some(relationship)
+        } else {
+            None
+        }
+    }
+
+    /// Reconstructs a record, applying the label allow-list and property
+    /// mask. `Ok(None)` covers both "no such record" and "denied by policy."
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if a read fails or stored state is corrupt.
+    pub fn reconstruct_record(&self, ordinal: u64) -> Result<Option<Json>, StorageError> {
+        let record = reconstruct::reconstruct_record(self.snap, self.tenant, ordinal)?;
+        Ok(record.and_then(|r| self.mask_record(r)))
+    }
+
+    /// Reconstructs a relationship, applying the relationship-type
+    /// deny-list. `Ok(None)` covers both "no such relationship" and "denied
+    /// by policy."
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if a read fails or stored state is corrupt.
+    pub fn reconstruct_relationship(&self, ordinal: u64) -> Result<Option<Json>, StorageError> {
+        let relationship = reconstruct::reconstruct_relationship(self.snap, self.tenant, ordinal)?;
+        Ok(relationship.and_then(|r| self.mask_relationship(r)))
+    }
