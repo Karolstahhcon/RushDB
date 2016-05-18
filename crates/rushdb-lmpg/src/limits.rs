@@ -23,3 +23,29 @@ pub struct RequestLimits {
     /// When the request's time is up.
     pub deadline: Option<Instant>,
 }
+
+/// The bounds in force: the server's ceilings tightened by the request's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueryLimits {
+    unindexed_walk_max_owners: Option<u64>,
+    query_memory_max_bytes: Option<u64>,
+    deadline: Option<Instant>,
+}
+
+impl QueryLimits {
+    /// The server's ceilings alone (`0` = none).
+    #[must_use]
+    pub fn of_server(config: &StorageResources) -> Self {
+        let set = |value: u64| (value != 0).then_some(value);
+        Self {
+            unindexed_walk_max_owners: set(config.unindexed_walk_max_owners),
+            query_memory_max_bytes: set(config.query_memory_max_bytes),
+            deadline: None,
+        }
+    }
+
+    /// These bounds tightened by a request's own.
+    #[must_use]
+    pub fn tightened(self, request: RequestLimits) -> Self {
+        Self {
+            unindexed_walk_max_owners: tighter(
