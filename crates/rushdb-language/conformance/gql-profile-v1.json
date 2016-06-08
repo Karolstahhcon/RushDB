@@ -20,25 +20,3 @@
   "deleteRelationship",
   "atomicStatementCommit"
  ],
- "excludedFeatures": [
-  "multipleLabelsPerRecord",
-  "statementLabelMutation",
-  "fullIsoGqlConformance",
-  "matchAfterWithPipeline",
-  "nextComposition",
-  "orderByInWith",
-  "shortestPath",
-  "patternPredicates",
-  "listAndPatternComprehensions",
-  "labelAlternation",
-  "createAfterWithUnwind",
-  "caseInPropertyMap"
- ],
- "sources": [
-  {
-   "kind": "standard",
-   "name": "ISO/IEC 39075:2024 Graph Query Language",
-   "url": "https://www.iso.org/standard/76120.html"
-  },
-  {
-   "kind": "public-workload-input",
