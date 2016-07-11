@@ -20,26 +20,3 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 DATA_DIR="$ROOT/data/vector-fixtures"
 mkdir -p "$DATA_DIR/dbpedia" "$DATA_DIR/sift1m"
 
-# ---- DBPedia-100K -----------------------------------------------------------
-DBPEDIA_REPO="Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-100K"
-DBPEDIA_URLS=(
-  "https://huggingface.co/api/datasets/$DBPEDIA_REPO/parquet/default/train/0.parquet"
-  "https://huggingface.co/api/datasets/$DBPEDIA_REPO/parquet/default/train/1.parquet"
-  "https://huggingface.co/api/datasets/$DBPEDIA_REPO/parquet/default/train/2.parquet"
-)
-
-# ---- SIFT1M ------------------------------------------------------------------
-SIFT_URL="https://ann-benchmarks.com/sift-128-euclidean.hdf5"
-
-echo "==> Fetching DBPedia-100K parquet (3 shards)..."
-for i in "${!DBPEDIA_URLS[@]}"; do
-  curl -L --fail --retry 3 -o "$DATA_DIR/dbpedia/train-$i.parquet" "${DBPEDIA_URLS[$i]}"
-done
-
-echo "==> Fetching SIFT1M hdf5..."
-curl -L --fail --retry 3 -o "$DATA_DIR/sift1m/sift-128-euclidean.hdf5" "$SIFT_URL"
-
-echo "==> Installing python deps in a venv..."
-python3 -m venv "$DATA_DIR/.venv"
-"$DATA_DIR/.venv/bin/pip" install --quiet --upgrade pip
-"$DATA_DIR/.venv/bin/pip" install --quiet pyarrow pandas h5py
