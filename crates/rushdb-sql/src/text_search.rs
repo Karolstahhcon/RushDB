@@ -34,39 +34,3 @@ const DEFAULT_LIMIT: usize = 10;
 /// Register `text_search` on `context`, searching `text` at `snapshot`.
 /// Without text indexes (`None`) the function exists but every call fails,
 /// so statements still plan the same way everywhere.
-pub(crate) fn install(
-    context: &SessionContext,
-    lmpg: &Lmpg,
-    snapshot: &Arc<ReadView>,
-    text: Option<&Arc<TextIndexes>>,
-) {
-    context.register_udtf(
-        "text_search",
-        Arc::new(TextSearchFunction {
-            text: text.cloned(),
-            tenant: lmpg.tenant,
-            snapshot: Arc::clone(snapshot),
-        }),
-    );
-}
-
-/// A `text_search` call that was invalid or whose search failed.
-#[derive(Debug)]
-pub(crate) struct TextSearchError(String);
-
-impl std::fmt::Display for TextSearchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for TextSearchError {}
-
-fn failed<T>(message: String) -> Result<T> {
-    Err(DataFusionError::External(Box::new(TextSearchError(
-        message,
-    ))))
-}
-
-struct TextSearchFunction {
-    text: Option<Arc<TextIndexes>>,
