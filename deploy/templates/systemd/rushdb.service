@@ -8,13 +8,3 @@ Type=simple
 User=rushdb
 Group=rushdb
 EnvironmentFile=/etc/rushdb/rushdb.env
-ExecStart=/usr/local/bin/rushdb serve
-Restart=on-failure
-RestartSec=5
-# Clean shutdown drains connections (up to 30 s), stops maintenance
-# (up to 30 s) and writes a final checkpoint; give it time.
-KillSignal=SIGTERM
-TimeoutStopSec=90
-LimitNOFILE=65536
-# Memory limits for the 8 GB VPS profile below; adjust to your host.
-MemoryHigh=3500M
