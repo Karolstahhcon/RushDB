@@ -7,13 +7,3 @@
 # /var/lib/rushdb, writes /etc/rushdb/rushdb.env with a random token, and runs
 # the server under systemd (deploy/templates/systemd/rushdb.service).
 #
-# The node listens on 127.0.0.1 only. Reach it through an SSH tunnel
-# (ssh -L 3000:127.0.0.1:3000 you@host) or put a TLS proxy in front; see
-# docs/manual/operations/security.md before binding a public address.
-package_update: true
-packages:
-  - ca-certificates
-  - curl
-  - openssl
-
-runcmd:
