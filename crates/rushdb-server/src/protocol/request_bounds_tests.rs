@@ -34,39 +34,3 @@ fn filtered_read() -> serde_json::Value {
 }
 
 fn sql_count() -> serde_json::Value {
-    serde_json::json!({"kind": "query", "query": {"kind": "statement", "language": "sql",
-        "statement": "SELECT count(*) AS c FROM \"user\" WHERE n = 1"}})
-}
-
-fn node_with_users(configure: impl FnOnce(&mut crate::ServerConfig)) -> Node {
-    let mut config = super::tests::config(false);
-    config.languages.sql = true;
-    configure(&mut config);
-    let node = Node::bootstrap(&mut config).unwrap();
-    for n in 0..5 {
-        execute(
-            &node,
-            RequestContext::default(),
-            &serde_json::json!({"kind": "mutate", "mutation": {"kind": "putRecord",
-                "mode": "create", "label": "User", "properties": {"n": n, "email": format!("u{n}")},
-                "options": {}}}),
-        )
-        .unwrap();
-    }
-    node
-}
-
-fn assert_refused_walk(result: Result<Response, ProtocolError>) {
-    let error = result.unwrap_err();
-    assert_eq!(error.code, ErrorCode::InvalidRequest, "{error:?}");
-    assert!(
-        error.message.contains("declare an ordered index"),
-        "{error:?}"
-    );
-}
-
-#[test]
-fn an_unindexed_filter_runs_unless_the_request_bounds_it() {
-    let node = node_with_users(|_| {});
-    // The server sets no limit.
-    assert!(execute(&node, RequestContext::default(), &filtered_read()).is_ok());
