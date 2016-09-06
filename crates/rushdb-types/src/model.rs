@@ -10,15 +10,3 @@ pub enum LogicalType {
     Int64,
     /// IEEE-754 double-precision float.
     Float64,
-    /// UTF-8 string.
-    Utf8,
-    /// UTC epoch milliseconds.
-    DateTime,
-}
-
-impl fmt::Display for LogicalType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            LogicalType::Boolean => "boolean",
-            LogicalType::Int64 => "int64",
-            LogicalType::Float64 => "float64",
