@@ -31,37 +31,3 @@ pub struct Capability {
 }
 
 /// Failure modes when issuing or verifying a capability token.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum CapError {
-    /// The token is not `base64url(claims).signature` or decodes to invalid JSON.
-    #[error("malformed capability")]
-    Malformed,
-    /// The HMAC signature did not match the claims under the server secret.
-    #[error("signature verification failed")]
-    BadSignature,
-    /// The token's `exp` timestamp is earlier than the verification time.
-    #[error("capability expired")]
-    Expired,
-    /// A requested permission is absent from the capability's scope.
-    #[error("permission `{0}` not in scope")]
-    ScopeDenied(String),
-}
-
-/// Issue a signed capability with the given TTL (seconds).
-#[must_use]
-pub fn issue(secret: &[u8], sub: &str, scope: &str, ttl_secs: u64, now: u64) -> String {
-    issue_for_tenant(secret, sub, scope, None, ttl_secs, now)
-}
-
-/// Issue a capability bound to one opaque scope value.
-#[must_use]
-pub fn issue_for_tenant(
-    secret: &[u8],
-    sub: &str,
-    scope: &str,
-    tenant: Option<&str>,
-    ttl_secs: u64,
-    now: u64,
-) -> String {
-    let mut claims = serde_json::Map::new();
-    claims.insert("sub".into(), serde_json::Value::String(sub.to_string()));
