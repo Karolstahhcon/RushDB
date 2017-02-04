@@ -4,10 +4,3 @@ description: RushDB, the LMPG database engine, as a single-node StatefulSet with
 type: application
 # Released together with the engine; publish.yml sets both from the release tag.
 version: 3.0.0
-appVersion: '3.0.0'
-keywords:
-  - rushdb
-  - database
-  - graph
-  - vector-search
-  - full-text-search
