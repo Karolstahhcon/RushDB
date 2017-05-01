@@ -13,18 +13,3 @@ primary_region = "iad"
 # A clean stop drains requests and writes a checkpoint.
 kill_signal = "SIGTERM"
 kill_timeout = 90
-
-[build]
-  image = "rushdb/rushdb:3"
-
-[env]
-  # Fly's private network is IPv6; "::" accepts IPv4 and IPv6.
-  RUSHDB_LISTEN = "::"
-
-[mounts]
-  source = "rushdb_data"
-  destination = "/data"
-
-[http_service]
-  internal_port = 3000
-  force_https = true
