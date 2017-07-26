@@ -32,37 +32,3 @@ fn stage_ingest(
     ingest: &serde_json::Value,
 ) -> Result<serde_json::Value, ProtocolError> {
     run(
-        node,
-        &serde_json::json!({"kind": "transaction", "transaction": {
-            "kind": "stage", "transactionId": tx,
-            "mutation": {"kind": "ingest", "ingest": ingest},
-        }}),
-    )
-}
-
-fn count(node: &Node, label: &str) -> usize {
-    let response = run(
-        node,
-        &serde_json::json!({"kind": "query", "query": {"kind": "records", "query": {"labels": [label]}}}),
-    )
-    .unwrap();
-    response["records"].as_array().unwrap().len()
-}
-
-fn links(node: &Node) -> usize {
-    let response = run(
-        node,
-        &serde_json::json!({"kind": "query", "query": {"kind": "relationships", "query": {}}}),
-    )
-    .unwrap();
-    response["relationships"].as_array().unwrap().len()
-}
-
-#[test]
-fn a_staged_json_import_lands_on_commit_with_its_relationships() {
-    let node = Node::bootstrap(&mut super::tests::config(false)).unwrap();
-    let tx = begin(&node);
-    let staged = stage_ingest(
-        &node,
-        &tx,
-        &serde_json::json!({"kind": "documents", "label": "Author", "documents": [
