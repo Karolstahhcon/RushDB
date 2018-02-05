@@ -1,7 +1,2 @@
 target
 .git
-.github
-.rushdb
-.rushdb-*
-data
-docs
