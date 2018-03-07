@@ -13,19 +13,3 @@ use rushdb_storage::Store;
 use rushdb_types::ids::TenantId;
 use serde_json::Value;
 
-const MAPPING: &str = include_str!("../conformance/gql-ldbc-snb-v1-mapping.json");
-
-fn fixture(mapping: &Value) -> Lmpg {
-    let graph = Lmpg::new(Arc::new(Store::new_in_memory()), TenantId::from_ordinal(1));
-    execute_mutation(
-        &graph,
-        QueryLanguage::Gql,
-        mapping["fixture"].as_str().expect("fixture script"),
-        None,
-    )
-    .expect("fixture loads");
-    graph
-}
-
-#[test]
-fn gql_profile_classifies_and_executes_the_ldbc_corpus() {
