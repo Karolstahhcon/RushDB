@@ -15,20 +15,3 @@ fn policy_default_deny() -> DataAccessPolicy {
         allowed_labels: vec!["Public".into()],
         denied_rel_types: vec!["SECRET_LINK".into()],
         visible_properties: {
-            let mut m: std::collections::BTreeMap<String, Vec<String>> =
-                std::collections::BTreeMap::new();
-            m.insert("public".to_string(), vec!["name".to_string()]);
-            m
-        },
-        max_results: 1,
-    }
-}
-
-#[test]
-fn default_deny_narrows_and_masks() {
-    let store = Arc::new(Store::new_in_memory());
-    let lmpg = Lmpg::new(store, TenantId::from_ordinal(51));
-
-    lmpg.create_record(
-        "Public",
-        None,
