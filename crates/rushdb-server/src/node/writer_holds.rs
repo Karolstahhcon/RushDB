@@ -18,23 +18,3 @@ impl WriterHoldCollector {
     pub(super) fn new() -> Self {
         Self {
             desc: Desc::new(
-                NAME.into(),
-                HELP.into(),
-                vec!["holder".into()],
-                std::collections::HashMap::new(),
-            )
-            .expect("valid Prometheus metric"),
-            snapshot: std::sync::Mutex::default(),
-        }
-    }
-
-    /// Replace the rendered snapshot with the store's current holds.
-    pub(super) fn observe(&self, store: &rushdb_storage::Store) {
-        *self
-            .snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = store.writer_holds();
-    }
-}
-
-impl Collector for WriterHoldCollector {
