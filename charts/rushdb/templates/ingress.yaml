@@ -15,3 +15,21 @@ spec:
   {{- end }}
   {{- with .Values.ingress.tls }}
   tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "rushdb.fullname" $ }}
+                port:
+                  name: http
+          {{- end }}
+    {{- end }}
+{{- end }}
