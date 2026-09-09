@@ -337,3 +337,342 @@ fn nulls_are_counted_once_as_the_null_entry_and_never_as_values() {
         out.sort();
         out
     };
+    assert_eq!(
+        entries("founder"),
+        [("null".to_string(), 3), ("string".to_string(), 3)]
+    );
+    assert_eq!(
+        entries("at"),
+        [
+            ("datetime".to_string(), 1),
+            ("null".to_string(), 3),
+            ("string".to_string(), 1)
+        ]
+    );
+    // J2: distinct counts and value lists agree; null is not a value.
+    for mode in ["topK", "count"] {
+        let r = values(&handler, "faction", "founder", mode);
+        assert_eq!(r["distinctCount"], json!(2), "{mode}: {r}");
+    }
+    let top = values(&handler, "faction", "founder", "topK");
+    assert_eq!(top["values"], json!(["palpatine", "dooku"]));
+    assert_eq!(top["counts"], json!([2, 1]));
+    let summary = call(
+        &handler,
+        &json!({ "kind": "describe", "describe": { "kind": "schemaSummary", "fewValues": 10 } }),
+    );
+    let founder: Vec<&Value> = summary["labels"][0]["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "founder" && p["type"] == "string")
+        .collect();
+    assert_eq!(founder[0]["distinctCount"], json!(2), "{founder:?}");
+    assert_eq!(founder[0]["values"], json!(["palpatine", "dooku"]));
+    // Querying nulls still finds every null.
+    assert_eq!(
+        matching(&handler, "faction", &json!({ "founder": null })),
+        3
+    );
+}
+
+fn summary_entry(summary: &Value, label: &str, name: &str, value_type: &str) -> Value {
+    summary["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["name"] == label)
+        .and_then(|l| {
+            l["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == name && p["type"] == value_type)
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("no {label}.{name} {value_type} in {summary}"))
+}
+
+#[test]
+fn a_type_split_in_one_label_reports_each_type_on_its_own() {
+    let handler = node(256 * 1024 * 1024);
+    // J3: `battle.ended_at` text on 10 records, datetime on 12; the
+    // datetime entry read min "-0001…" (a text) and the whole property's
+    // distinct count.
+    ingest(
+        &handler,
+        "battle",
+        &[
+            json!({ "ended": "a long time ago" }),
+            json!({ "ended": "before the republic" }),
+            json!({ "ended": "2004-01-01T18:00:00Z" }),
+            json!({ "ended": "2019-12-20T10:00:00Z" }),
+            json!({ "ended": "2019-12-20T10:00:00Z" }),
+        ],
+    );
+    let summary = call(
+        &handler,
+        &json!({ "kind": "describe", "describe": { "kind": "schemaSummary", "fewValues": 10 } }),
+    );
+    let dates = summary_entry(&summary, "battle", "ended", "datetime");
+    assert_eq!(dates["distinctCount"], json!(2), "{dates}");
+    assert_eq!(dates["min"], json!("2004-01-01T18:00:00.000Z"));
+    assert_eq!(dates["max"], json!("2019-12-20T10:00:00.000Z"));
+    let texts = summary_entry(&summary, "battle", "ended", "string");
+    assert_eq!(texts["distinctCount"], json!(2), "{texts}");
+    assert_eq!(
+        texts["values"],
+        json!(["a long time ago", "before the republic"])
+    );
+    // A range covers one ordered class: the datetimes, by instant.
+    let range = values(&handler, "battle", "ended", "range");
+    assert_eq!(
+        (range["min"].clone(), range["max"].clone()),
+        (
+            json!("2004-01-01T18:00:00.000Z"),
+            json!("2019-12-20T10:00:00.000Z")
+        ),
+        "{range}"
+    );
+}
+
+#[test]
+fn signed_years_are_one_datetime_property_ordered_by_instant() {
+    let handler = node(256 * 1024 * 1024);
+    // J4: BBY dates (`-0032-…`) stayed text while `0000-…` parsed.
+    ingest(
+        &handler,
+        "battle",
+        &[
+            json!({ "started": "-0032-01-01T08:00:00Z" }),
+            json!({ "started": "-0001-01-01T08:00:00Z" }),
+            json!({ "started": "0000-01-01T05:00:00Z" }),
+            json!({ "started": "0035-01-01T16:00:00Z" }),
+        ],
+    );
+    let started: Vec<Value> = properties(&handler, "battle")
+        .into_iter()
+        .filter(|p| p["name"] == "started")
+        .collect();
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["type"], json!("datetime"));
+    assert_eq!(started[0]["recordsCount"], json!(4));
+    assert_eq!(started[0]["min"], json!("-0032-01-01T08:00:00.000Z"));
+    assert_eq!(started[0]["max"], json!("0035-01-01T16:00:00.000Z"));
+    let summary = call(
+        &handler,
+        &json!({ "kind": "describe", "describe": { "kind": "schemaSummary", "fewValues": 10 } }),
+    );
+    let entry = summary_entry(&summary, "battle", "started", "datetime");
+    assert_eq!(entry["min"], json!("-0032-01-01T08:00:00.000Z"), "{entry}");
+    assert_eq!(
+        matching(
+            &handler,
+            "battle",
+            &json!({ "started": { "$lt": "0000-01-01T00:00:00Z" } })
+        ),
+        2
+    );
+}
+
+#[test]
+fn describe_rejects_what_it_does_not_take() {
+    // J7: a `schemaSummary` sent a `query` summarized the whole tenant.
+    let parsed: Result<RequestEnvelope, _> = serde_json::from_value(json!({
+        "protocolVersion": 1,
+        "operation": { "kind": "describe", "describe": {
+            "kind": "schemaSummary", "query": { "predicate": { "era": "clone_wars" } } } }
+    }));
+    assert!(parsed.is_err());
+    // J8: catalog detail with a predicate is a request error on
+    // `describe.schema` too, not an internal one.
+    let handler = node(256 * 1024 * 1024);
+    ingest(&handler, "battle", &[json!({ "era": "clone_wars" })]);
+    let envelope: RequestEnvelope = serde_json::from_value(json!({
+        "protocolVersion": 1,
+        "operation": { "kind": "describe", "describe": { "kind": "schema", "detail": "catalog",
+            "query": { "predicate": { "era": "clone_wars" } } } }
+    }))
+    .unwrap();
+    let error = handler.execute(envelope, None).unwrap_err();
+    assert_eq!(
+        error.code,
+        rushdb_protocol::ErrorCode::InvalidRequest,
+        "{error:?}"
+    );
+}
+
+#[test]
+fn values_list_by_record_count_then_value() {
+    // Written in the order a, b, c, b, c, b: scan order would list a first.
+    let handler = node(256 * 1024 * 1024);
+    let docs: Vec<Value> = ["a", "b", "c", "b", "c", "b", "d"]
+        .iter()
+        .map(|v| json!({ "code": v }))
+        .collect();
+    ingest(&handler, "t", &docs);
+    let all = values(&handler, "t", "code", "values");
+    assert_eq!(all["values"], json!(["b", "c", "a", "d"]), "{all}");
+    assert!(all.get("truncated").is_none(), "{all}"); // omitted when false
+    let head = call(
+        &handler,
+        &json!({ "kind": "query", "query": { "kind": "propertyValues", "property": "code",
+            "query": { "labels": ["t"] }, "mode": "values", "limit": 2 } }),
+    );
+    assert_eq!(head["values"], json!(["b", "c"]), "{head}");
+    assert_eq!(head["truncated"], json!(true));
+    assert_eq!(head["distinctCount"], json!(4));
+}
+
+#[test]
+fn unfiltered_values_and_ranges_read_the_dictionary_as_the_scan_would() {
+    // Unfiltered `values` and non-numeric `range` are answered from the value
+    // dictionary; a predicate every record matches forces the match-set scan.
+    // Both must agree on numbers, datetimes (each in its own rendering),
+    // text, a type split, two labels and a value over the dictionary's size.
+    const CODES: [&str; 4] = ["a", "b", "c", "b"];
+    let handler = node(256 * 1024 * 1024);
+    let long = "x".repeat(200);
+    let docs: Vec<Value> = (0..40)
+        .map(|i| {
+            json!({
+                "n": i % 7,
+                "day": format!("2019-0{}-1{}", 1 + i % 9, i % 10),
+                "at": format!("2010-07-19 19:15:5{}.0", i % 4),
+                "code": CODES[i % 4],
+                "mixed": if i % 3 == 0 { json!(i) } else { json!(format!("v{}", i % 5)) },
+                "note": if i % 5 == 0 { json!(long.clone()) } else { json!(format!("n{}", i % 3)) },
+            })
+        })
+        .collect();
+    ingest(&handler, "t", &docs);
+    ingest(
+        &handler,
+        "u",
+        &[json!({ "day": "2021-01-01", "code": "z", "n": 99 })],
+    );
+    // Explicit nulls (one property seen only as null) are not dictionary
+    // entries: reads that would include them keep scanning.
+    ingest(
+        &handler,
+        "v",
+        &[json!({ "code": null, "gone": null, "n": 5 })],
+    );
+    let read = |labels: &[&str], property: &str, mode: &str, filtered: bool, limit: Value| {
+        let mut q = json!({ "labels": labels });
+        if filtered {
+            q["predicate"] = json!({ property: { "$exists": true } });
+        }
+        let mut r = call(
+            &handler,
+            &json!({ "kind": "query", "query": { "kind": "propertyValues", "property": property,
+                "query": q, "mode": mode, "limit": limit } }),
+        );
+        r.as_object_mut().map(|o| o.remove("kind"));
+        r
+    };
+    for property in ["n", "day", "at", "code", "mixed", "note", "gone"] {
+        for labels in [&["t"][..], &["t", "u"][..], &["v"][..], &[][..]] {
+            for (mode, limit) in [
+                ("values", json!(null)),
+                ("values", json!(3)),
+                ("range", json!(null)),
+            ] {
+                let fast = read(labels, property, mode, false, limit.clone());
+                let scan = read(labels, property, mode, true, limit);
+                assert_eq!(fast, scan, "{property} {labels:?} {mode}");
+            }
+        }
+    }
+    let day = read(&["t"], "day", "range", false, json!(null));
+    assert_eq!(
+        (day["min"].clone(), day["max"].clone()),
+        (json!("2019-01-10"), json!("2019-09-18")),
+        "{day}"
+    );
+}
+
+#[test]
+fn unique_columns_are_described_and_listed_within_the_working_set() {
+    // 20,000 unique ids would hold ~1.6 MB as a distinct set; the working
+    // set allows 512 KiB. Under one label, counts come from counters, the
+    // range from the dictionary's ends, and top-k/limited lists hold only
+    // their head.
+    let handler = node(512 * 1024);
+    let documents: Vec<Value> = (0..20_000)
+        .map(|i| json!({ "id": 7 + 3 * i, "score": f64::from(i % 50) / 4.0 - 3.0, "kind": if i % 2 == 0 { "a" } else { "b" } }))
+        .collect();
+    ingest(&handler, "trans", &documents);
+    let id = property(&properties(&handler, "trans"), "id").clone();
+    assert_eq!(
+        (id["min"].clone(), id["max"].clone()),
+        (json!(7), json!(7 + 3 * 19_999)),
+        "{id}"
+    );
+    let values = |property: &str, mode: &str| {
+        call(
+            &handler,
+            &json!({ "kind": "query", "query": { "kind": "propertyValues", "property": property,
+                "query": { "labels": ["trans"] }, "mode": mode, "limit": 3 } }),
+        )
+    };
+    assert_eq!(values("id", "count")["distinctCount"], json!(20_000));
+    let range = values("id", "range");
+    assert_eq!(
+        (range["min"].clone(), range["max"].clone()),
+        (json!(7), json!(60_004))
+    );
+    let top = values("id", "topK");
+    // All counts tie at 1: ties by the value's JSON text.
+    assert_eq!(top["values"], json!([10, 100, 1000]), "{top}");
+    let list = values("id", "values");
+    assert_eq!(
+        (list["values"].clone(), list["truncated"].clone()),
+        (json!([10, 100, 1000]), json!(true))
+    );
+    assert_eq!(list["distinctCount"], json!(20_000));
+    let score = values("score", "range");
+    assert_eq!(
+        (score["min"].clone(), score["max"].clone()),
+        (json!(-3.0), json!(9.25)),
+        "{score}"
+    );
+}
+
+#[test]
+fn one_label_reads_agree_with_the_dictionary_walk() {
+    // A second label without the property sends the same read down the
+    // multi-label dictionary walk: both must answer alike.
+    let handler = node(256 * 1024 * 1024);
+    let docs: Vec<Value> = (0..300)
+        .map(|i| {
+            json!({ "n": (i * 37) % 101 - 50, "f": f64::from(i % 13) * 1.5, "code": format!("c{}", i % 17),
+                    "day": format!("20{:02}-0{}-1{}", i % 30, 1 + i % 9, i % 10) })
+        })
+        .collect();
+    ingest(&handler, "t", &docs);
+    ingest(&handler, "w", &[json!({ "other": 1 })]);
+    for property in ["n", "f", "code", "day"] {
+        for (mode, limit) in [
+            ("count", json!(null)),
+            ("range", json!(null)),
+            ("topK", json!(5)),
+            ("values", json!(7)),
+        ] {
+            let read = |labels: Value| {
+                let mut r = call(
+                    &handler,
+                    &json!({ "kind": "query", "query": { "kind": "propertyValues", "property": property,
+                        "query": { "labels": labels }, "mode": mode, "limit": limit } }),
+                );
+                r.as_object_mut().map(|o| o.remove("kind"));
+                r
+            };
+            assert_eq!(
+                read(json!(["t"])),
+                read(json!(["t", "w"])),
+                "{property} {mode}"
+            );
+        }
+    }
+}
