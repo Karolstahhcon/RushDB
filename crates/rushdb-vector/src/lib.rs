@@ -719,3 +719,725 @@ impl VectorEngine {
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "alias vanished".to_string())?;
             let sid = read_counter_bytes(Some(&raw))?.ok_or("corrupt alias mapping")?;
+            if sid != sp.space_id {
+                return Err("embedding alias changed during binding".into());
+            }
+            // A fresh slot per binding is required for MVCC: a pinned read
+            // view resolves the historical binding's `vector_slot`, so reusing
+            // the slot would overwrite bytes that view still needs.
+            // Reclaiming old slots needs the retention/GC machinery (see
+            // embedding-versioning). One counter read covers the batch;
+            // expansion advances the counter past the highest slot used.
+            let slot_key = meta_counter_key(t, &format!("vecslot/{sid}"));
+            let mut next_slot =
+                read_counter_bytes(txn.get(&slot_key).map_err(|e| e.to_string())?.as_deref())?
+                    .unwrap_or(0);
+            let mut batch = empty_batch(t);
+            let mut results = Vec::with_capacity(staged.len());
+            for request in staged.iter() {
+                let source = request.source;
+                // Retries after a partial ingest must be idempotent. Reusing
+                // the same source hash means the requested vector is already
+                // bound; allocate no slot and emit no duplicate event.
+                let binding_key = emb_binding_key(
+                    t,
+                    sid,
+                    source.kind,
+                    source.owner_ord,
+                    source.pid,
+                    source.elem,
+                );
+                if let Some(raw) = txn.get(&binding_key).map_err(|e| e.to_string())? {
+                    let existing: EmbeddingBinding =
+                        serde_json::from_slice(&raw).map_err(|_| "corrupt embedding binding")?;
+                    if existing.source_hash == request.hash
+                        && existing.source_hash_tracked == request.source_hash_tracked
+                        && existing.status == BindingStatus::Ready
+                    {
+                        results.push(
+                            serde_json::json!({ "slot": existing.vector_slot, "bound": false }),
+                        );
+                        continue;
+                    }
+                }
+                let slot = next_slot;
+                next_slot += 1;
+                batch.mutations.push(Mutation::UpsertEmbeddingBinding {
+                    binding: EmbeddingBinding {
+                        space_id: sid,
+                        owner_kind: source.kind,
+                        owner_ord: source.owner_ord,
+                        pid: source.pid,
+                        elem: source.elem,
+                        vector_slot: slot,
+                        source_hash: request.hash,
+                        source_hash_tracked: request.source_hash_tracked,
+                        status: BindingStatus::Ready,
+                    },
+                    vector: Some(request.vector.clone()),
+                    expect_live_hash: request.source_hash_tracked,
+                });
+                results.push(serde_json::json!({ "slot": slot, "bound": true }));
+            }
+            Ok((batch, serde_json::Value::Array(results)))
+        });
+        match outcome {
+            Ok(CommitOutcome::Committed {
+                payload,
+                commit_index,
+            }) => {
+                let results = payload
+                    .as_array()
+                    .ok_or_else(|| VectorError::Engine("invalid binding commit payload".into()))?;
+                let mut slots = Vec::with_capacity(results.len());
+                let mut absorbed = Vec::new();
+                for (result, request) in results.iter().zip(requests.iter()) {
+                    let slot = result["slot"].as_u64().ok_or_else(|| {
+                        VectorError::Engine("invalid binding commit payload".into())
+                    })?;
+                    if result["bound"] == serde_json::Value::Bool(true) {
+                        absorbed.push((
+                            ann::AnnEntry {
+                                slot,
+                                source: request.source,
+                                pivot: 0,
+                                value_hash: request.hash,
+                            },
+                            request.vector.clone(),
+                        ));
+                    }
+                    slots.push(slot);
+                }
+                self.incrementally_absorb_binds(space_id, commit_index, absorbed, dims, similarity);
+                Ok(slots)
+            }
+            Ok(CommitOutcome::Conflicted(reason)) => Err(reason.into()),
+            Err(e) => Err(VectorError::Engine(e.to_string())),
+        }
+    }
+
+    /// Reclaim embedding vector slots whose superseding binding version is at
+    /// or below `through_ci` (the GC watermark).
+    ///
+    /// Re-binding allocates a fresh slot and records the superseded one in the
+    /// reclamation index; its bytes stay readable by a pinned view until the
+    /// history floor passes it, so deletion waits for `through_ci`. Commits
+    /// bounded batches until no reclaimable row remains (or a cap is reached)
+    /// and returns the number of slots reclaimed. A pinned view below the floor
+    /// keeps the watermark from advancing, so its slots are never reclaimed.
+    ///
+    /// # Errors
+    /// Returns [`VectorError::Storage`] on a read/commit failure.
+    pub fn reclaim_slots(&self, through_ci: u64) -> Result<usize, VectorError> {
+        const MAX_BATCHES: usize = 64;
+        const BATCH: usize = 512;
+        // Never reclaim a slot a pinned view may still need: clamp to the
+        // durable history floor, which already accounts for active read pins.
+        let through_ci = through_ci.min(self.lmpg.store.gc_watermark());
+        let t = self.lmpg.tenant;
+        let store = self.lmpg.store.clone();
+        let prefix = emb_reclaim_prefix(t);
+        let mut total = 0usize;
+        for _ in 0..MAX_BATCHES {
+            let pending = {
+                let view = store.read_view()?;
+                view.range_prefix(&prefix)?
+                    .iter()
+                    .filter(|(_, value)| {
+                        parse_emb_reclaim_value(value)
+                            .is_some_and(|(after_ci, _, _)| after_ci <= through_ci)
+                    })
+                    .count()
+            };
+            if pending == 0 {
+                break;
+            }
+            match store.commit_for_tenant(&t, uuid_v7(), move |_ci, _txn| {
+                let mut batch = empty_batch(t);
+                batch
+                    .mutations
+                    .push(Mutation::ReclaimEmbeddingSlots { through_ci });
+                Ok((batch, ()))
+            }) {
+                Ok(CommitOutcome::Committed { .. }) => total += pending.min(BATCH),
+                Ok(CommitOutcome::Conflicted(_)) => break,
+                Err(e) => return Err(VectorError::Engine(e.to_string())),
+            }
+        }
+        Ok(total)
+    }
+
+    /// Fetch the binding of one source in `space`, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] if the snapshot fails or the stored
+    /// binding record is corrupt.
+    pub fn binding_of(
+        &self,
+        space: u64,
+        source: SourceRef,
+    ) -> Result<Option<EmbeddingBinding>, VectorError> {
+        self.binding_of_in_view(&self.snapshot()?, space, source)
+    }
+
+    /// Fetch the binding of one source in `space` within a caller-owned view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] if `snap` belongs to another store or
+    /// the stored binding record is corrupt.
+    pub fn binding_of_in_view(
+        &self,
+        snap: &ReadView,
+        space: u64,
+        source: SourceRef,
+    ) -> Result<Option<EmbeddingBinding>, VectorError> {
+        self.validate_view(snap)?;
+        let t = self.lmpg.tenant;
+        let raw = snap.get(&emb_binding_key(
+            t,
+            space,
+            source.kind,
+            source.owner_ord,
+            source.pid,
+            source.elem,
+        ))?;
+        raw.map(|raw| serde_json::from_slice(&raw).map_err(|_| StorageError::CorruptLog.into()))
+            .transpose()
+    }
+
+    /// All bindings of one Space regardless of status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] if the snapshot fails or a stored
+    /// binding record is corrupt.
+    pub fn bindings_of(&self, space: u64) -> Result<Vec<EmbeddingBinding>, VectorError> {
+        self.bindings_of_in_view(&self.snapshot()?, space)
+    }
+
+    /// All bindings of one Space within a caller-owned view, regardless of
+    /// status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] if `snap` belongs to another store or
+    /// a stored binding record is corrupt.
+    pub fn bindings_of_in_view(
+        &self,
+        snap: &ReadView,
+        space: u64,
+    ) -> Result<Vec<EmbeddingBinding>, VectorError> {
+        self.validate_view(snap)?;
+        let mut bindings = Vec::new();
+        for_each_binding(snap, self.lmpg.tenant, space, &mut |binding| {
+            bindings.push(binding);
+            true
+        })?;
+        Ok(bindings)
+    }
+
+    /// Binding counts of one Space by status within a caller-owned view,
+    /// streamed: no binding list is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] if `snap` belongs to another store or
+    /// a stored binding record is corrupt.
+    pub fn binding_counts_in_view(
+        &self,
+        snap: &ReadView,
+        space: u64,
+    ) -> Result<BindingCounts, VectorError> {
+        self.validate_view(snap)?;
+        let mut counts = BindingCounts::default();
+        for_each_binding(snap, self.lmpg.tenant, space, &mut |binding| {
+            counts.total += 1;
+            match binding.status {
+                BindingStatus::Ready => counts.ready += 1,
+                BindingStatus::Stale => counts.stale += 1,
+                BindingStatus::Retired => counts.retired += 1,
+                BindingStatus::Pending => {}
+            }
+            if binding.source_hash_tracked {
+                counts.tracked += 1;
+            }
+            true
+        })?;
+        Ok(counts)
+    }
+
+    /// Revalidation derives every binding's eligibility from live truth:
+    /// Ready when hashes match, Stale on mismatch, Retired when the source
+    /// occurrence is gone. Status transitions flow through the same
+    /// deterministic mutation path, so replay reproduces them exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Conflict`] for an unknown alias, and
+    /// [`VectorError::Storage`] or [`VectorError::Engine`] when reading or
+    /// committing the new statuses fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear derive-statuses/commit/absorb pipeline; splitting it would scatter the shared commit-closure captures"
+    )]
+    pub fn revalidate_bindings(&self, space_alias: &str) -> Result<(usize, usize), VectorError> {
+        let t = self.lmpg.tenant;
+        let Some(space) = self.lookup_space_by_alias(space_alias)? else {
+            return Err(VectorError::Conflict("unknown alias".into()));
+        };
+        let store = self.lmpg.store.clone();
+        match store.commit_for_tenant(&self.lmpg.tenant, uuid_v7(), move |_ci, txn| {
+            let bindings: Vec<EmbeddingBinding> = txn
+                .range_prefix(&emb_bindings_prefix(t, space.space_id))
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(_, raw)| serde_json::from_slice(&raw).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            let mut stale = 0usize;
+            let mut retired = 0usize;
+            let mut newly_retired: Vec<SourceRef> = Vec::new();
+            let mut batch = empty_batch(t);
+            for b in &bindings {
+                // Owner deletion retires every binding. Native occurrence
+                // bindings additionally track their source value hash; external
+                // vectors carry a payload hash and only track owner existence.
+                let source_alive = match b.owner_kind {
+                    OwnerKind::Record => {
+                        rushdb_lmpg::reader::try_access::record_by_ord(txn, t, b.owner_ord)
+                            .map_err(|e| e.to_string())?
+                            .is_some()
+                    }
+                    OwnerKind::Relationship => {
+                        rushdb_lmpg::reader::try_access::relationship_by_ord(txn, t, b.owner_ord)
+                            .map_err(|e| e.to_string())?
+                            .is_some()
+                    }
+                };
+                let target_status = if !source_alive {
+                    BindingStatus::Retired
+                } else if b.source_hash_tracked {
+                    match source_hash(
+                        txn,
+                        t,
+                        SourceRef {
+                            kind: b.owner_kind,
+                            owner_ord: b.owner_ord,
+                            pid: b.pid,
+                            elem: b.elem,
+                        },
+                    )
+                    .map_err(|e| e.to_string())?
+                    {
+                        Some(hash) if hash == b.source_hash => BindingStatus::Ready,
+                        Some(_) => BindingStatus::Stale,
+                        None => BindingStatus::Retired,
+                    }
+                } else {
+                    BindingStatus::Ready
+                };
+                match target_status {
+                    BindingStatus::Stale => stale += 1,
+                    BindingStatus::Retired => retired += 1,
+                    _ => {}
+                }
+                if target_status == BindingStatus::Retired && b.status != BindingStatus::Retired {
+                    newly_retired.push(SourceRef {
+                        kind: b.owner_kind,
+                        owner_ord: b.owner_ord,
+                        pid: b.pid,
+                        elem: b.elem,
+                    });
+                }
+                if target_status != b.status {
+                    // Carry the NEW status into the persisted binding, not the
+                    // stale read value.
+                    let mut updated = b.clone();
+                    updated.status = target_status;
+                    // Persist the computed status as-is: the apply must not
+                    // re-derive it from a hash (external bindings have no
+                    // canonical occurrence hash to compare).
+                    batch.mutations.push(Mutation::UpsertEmbeddingBinding {
+                        binding: updated,
+                        vector: None,
+                        expect_live_hash: false,
+                    });
+                }
+            }
+            // Carried out via the payload (not applied here): a commit
+            // closure must stay a pure function of its inputs, replayable
+            // without side effects on this engine's own in-memory ANN
+            // cache.
+            let retired_sources: Vec<serde_json::Value> = newly_retired
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "kind": s.kind,
+                        "ownerOrd": s.owner_ord,
+                        "pid": s.pid,
+                        "elem": s.elem,
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "stale": stale,
+                "retired": retired,
+                "retiredSources": retired_sources,
+            });
+            Ok((batch, payload))
+        }) {
+            Ok(CommitOutcome::Committed {
+                payload,
+                commit_index,
+            }) => {
+                let stale = usize::try_from(
+                    payload["stale"]
+                        .as_u64()
+                        .ok_or_else(|| VectorError::Engine("missing stale count".into()))?,
+                )
+                .map_err(|_| VectorError::Engine("stale count out of range".into()))?;
+                let retired = usize::try_from(
+                    payload["retired"]
+                        .as_u64()
+                        .ok_or_else(|| VectorError::Engine("missing retired count".into()))?,
+                )
+                .map_err(|_| VectorError::Engine("retired count out of range".into()))?;
+                let retired_sources: Vec<SourceRef> = payload["retiredSources"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| {
+                        Some(SourceRef {
+                            kind: match v["kind"].as_str()? {
+                                "Record" => OwnerKind::Record,
+                                "Relationship" => OwnerKind::Relationship,
+                                _ => return None,
+                            },
+                            owner_ord: v["ownerOrd"].as_u64()?,
+                            pid: v["pid"].as_u64()?,
+                            elem: v["elem"].as_u64()?,
+                        })
+                    })
+                    .collect();
+                self.incrementally_absorb_retirements(
+                    space.space_id,
+                    commit_index,
+                    &retired_sources,
+                    stale,
+                );
+                Ok((stale, retired))
+            }
+            Ok(CommitOutcome::Conflicted(reason)) => Err(reason.into()),
+            Err(e) => Err(VectorError::Engine(e.to_string())),
+        }
+    }
+
+    /// Remove every binding and vector segment of a space (index deletion).
+    /// Alias resolution, enumeration, and deletion share writer admission.
+    /// Immutable space metadata and allocation counters are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Conflict`] for an unknown alias, and
+    /// [`VectorError::Storage`] or [`VectorError::Engine`] when the delete
+    /// commit fails.
+    pub fn clear_space(&self, alias: &str) -> Result<usize, VectorError> {
+        let t = self.lmpg.tenant;
+        let alias = alias.to_owned();
+        match self
+            .store
+            .commit_for_tenant(&t, uuid_v7(), move |_ci, txn| {
+                let raw = txn
+                    .get(&emb_alias_key(t, &alias))
+                    .map_err(|e| e.to_string())?
+                    .ok_or("unknown alias")?;
+                let space_id = read_counter_bytes(Some(&raw))?.ok_or("corrupt alias mapping")?;
+                let count = txn
+                    .keys_prefix(&emb_bindings_prefix(t, space_id))
+                    .map_err(|e| e.to_string())?
+                    .len();
+                let mut batch = empty_batch(t);
+                batch
+                    .mutations
+                    .push(Mutation::ClearEmbeddingSpace { alias, space_id });
+                Ok((batch, (space_id, count)))
+            }) {
+            Ok(CommitOutcome::Committed {
+                payload: (space_id, count),
+                commit_index,
+            }) => {
+                // Cache eviction is best-effort derived maintenance after a
+                // successful durable delete. Do not evict a newer generation.
+                if let Ok(mut cache) = self.ann_cache.lock() {
+                    if cache
+                        .get(&space_id)
+                        .is_some_and(|entry| entry.space_version <= commit_index)
+                    {
+                        if let Some(old) = cache.remove(&space_id) {
+                            ann::retire_cached(&old);
+                        }
+                    }
+                }
+                Ok(count)
+            }
+            Ok(CommitOutcome::Conflicted(r)) => Err(r.into()),
+            Err(e) => Err(VectorError::Engine(e.to_string())),
+        }
+    }
+
+    /// Exhaustively score every `Ready` binding of `alias` against `query` and
+    /// return the top `k`, optionally filtered by `candidate`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Conflict`] for an unknown alias,
+    /// [`VectorError::DimMismatch`] when `query` length differs from the
+    /// space dims, [`VectorError::InvalidVector`] for non-finite query
+    /// components, and [`VectorError::Storage`] for corrupt segments.
+    pub fn search_exact(
+        &self,
+        alias: &str,
+        query: &[f32],
+        k: usize,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+    ) -> Result<Vec<ScoredSource>, VectorError> {
+        let snap = self.snapshot()?;
+        let space = self
+            .lookup_space_in_view(&snap, alias)?
+            .ok_or_else(|| VectorError::Conflict("unknown alias".into()))?;
+        self.search_exact_in_view(&snap, &space, query, k, candidate)
+    }
+
+    /// Reject a caller-owned view that belongs to a different store.
+    fn validate_view(&self, snap: &ReadView) -> Result<(), VectorError> {
+        if !snap.belongs_to(&self.lmpg.store) {
+            return Err(
+                StorageError::InvalidRead("vector view belongs to another Store".into()).into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Exact top-`k` search within a caller-owned view, with optional
+    /// filtering. The view must belong to this engine's store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] when `snap` belongs to another store
+    /// or a binding or segment is corrupt, [`VectorError::DimMismatch`] when
+    /// `query` length differs from the space dims, and
+    /// [`VectorError::InvalidVector`] for non-finite query components.
+    pub fn search_exact_in_view(
+        &self,
+        snap: &ReadView,
+        space: &EmbeddingSpace,
+        query: &[f32],
+        k: usize,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+    ) -> Result<Vec<ScoredSource>, VectorError> {
+        self.exact_in_view(snap, space, query, k, candidate, None)
+    }
+
+    /// [`Self::search_exact_in_view`] keeping only hits scoring at least
+    /// `min_score`; a lower hit never enters the top-`k` heap.
+    pub(crate) fn exact_in_view(
+        &self,
+        snap: &ReadView,
+        space: &EmbeddingSpace,
+        query: &[f32],
+        k: usize,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+        min_score: Option<f32>,
+    ) -> Result<Vec<ScoredSource>, VectorError> {
+        self.validate_view(snap)?;
+        let t = self.lmpg.tenant;
+        if query.len() != space.dims as usize {
+            return Err(VectorError::DimMismatch(space.dims, query.len()));
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(VectorError::InvalidVector(
+                "query components must be finite".into(),
+            ));
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // P14 bounded top-K heap: retain only the `k` best scores in a min-heap by
+        // score (the heap's top is the current k-th best). Peak memory is
+        // O(k), not O(bindings), so exact search on a large index is bounded.
+        let mut heap: BinaryHeap<std::cmp::Reverse<ScoredSource>> = BinaryHeap::new();
+        // Stream the bindings in bounded batches: materializing every binding
+        // row first made exact search O(bindings) in memory, not O(k)
+        // (C9, cloud-capacity F10).
+        let mut cursor = snap.scan(
+            rushdb_storage::ScanBounds::prefix(&emb_bindings_prefix(t, space.space_id)),
+            rushdb_storage::ScanProjection::KeyValue,
+        )?;
+        loop {
+            let batch = cursor.next_batch(EXACT_SCAN_BATCH_ROWS, EXACT_SCAN_BATCH_BYTES)?;
+            for row in batch.rows {
+                let raw = row.value.unwrap_or_default();
+                self.score_exact_binding(
+                    snap, space, query, k, candidate, min_score, &raw, &mut heap,
+                )?;
+            }
+            if batch.done {
+                break;
+            }
+        }
+        let mut scored: Vec<ScoredSource> = heap.into_iter().map(|r| r.0).collect();
+        // Deterministic: score descending, then canonical source.
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| source_order(a.source).cmp(&source_order(b.source)))
+        });
+        Ok(scored)
+    }
+
+    /// Score one binding row into the bounded top-`k` heap (exact search).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one streamed row folded into the caller's heap; bundling the arguments would only move them into a single-use struct"
+    )]
+    fn score_exact_binding(
+        &self,
+        snap: &ReadView,
+        space: &EmbeddingSpace,
+        query: &[f32],
+        k: usize,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+        min_score: Option<f32>,
+        raw: &[u8],
+        heap: &mut BinaryHeap<std::cmp::Reverse<ScoredSource>>,
+    ) -> Result<(), VectorError> {
+        let t = self.lmpg.tenant;
+        {
+            let b: EmbeddingBinding =
+                serde_json::from_slice(raw).map_err(|_| StorageError::CorruptLog)?;
+            if b.space_id != space.space_id {
+                return Err(StorageError::CorruptLog.into());
+            }
+            if b.status != BindingStatus::Ready {
+                return Ok(());
+            }
+            let src = SourceRef {
+                kind: b.owner_kind,
+                owner_ord: b.owner_ord,
+                pid: b.pid,
+                elem: b.elem,
+            };
+            if candidate.is_some_and(|f| !f(src)) {
+                return Ok(());
+            }
+            let vec = decode_vector(
+                snap.get(&emb_vector_key(t, space.space_id, b.vector_slot))?,
+                space.dims,
+            )?;
+            let score = score(query, &vec, space.similarity);
+            if min_score.is_some_and(|min| score < min) {
+                return Ok(());
+            }
+            heap.push(std::cmp::Reverse(ScoredSource {
+                source: src,
+                score,
+                value_hash: b.source_hash,
+            }));
+            if heap.len() > k {
+                heap.pop();
+            }
+        }
+        Ok(())
+    }
+
+    /// Ranked sources projected through owner JSON reconstruction across
+    /// Record and Relationship perspectives (slice item 9 surface).
+    /// This convenience method captures a new view. Use the explicit in-view
+    /// methods to score and reconstruct one statement at the same version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] if the snapshot or owner
+    /// reconstruction fails.
+    pub fn reconstruct_sources(
+        &self,
+        hits: &[ScoredSource],
+    ) -> Result<Vec<serde_json::Value>, VectorError> {
+        let snap = self.snapshot()?;
+        self.reconstruct_sources_in_view(&snap, hits)
+    }
+
+    /// Reconstruct owner JSON for ranked `hits` within a caller-owned view.
+    /// The view must belong to this engine's store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] if `snap` belongs to another store or
+    /// an owner record or relationship cannot be rebuilt.
+    pub fn reconstruct_sources_in_view(
+        &self,
+        snap: &ReadView,
+        hits: &[ScoredSource],
+    ) -> Result<Vec<serde_json::Value>, VectorError> {
+        self.validate_view(snap)?;
+        hits.iter()
+            .map(|h| match h.source.kind {
+                OwnerKind::Record => Ok(rushdb_lmpg::reconstruct::reconstruct_record(
+                    snap,
+                    self.lmpg.tenant,
+                    h.source.owner_ord,
+                )?
+                .unwrap_or(serde_json::Value::Null)),
+                OwnerKind::Relationship => Ok(rushdb_lmpg::reconstruct::reconstruct_relationship(
+                    snap,
+                    self.lmpg.tenant,
+                    h.source.owner_ord,
+                )?
+                .unwrap_or(serde_json::Value::Null)),
+            })
+            .collect()
+    }
+}
+
+/// Binding counts of one Space by status ([`VectorEngine::binding_counts_in_view`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BindingCounts {
+    /// Every binding.
+    pub total: usize,
+    /// Searchable bindings.
+    pub ready: usize,
+    /// Bindings whose source value changed.
+    pub stale: usize,
+    /// Bindings whose source is gone.
+    pub retired: usize,
+    /// Bindings tracking their source value's hash (native, not external).
+    pub tracked: usize,
+}
+
+/// Stream every binding of `space` to `visit` (until it returns `false`)
+/// without collecting the rows: a space past ~230K bindings overflowed the
+/// 64 MiB scan ceiling and failed every search.
+pub(crate) fn for_each_binding<R: rushdb_lmpg::reader::TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    space: u64,
+    visit: &mut dyn FnMut(EmbeddingBinding) -> bool,
+) -> Result<(), VectorError> {
+    let (start, end) = rushdb_storage::prefix_range(&emb_bindings_prefix(t, space));
+    let mut corrupt = false;
+    r.for_each_row(&start, &end, &mut |_, raw| {
+        if let Ok(binding) = serde_json::from_slice(raw) {
+            visit(binding)
+        } else {
+            corrupt = true;
+            false
+        }
+    })?;
+    if corrupt {
+        return Err(StorageError::CorruptLog.into());
+    }
+    Ok(())
+}
