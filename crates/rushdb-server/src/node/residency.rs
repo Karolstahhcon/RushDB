@@ -187,3 +187,192 @@ impl TenantResidency {
         resident.tx = Some(Arc::clone(&coordinator));
         Ok(coordinator)
     }
+
+    /// The tenant's coordinator if resident (never creates one).
+    pub(crate) fn existing_tx(&self, tenant: TenantId) -> Option<Arc<rushdb_tx::TxCoordinator>> {
+        self.lock()
+            .get(&tenant)
+            .and_then(|resident| resident.tx.clone())
+    }
+
+    /// Every resident coordinator (for the expiry sweep).
+    pub(crate) fn coordinators(&self) -> Vec<Arc<rushdb_tx::TxCoordinator>> {
+        self.lock()
+            .values()
+            .filter_map(|resident| resident.tx.clone())
+            .collect()
+    }
+
+    /// Evict idle entries unused for longer than the idle TTL, then idle
+    /// entries least recently used first while over budget. Returns the
+    /// evicted tenants.
+    pub(crate) fn evict_idle(&self) -> Vec<TenantId> {
+        let now = (self.clock)();
+        let mut entries = self.lock();
+        let mut evicted: Vec<TenantId> = entries
+            .iter()
+            .filter(|(_, resident)| {
+                resident.idle()
+                    && resident
+                        .last_used
+                        .is_none_or(|used| now.saturating_duration_since(used) >= self.idle)
+            })
+            .map(|(tenant, _)| *tenant)
+            .collect();
+        for tenant in &evicted {
+            entries.remove(tenant);
+        }
+        while entries.values().map(Resident::bytes).sum::<usize>() > self.budget {
+            let Some(victim) = entries
+                .iter()
+                .filter(|(_, resident)| resident.idle())
+                .min_by_key(|(_, resident)| resident.last_used)
+                .map(|(tenant, _)| *tenant)
+            else {
+                break;
+            };
+            entries.remove(&victim);
+            evicted.push(victim);
+        }
+        evicted
+    }
+
+    /// Forget a purged tenant (handles held by in-flight requests stay
+    /// valid until dropped).
+    pub(crate) fn remove(&self, tenant: TenantId) {
+        self.lock().remove(&tenant);
+    }
+
+    /// Number of resident tenants.
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn clock() -> (Clock, Arc<AtomicU64>) {
+        let base = Instant::now();
+        let offset = Arc::new(AtomicU64::new(0));
+        let read = Arc::clone(&offset);
+        (
+            Arc::new(move || base + Duration::from_secs(read.load(Ordering::Relaxed))),
+            offset,
+        )
+    }
+
+    fn engine(store: &Arc<rushdb_storage::Store>, tenant: TenantId) -> rushdb_vector::VectorEngine {
+        rushdb_vector::VectorEngine::new(Arc::new(rushdb_lmpg::Lmpg::new(
+            Arc::clone(store),
+            tenant,
+        )))
+    }
+
+    #[test]
+    fn idle_tenant_is_evicted_and_transparently_reloaded() {
+        let store = Arc::new(rushdb_storage::Store::new_in_memory());
+        let (clock, now) = clock();
+        let residency = TenantResidency::new(Duration::from_secs(300), 1 << 30, clock);
+        let tenant = TenantId::from_ordinal(9);
+        let first = residency.vector(tenant, || engine(&store, tenant)).unwrap();
+        now.store(1_000, Ordering::Relaxed);
+        assert!(
+            residency.evict_idle().is_empty(),
+            "a held handle is never evicted"
+        );
+        drop(first);
+        now.store(1_299, Ordering::Relaxed);
+        residency.vector(tenant, || engine(&store, tenant)).unwrap();
+        now.store(1_299 + 299, Ordering::Relaxed);
+        assert!(
+            residency.evict_idle().is_empty(),
+            "used 299 s ago: still resident"
+        );
+        now.store(1_299 + 300, Ordering::Relaxed);
+        assert_eq!(residency.evict_idle(), vec![tenant]);
+        assert_eq!((residency.len(), residency.resident_bytes()), (0, 0));
+        // The next request rebuilds the handle from durable state.
+        assert!(residency.vector(tenant, || engine(&store, tenant)).is_ok());
+        assert_eq!(residency.len(), 1);
+    }
+
+    #[test]
+    fn ten_thousand_tenants_round_robin_stay_within_budget() {
+        let store = Arc::new(rushdb_storage::Store::new_in_memory());
+        let (clock, now) = clock();
+        let budget = 1_000 * ENTRY_OVERHEAD_BYTES;
+        let residency = TenantResidency::new(Duration::from_secs(300), budget, clock);
+        for round in 0..2u64 {
+            for ordinal in 0..10_000u64 {
+                now.store(round * 10_000 + ordinal, Ordering::Relaxed);
+                let tenant = TenantId::from_ordinal(ordinal + 2);
+                let handle = residency.vector(tenant, || engine(&store, tenant)).unwrap();
+                drop(handle);
+                assert!(residency.resident_bytes() <= budget);
+            }
+        }
+        assert_eq!(
+            residency.len(),
+            1_000,
+            "LRU keeps the budget's worth resident"
+        );
+        // The most recently used tenants are the resident ones.
+        assert_eq!(
+            residency.resident_tenants()[0],
+            TenantId::from_ordinal(10_001)
+        );
+    }
+
+    #[test]
+    fn active_tenants_exhausting_the_budget_are_refused_until_one_goes_idle() {
+        let store = Arc::new(rushdb_storage::Store::new_in_memory());
+        let (clock, _) = clock();
+        let residency =
+            TenantResidency::new(Duration::from_secs(300), 2 * ENTRY_OVERHEAD_BYTES, clock);
+        let (a, b, c) = (
+            TenantId::from_ordinal(2),
+            TenantId::from_ordinal(3),
+            TenantId::from_ordinal(4),
+        );
+        let held_a = residency.vector(a, || engine(&store, a)).unwrap();
+        let held_b = residency.vector(b, || engine(&store, b)).unwrap();
+        let Err(error) = residency.vector(c, || engine(&store, c)) else {
+            panic!("all resident tenants are active")
+        };
+        assert!(error.contains("tenant_capacity"));
+        drop(held_a);
+        assert!(residency.vector(c, || engine(&store, c)).is_ok());
+        assert_eq!(residency.resident_tenants().len(), 2);
+        drop(held_b);
+    }
+
+    #[test]
+    fn a_coordinator_with_an_open_transaction_is_not_evicted() {
+        let store = Arc::new(rushdb_storage::Store::new_in_memory());
+        let (clock, now) = clock();
+        let residency = TenantResidency::new(Duration::from_secs(1), 1 << 30, clock);
+        let tenant = TenantId::from_ordinal(5);
+        drop(rushdb_lmpg::Lmpg::new(Arc::clone(&store), tenant));
+        let coordinator = residency
+            .tx(tenant, || {
+                rushdb_tx::TxCoordinator::new(Arc::clone(&store), tenant, Duration::from_secs(60))
+            })
+            .unwrap();
+        let tx = coordinator.begin().unwrap();
+        drop(coordinator);
+        now.store(10, Ordering::Relaxed);
+        assert!(
+            residency.evict_idle().is_empty(),
+            "its transaction state is in memory"
+        );
+        residency
+            .existing_tx(tenant)
+            .unwrap()
+            .rollback(&tx)
+            .unwrap();
+        assert_eq!(residency.evict_idle(), vec![tenant]);
+    }
+}
