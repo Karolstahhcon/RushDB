@@ -439,3 +439,445 @@ fn and_match(where_clause: &mut Map<String, Value>, stage: &Value) -> Result<(),
         .cloned()
         .ok_or_else(|| "mongo: `$match` must be an object".to_string())?;
     if filter.is_empty() {
+        return Ok(());
+    }
+    if where_clause.is_empty() {
+        *where_clause = filter;
+    } else {
+        let earlier = std::mem::take(where_clause);
+        where_clause.insert(
+            "$and".into(),
+            json!([Value::Object(earlier), Value::Object(filter)]),
+        );
+    }
+    Ok(())
+}
+
+fn enforce_budget(rows: &[Value], budget: Option<usize>) -> Result<(), String> {
+    if let Some(limit) = budget {
+        let bytes = serde_json::to_vec(rows).map_err(|e| e.to_string())?.len();
+        if bytes > limit {
+            return Err(format!(
+                "mongo result exceeds configured byte budget ({bytes} > {limit})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply a `$group` stage: record its group keys and accumulator outputs.
+///
+/// # Errors
+///
+/// Returns an error string if `$group` is not an object or uses an unsupported
+/// accumulator operator.
+fn apply_group_stage(
+    g: &Value,
+    group_by: &mut Vec<String>,
+    select: &mut Map<String, Value>,
+) -> Result<(), String> {
+    let g = g.as_object().ok_or("mongo: $group must be an object")?;
+    if let Some(id) = g.get("_id").and_then(Value::as_str) {
+        // Group keys are emitted by the native aggregate automatically.
+        group_by.push(id.trim_start_matches('$').to_string());
+    }
+    for (out, spec) in g {
+        if out == "_id" {
+            continue;
+        }
+        let Some(acc) = spec.as_object() else {
+            continue;
+        };
+        let Some((op, target)) = acc.iter().next() else {
+            continue;
+        };
+        let field = target.as_str().unwrap_or("").trim_start_matches('$');
+        let target_field = format!("$record.{field}");
+        let entry: Value = match op.as_str() {
+            "$sum" => {
+                if field.is_empty() {
+                    json!({ "$count": "*" })
+                } else {
+                    json!({ "$sum": target_field })
+                }
+            }
+            "$avg" => json!({ "$avg": target_field }),
+            "$min" => json!({ "$min": target_field }),
+            "$max" => json!({ "$max": target_field }),
+            "$count" => {
+                json!({ "$count": if field.is_empty() { "*".to_string() } else { format!("$record.{field}") } })
+            }
+            "$first" => json!({ "$first": target_field }),
+            _ => return Err(format!("mongo: unsupported accumulator {op}")),
+        };
+        select.insert(out.clone(), entry);
+    }
+    Ok(())
+}
+
+/// Execute a MongoDB write statement (insert/update/delete/upsert). Returns the
+/// number of records affected.
+///
+/// # Errors
+///
+/// Returns an error string if the statement is not valid JSON, names an
+/// unsupported command or update operator, is missing a required field, or the
+/// underlying mutation fails.
+pub fn execute_mutation(lmpg: &Lmpg, statement: &str) -> Result<u64, String> {
+    execute_mutation_with_cancel(lmpg, statement, &|| false)
+}
+
+/// Execute a MongoDB write while observing transport cancellation/deadline
+/// state between matching and mutation steps.
+///
+/// # Errors
+///
+/// Returns the same validation and storage errors as [`execute_mutation`], or
+/// a cancellation error when `is_cancelled` reports that execution should
+/// stop.
+pub fn execute_mutation_with_cancel(
+    lmpg: &Lmpg,
+    statement: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<u64, String> {
+    execute_mutation_inner(lmpg, None, statement, is_cancelled)
+}
+
+/// Execute a MongoDB write against a caller-owned pinned read view while
+/// observing transport cancellation/deadline state.
+///
+/// # Errors
+///
+/// Returns the same validation, storage, and cancellation errors as
+/// [`execute_mutation_with_cancel`].
+pub fn execute_mutation_in_view_with_cancel(
+    lmpg: &Lmpg,
+    view: &Arc<ReadView>,
+    statement: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<u64, String> {
+    execute_mutation_inner(lmpg, Some(view), statement, is_cancelled)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the supported Mongo write command families share one validated dispatch boundary"
+)]
+fn execute_mutation_inner(
+    lmpg: &Lmpg,
+    source_view: Option<&Arc<ReadView>>,
+    statement: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<u64, String> {
+    let doc: Value =
+        serde_json::from_str(statement).map_err(|e| format!("mongo: invalid JSON: {e}"))?;
+    let obj = doc
+        .as_object()
+        .ok_or_else(|| "mongo: write command must be an object".to_string())?;
+
+    if let Some(ins) = obj.get("insertOne") {
+        let ins = ins
+            .as_object()
+            .ok_or("mongo: insertOne must be an object")?;
+        let label = collection_of(ins, "insertOne")?;
+        let document = ins
+            .get("document")
+            .and_then(Value::as_object)
+            .ok_or("mongo: insertOne requires `document`")?;
+        let fields = fields_from_object(document);
+        lmpg.create_record(&label, None, fields)
+            .map_err(|e| e.to_reason())?;
+        return Ok(1);
+    }
+
+    if let Some(ins) = obj.get("insertMany") {
+        let ins = ins
+            .as_object()
+            .ok_or("mongo: insertMany must be an object")?;
+        let label = collection_of(ins, "insertMany")?;
+        let docs = ins
+            .get("documents")
+            .and_then(Value::as_array)
+            .ok_or("mongo: insertMany requires `documents`")?;
+        // One commit for every document: all inserted, or none.
+        let mut batch = lmpg.begin_batch();
+        for d in docs {
+            if is_cancelled() {
+                return Err("mongo: mutation cancelled".into());
+            }
+            let d = d.as_object().ok_or("mongo: document must be an object")?;
+            batch.ops.push(BatchOp::CreateRecord {
+                label: label.clone(),
+                explicit_id: None,
+                fields: fields_from_object(d),
+            });
+        }
+        return run_counted(lmpg, batch, None);
+    }
+
+    if let Some(upd) = obj.get("updateOne").or_else(|| obj.get("updateMany")) {
+        let is_many = obj.contains_key("updateMany");
+        let upd = upd.as_object().ok_or("mongo: update must be an object")?;
+        let label = collection_of(upd, "update")?;
+        let filter = upd.get("filter").cloned().unwrap_or(json!({}));
+        let mutation = upd
+            .get("update")
+            .and_then(Value::as_object)
+            .ok_or("mongo: update requires `update` ($set/...)")?;
+        // Upsert has no existing document, so operators use Mongo's default
+        // values. Matched updates are expanded per record below so `$inc`
+        // reads the current numeric value and `$unset` removes the field.
+        let upsert_fields = extract_update_fields(mutation, None)?;
+        let refs = matching_records(lmpg, source_view, &label, &filter, is_cancelled)?;
+        if refs.is_empty() {
+            if upd.get("upsert").and_then(Value::as_bool).unwrap_or(false) {
+                let mut doc_map = Map::new();
+                if let Some(obj) = filter.as_object() {
+                    for (k, v) in obj {
+                        if v.is_object() {
+                            continue;
+                        }
+                        doc_map.insert(k.clone(), v.clone());
+                    }
+                }
+                for (k, v) in &upsert_fields {
+                    if let FieldChange::Set(value) = v {
+                        doc_map.insert(k.clone(), value.clone());
+                    }
+                }
+                lmpg.create_record(&label, None, fields_from_object(&doc_map))
+                    .map_err(|e| e.to_reason())?;
+                return Ok(1);
+            }
+            return Ok(0);
+        }
+        // Every update is computed from one snapshot and committed at once,
+        // only if the tenant has not changed since: all applied, or none.
+        let snap = match source_view {
+            Some(view) => Arc::clone(view),
+            None => Arc::new(lmpg.store.read_view().map_err(|e| e.to_string())?),
+        };
+        let mut batch = lmpg.begin_batch();
+        for (rr, _id) in refs.into_iter().take(if is_many { usize::MAX } else { 1 }) {
+            if is_cancelled() {
+                return Err("mongo: mutation cancelled".into());
+            }
+            let current =
+                rushdb_lmpg::reconstruct::reconstruct_record(&snap, lmpg.tenant, rr.ordinal)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("mongo: record vanished")?;
+            batch.ops.push(BatchOp::UpdateFields {
+                owner: rushdb_types::ids::OwnerKind::Record,
+                owner_ord: rr.ordinal,
+                owner_public_id: rr.record_id,
+                fields: extract_update_fields(mutation, current.as_object())?,
+            });
+        }
+        return run_counted(lmpg, batch, Some(snap.commit_index()));
+    }
+
+    if let Some(del) = obj.get("deleteOne").or_else(|| obj.get("deleteMany")) {
+        let is_many = obj.contains_key("deleteMany");
+        let del = del.as_object().ok_or("mongo: delete must be an object")?;
+        let label = collection_of(del, "delete")?;
+        let filter = del.get("filter").cloned().unwrap_or(json!({}));
+        let refs = matching_records(lmpg, source_view, &label, &filter, is_cancelled)?;
+        // One commit for every matched record: all deleted, or none.
+        let mut batch = lmpg.begin_batch();
+        for (rr, _id) in refs.into_iter().take(if is_many { usize::MAX } else { 1 }) {
+            if is_cancelled() {
+                return Err("mongo: mutation cancelled".into());
+            }
+            batch.ops.push(BatchOp::DeleteRecord { record: rr });
+        }
+        return run_counted(lmpg, batch, None);
+    }
+
+    Err("mongo: unsupported write command (expected insertOne/insertMany/updateOne/updateMany/deleteOne/deleteMany)".into())
+}
+
+/// Commit `batch` as one atomic commit (at `snapshot` when given: refused
+/// if the tenant changed since) and return its operation count.
+fn run_counted(lmpg: &Lmpg, batch: BatchTx, snapshot: Option<u64>) -> Result<u64, String> {
+    let affected = batch.ops.len() as u64;
+    if affected > 0 {
+        match snapshot {
+            Some(version) => lmpg.run_batch_at_version(batch, version),
+            None => lmpg.run_batch(batch),
+        }
+        .map_err(|e| e.to_reason())?;
+    }
+    Ok(affected)
+}
+
+fn collection_of(obj: &Map<String, Value>, command: &str) -> Result<String, String> {
+    obj.get("collection")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| format!("mongo: {command} requires `collection`"))
+}
+
+fn fields_from_object(obj: &Map<String, Value>) -> Vec<(String, FieldChange)> {
+    let mut out = Vec::new();
+    for (k, v) in obj {
+        if k == "id" || k == "_id" || k == "__id" || k == "__label" {
+            continue;
+        }
+        out.push((
+            k.clone(),
+            if v.is_null() {
+                FieldChange::ExplicitNull
+            } else {
+                FieldChange::Set(v.clone())
+            },
+        ));
+    }
+    out
+}
+
+/// Expand a Mongo update against an optional current document.
+fn extract_update_fields(
+    update: &Map<String, Value>,
+    current: Option<&Map<String, Value>>,
+) -> Result<Vec<(String, FieldChange)>, String> {
+    let mut out = Vec::new();
+    for (op, spec) in update {
+        match op.as_str() {
+            "$set" => {
+                let spec = spec.as_object().ok_or("mongo: $set must be an object")?;
+                for (k, v) in spec {
+                    out.push((k.clone(), FieldChange::Set(v.clone())));
+                }
+            }
+            "$inc" => {
+                let spec = spec.as_object().ok_or("mongo: $inc must be an object")?;
+                for (k, increment) in spec {
+                    let increment = increment
+                        .as_number()
+                        .ok_or("mongo: $inc values must be numeric")?;
+                    let zero = Value::from(0);
+                    let base = current
+                        .and_then(|doc| doc.get(k))
+                        .filter(|value| !value.is_null())
+                        .unwrap_or(&zero);
+                    let base = base.as_number().ok_or_else(|| {
+                        format!("mongo: cannot increment non-numeric field `{k}`")
+                    })?;
+                    let value = if base.is_f64() || increment.is_f64() {
+                        let sum = exact_f64_number(base)? + exact_f64_number(increment)?;
+                        serde_json::Number::from_f64(sum)
+                            .ok_or("mongo: $inc produced a non-finite number")?
+                    } else if let (Some(a), Some(b)) = (base.as_i64(), increment.as_i64()) {
+                        serde_json::Number::from(a.checked_add(b).ok_or("mongo: $inc overflow")?)
+                    } else if base.is_i64() != increment.is_i64() {
+                        return Err(
+                            "mongo: $inc mixed signed and unsigned integers are unsupported".into(),
+                        );
+                    } else {
+                        let base = base
+                            .as_u64()
+                            .ok_or("mongo: invalid unsigned base for $inc")?;
+                        let increment = increment
+                            .as_u64()
+                            .ok_or("mongo: invalid unsigned increment for $inc")?;
+                        let sum = base.checked_add(increment).ok_or("mongo: $inc overflow")?;
+                        serde_json::Number::from(sum)
+                    };
+                    out.push((k.clone(), FieldChange::Set(Value::Number(value))));
+                }
+            }
+            "$unset" => {
+                let spec = spec.as_object().ok_or("mongo: $unset must be an object")?;
+                for k in spec.keys() {
+                    out.push((k.clone(), FieldChange::Delete));
+                }
+            }
+            _ => return Err(format!("mongo: unsupported update operator {op}")),
+        }
+    }
+    Ok(out)
+}
+
+/// Convert a JSON number to `f64` only when integer widening is lossless.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the reverse cast immediately verifies that mixed numeric arithmetic is lossless"
+)]
+fn exact_f64_number(number: &serde_json::Number) -> Result<f64, String> {
+    if number.is_f64() {
+        return number
+            .as_f64()
+            .ok_or_else(|| "mongo: invalid floating-point number".into());
+    }
+    if let Some(value) = number.as_i64() {
+        let widened = value as f64;
+        // Positive i64::MAX widens to 2^63 and then saturating-casts back to
+        // i64::MAX; reject that boundary alias. The negative minimum is
+        // exactly representable and remains valid.
+        let in_signed_domain = value < 0 || widened < 9_223_372_036_854_775_808.0;
+        if in_signed_domain && widened as i64 == value {
+            return Ok(widened);
+        }
+    }
+    if let Some(value) = number.as_u64() {
+        let widened = value as f64;
+        // u64::MAX widens to 2^64 and saturating-casts back to the same
+        // value. Require the widened value to remain strictly inside the
+        // unsigned domain before accepting the round-trip.
+        if widened < 18_446_744_073_709_551_616.0 && widened as u64 == value {
+            return Ok(widened);
+        }
+    }
+    Err("mongo: $inc mixed numeric types would lose integer precision".into())
+}
+
+/// Resolve records matching a Mongo filter into `(RecordRef, public_id)` pairs.
+fn matching_records(
+    lmpg: &Lmpg,
+    source_view: Option<&Arc<ReadView>>,
+    label: &str,
+    filter: &Value,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<(rushdb_lmpg::RecordRef, String)>, String> {
+    let query = json!({
+        "labels": [label],
+        "where": filter.clone(),
+        "limit": 1_000_000,
+    });
+    let parsed = rushdb_query::document::parse_document(&query).map_err(|e| e.to_string())?;
+    let snap = match source_view {
+        Some(view) => Arc::clone(view),
+        None => Arc::new(lmpg.store.read_view().map_err(|e| e.to_string())?),
+    };
+    let page = rushdb_query::find_records_in_view(lmpg, &parsed.search, is_cancelled, snap.clone())
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for rec in &page.records {
+        if is_cancelled() {
+            return Err("mongo: mutation cancelled".into());
+        }
+        let id = rec
+            .get(rushdb_types::value::ID_FIELD)
+            .and_then(Value::as_str)
+            .ok_or("mongo: record missing its id")?;
+        let bytes = rushdb_lmpg::import::decode_simple_hex(id)
+            .ok_or_else(|| "mongo: invalid record id".to_string())?;
+        let hdr = rushdb_lmpg::reader::try_access::record_by_id(
+            &snap,
+            lmpg.tenant,
+            &rushdb_types::ids::RecordId(bytes),
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or("mongo: record vanished")?;
+        out.push((
+            rushdb_lmpg::RecordRef {
+                record_id: hdr.record_id,
+                ordinal: hdr.ordinal,
+            },
+            id.to_string(),
+        ));
+    }
+    Ok(out)
+}

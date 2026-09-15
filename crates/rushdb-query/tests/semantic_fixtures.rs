@@ -98,3 +98,103 @@ fn multivalue_matches_any_element_but_not_empty() {
         None,
         vec![("tags".into(), FieldChange::Set(json!(["b", "c"])))],
     )
+    .unwrap();
+
+    // Element match: both records containing "b".
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({ "labels": ["D"], "where": { "tags": { "$eq": "b" } } })
+        ),
+        2
+    );
+    // Empty array contains no element.
+    assert_eq!(
+        match_count(
+            &lmpg,
+            &json!({ "labels": ["D"], "where": { "tags": { "$eq": "a" } } })
+        ),
+        1
+    );
+}
+
+#[test]
+fn sort_ties_have_deterministic_order() {
+    let lmpg = setup();
+    // Three records with identical sort keys; ordering must be stable (not
+    // nondeterministic), so repeated queries return the same sequence.
+    for i in 0..3 {
+        lmpg.create_record(
+            "D",
+            None,
+            vec![
+                ("k".into(), FieldChange::Set(json!(10))),
+                ("id".into(), FieldChange::Set(json!(i))),
+            ],
+        )
+        .unwrap();
+    }
+    let doc = json!({ "labels": ["D"], "orderBy": { "k": "desc" }, "limit": 3 });
+    let parsed = rushdb_query::document::parse_document(&doc).unwrap();
+    let ids = |parsed: &rushdb_query::SearchRequest| -> Vec<Value> {
+        rushdb_query::find_records(&lmpg, parsed)
+            .unwrap()
+            .records
+            .iter()
+            .map(|r| r.get("id").cloned().unwrap_or(Value::Null))
+            .collect()
+    };
+    let first = ids(&parsed.search);
+    let second = ids(&parsed.search);
+    assert_eq!(
+        first, second,
+        "tie ordering must be deterministic across runs"
+    );
+    assert_eq!(first.len(), 3);
+}
+
+#[test]
+fn exact_totals_are_reported_not_truncated() {
+    let lmpg = setup();
+    for i in 0..25 {
+        lmpg.create_record("D", None, vec![("v".into(), FieldChange::Set(json!(i)))])
+            .unwrap();
+    }
+    // A small page must report the true total, not the page size.
+    let doc = json!({ "labels": ["D"], "limit": 5 });
+    let parsed = rushdb_query::document::parse_document(&doc).unwrap();
+    let page = rushdb_query::find_records(&lmpg, &parsed.search).unwrap();
+    assert_eq!(page.records.len(), 5);
+    assert_eq!(
+        page.total_matched, 25,
+        "exact total must not be truncated to the page"
+    );
+}
+
+#[test]
+fn text_bearing_queries_are_deterministic() {
+    // A filtered label query over text-bearing records must be finite and
+    // deterministic (prerequisite for any filtered-scoring work; the `$text`
+    // operator lives in the text engine, not the query-document grammar).
+    let lmpg = setup();
+    for i in 0..10 {
+        lmpg.create_record(
+            "D",
+            None,
+            vec![(
+                "t".into(),
+                FieldChange::Set(json!(format!("graph database topic {i}"))),
+            )],
+        )
+        .unwrap();
+    }
+    let doc = json!({ "labels": ["D"], "limit": 10 });
+    let parsed = rushdb_query::document::parse_document(&doc).unwrap();
+    let a = rushdb_query::find_records(&lmpg, &parsed.search).unwrap();
+    let b = rushdb_query::find_records(&lmpg, &parsed.search).unwrap();
+    assert_eq!(
+        a.records, b.records,
+        "query over text-bearing records is deterministic"
+    );
+    assert_eq!(a.total_matched, 10);
+}
