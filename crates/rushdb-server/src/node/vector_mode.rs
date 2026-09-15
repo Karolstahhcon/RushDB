@@ -69,3 +69,75 @@ impl Node {
             .map_err(|e| e.to_string())?;
         let mut report = vector_search_report(mode, outcome.path, pool);
         if warming {
+            report["fallback"] = "annWarming".into();
+        }
+        // VEC-3: an exact answer to an ANN-sized pool used to be silent.
+        self.metrics.observe_vector_search(
+            report["mode"].as_str().unwrap_or("exact"),
+            report["fallback"].as_str().unwrap_or("none"),
+        );
+        Ok((outcome.hits, report))
+    }
+
+    /// The path a search takes before any fallback, and whether `auto`
+    /// chose it.
+    fn vector_search_mode(
+        &self,
+        search: &VectorSearch<'_>,
+        similarity: Similarity,
+        pool: u64,
+    ) -> Result<(SearchMode, bool), String> {
+        let ef = search.ef.filter(|ef| *ef > 0);
+        let ann = SearchMode::Ann {
+            ef: ef.unwrap_or(self.vector_default_ef).max(search.k),
+        };
+        let cosine = similarity == Similarity::Cosine;
+        let requested = search.mode.unwrap_or(if ef.is_some() {
+            VectorSearchMode::Ann
+        } else {
+            VectorSearchMode::Auto
+        });
+        match requested {
+            VectorSearchMode::Exact => Ok((SearchMode::Exact, false)),
+            VectorSearchMode::Ann if !cosine => Err(format!(
+                "vector search mode `ann` requires a cosine index; this index uses `{}` \
+                 (use `exact` or `auto`)",
+                similarity.as_str()
+            )),
+            VectorSearchMode::Ann => Ok((ann, false)),
+            VectorSearchMode::Auto if !cosine || pool <= self.vector_exact_max_pool => {
+                Ok((SearchMode::Exact, true))
+            }
+            VectorSearchMode::Auto => Ok((ann, true)),
+        }
+    }
+}
+
+/// The `vectorSearch` report returned next to a search's rows.
+pub(super) fn vector_search_report(
+    mode: SearchMode,
+    path: SearchPath,
+    pool: u64,
+) -> serde_json::Value {
+    let (taken, ef, fallback) = match (path, mode) {
+        (SearchPath::Ann, SearchMode::Ann { ef }) => ("ann", Some(ef), None),
+        (SearchPath::ExactFallback(reason), _) => (
+            "exact",
+            None,
+            Some(match reason {
+                FallbackReason::Metric => "metric",
+                FallbackReason::Budget => "budget",
+                FallbackReason::LowConfidence => "lowConfidence",
+            }),
+        ),
+        _ => ("exact", None, None),
+    };
+    let mut report = serde_json::json!({ "mode": taken, "pool": pool });
+    if let Some(ef) = ef {
+        report["ef"] = ef.into();
+    }
+    if let Some(fallback) = fallback {
+        report["fallback"] = fallback.into();
+    }
+    report
+}
