@@ -21,3 +21,27 @@ pub mod error;
 /// Stable hashing helpers and hash domains.
 pub mod hash;
 /// Tenant, record, relationship and dense-ordinal identifiers.
+pub mod ids;
+/// Declared secondary indexes.
+pub mod index;
+/// Byte-exact key constructors for the tenant keyspace.
+pub mod keys;
+/// Logical types, catalog state, cardinality and nullability.
+pub mod model;
+/// Name tokens and spelling similarity for labels and properties.
+pub mod names;
+/// Occurrence rows, headers and property/embedding metadata.
+pub mod occurrence;
+/// Canonical tenant policy payloads for authorization.
+pub mod security;
+/// Planner value-distribution summaries (estimates, never results).
+pub mod stats;
+/// Scalar value model and JSON conversion helpers.
+pub mod value;
+/// Matching a search text against stored values.
+pub mod value_match;
+
+pub use error::TypesError;
+
+/// Convenience alias for a [`std::result::Result`] over [`TypesError`].
+pub type Result<T> = std::result::Result<T, TypesError>;
