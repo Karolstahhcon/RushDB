@@ -141,3 +141,147 @@ fn an_indexed_condition_reads_only_its_candidates() {
 fn a_text_comparison_on_a_widened_column_keeps_every_matching_row() {
     // `code` holds integers and one text value, so its column is text and
     // `code = '5'` matches the integer 5. An index probe for the text "5"
+    // would miss it, so the condition is not planned on the index.
+    let lmpg = engine(0);
+    index(&lmpg, "code");
+    let rows = sql(&lmpg, "SELECT n FROM big WHERE code = '5'").unwrap();
+    assert_eq!(rows, vec![json!({"n": 5})]);
+}
+
+#[test]
+fn an_unindexed_filter_over_the_walk_limit_is_refused() {
+    let lmpg = engine(100);
+    let err = sql(&lmpg, "SELECT n FROM big WHERE n = 5").unwrap_err();
+    let SqlError::UnindexedWalk(message) = &err else {
+        panic!("expected an unindexed-walk refusal, got {err:?}");
+    };
+    assert!(
+        message.contains("`n`") && message.contains("300"),
+        "{message}"
+    );
+    // A filter with no condition the scan can state walks the whole label.
+    assert!(matches!(
+        sql(&lmpg, "SELECT n FROM big WHERE n + 1 = 6"),
+        Err(SqlError::UnindexedWalk(_))
+    ));
+    // Unfiltered reads walk nothing they do not return.
+    assert_eq!(
+        sql(&lmpg, "SELECT count(*) AS c FROM big").unwrap(),
+        vec![json!({"c": RECORDS})]
+    );
+    assert_eq!(sql(&lmpg, "SELECT n FROM big LIMIT 2").unwrap().len(), 2);
+    // With the index the same filter runs.
+    index(&lmpg, "n");
+    assert_eq!(
+        sql(&lmpg, "SELECT count(*) AS c FROM big WHERE n = 5").unwrap(),
+        vec![json!({"c": 30})]
+    );
+}
+
+#[test]
+fn an_unfiltered_limit_stops_after_its_rows() {
+    let lmpg = engine(0);
+    reset_work_counters();
+    assert_eq!(sql(&lmpg, "SELECT n FROM big LIMIT 2").unwrap().len(), 2);
+    let read = take_work_counters().candidate_rows;
+    assert!(
+        read < u64::try_from(RECORDS).unwrap(),
+        "read {read} candidates"
+    );
+}
+
+#[test]
+fn a_count_the_index_answers_exactly_rebuilds_no_record() {
+    let lmpg = engine(0);
+    reset_work_counters();
+    assert_eq!(
+        sql(&lmpg, "SELECT count(*) AS c FROM big").unwrap(),
+        vec![json!({"c": RECORDS})]
+    );
+    assert_eq!(take_work_counters().reconstructed_rows, 0);
+
+    // Walked: the `Exact` filters are checked strictly per row.
+    let counts = |lmpg: &Lmpg| {
+        [
+            "SELECT count(*) AS c FROM big WHERE n = 5",
+            "SELECT count(*) AS c FROM big WHERE n >= 5 AND n <= 6",
+            "SELECT count(*) AS c FROM big WHERE n = 5 AND code >= 100",
+        ]
+        .map(|q| sql(lmpg, q).unwrap()[0]["c"].clone())
+    };
+    let expected = [json!(30), json!(60), json!(20)];
+    assert_eq!(counts(&lmpg), expected);
+
+    // Planned: the index answers `n` exactly, so nothing is rebuilt.
+    index(&lmpg, "n");
+    reset_work_counters();
+    assert_eq!(
+        sql(&lmpg, "SELECT count(*) AS c FROM big WHERE n = 5").unwrap(),
+        vec![json!({"c": 30})]
+    );
+    let work = take_work_counters();
+    assert_eq!((work.candidate_rows, work.reconstructed_rows), (30, 0));
+    assert_eq!(counts(&lmpg), expected);
+}
+
+#[test]
+fn point_reads_return_the_values_a_rebuilt_record_holds() {
+    // `n, code` are scalar properties, read by point reads; adding `__id`
+    // rebuilds each record instead. Both must give the same values.
+    let lmpg = engine(0);
+    let pairs = |q: &str| {
+        let mut pairs: Vec<String> = sql(&lmpg, q)
+            .unwrap()
+            .iter()
+            .map(|row| format!("{}|{}", row["n"], row["code"]))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    let by_points = pairs("SELECT n, code FROM big");
+    assert_eq!(by_points.len(), usize::try_from(RECORDS).unwrap());
+    assert_eq!(by_points, pairs("SELECT __id, n, code FROM big"));
+}
+
+#[test]
+fn the_request_bounds_stop_a_walk_the_server_allows() {
+    // `disallow_full_table_scans` with `large_full_scan_rows = 100`.
+    let lmpg = engine(0).with_request_limits(RequestLimits {
+        unindexed_walk_max_owners: Some(100),
+        ..RequestLimits::default()
+    });
+    assert!(matches!(
+        sql(&lmpg, "SELECT n FROM big WHERE n = 5"),
+        Err(SqlError::UnindexedWalk(_))
+    ));
+
+    // A `count(*)` yields no batch until its walk ends, so the scan itself
+    // checks the deadline.
+    let lmpg = engine(0).with_request_limits(RequestLimits {
+        deadline: Some(std::time::Instant::now()),
+        ..RequestLimits::default()
+    });
+    let err = sql(&lmpg, "SELECT count(*) AS c FROM big WHERE n + 1 = 6").unwrap_err();
+    assert!(matches!(err, SqlError::Cancelled), "{err:?}");
+
+    // `work_mem`: a sort of every row needs more than 1 KiB.
+    let lmpg = engine(0).with_request_limits(RequestLimits {
+        query_memory_max_bytes: Some(1024),
+        ..RequestLimits::default()
+    });
+    let err = sql(&lmpg, "SELECT n, code FROM big ORDER BY code, n").unwrap_err();
+    assert!(matches!(err, SqlError::MemoryLimit(1024)), "{err:?}");
+
+    // Unbounded, the same statements run.
+    let lmpg = engine(0);
+    assert_eq!(
+        sql(&lmpg, "SELECT count(*) AS c FROM big WHERE n + 1 = 6").unwrap(),
+        vec![json!({"c": 30})]
+    );
+    assert_eq!(
+        sql(&lmpg, "SELECT n, code FROM big ORDER BY code, n")
+            .unwrap()
+            .len(),
+        300
+    );
+}
