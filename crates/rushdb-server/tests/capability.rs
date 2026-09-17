@@ -38,3 +38,44 @@ fn tampered_token_fails_signature() {
             claims.get(3..4).unwrap(),
             if claims.as_bytes()[3] == b'C' {
                 "D"
+            } else {
+                "C"
+            }
+        )
+    );
+    let _ = sig;
+    let full = format!("{tampered}{}", token.split_once('.').unwrap().1);
+    assert_eq!(verify(SECRET, &full, now), Err(CapError::BadSignature));
+    // wrong secret
+    assert_eq!(
+        verify(b"different-secret", &token, now),
+        Err(CapError::BadSignature)
+    );
+}
+
+#[test]
+fn expired_token_rejected() {
+    let now = 1_700_000_000u64;
+    let token = issue(SECRET, "svc-a", "read", 60, now);
+    assert!(verify(SECRET, &token, now + 30).is_ok());
+    assert_eq!(verify(SECRET, &token, now + 61), Err(CapError::Expired));
+}
+
+#[test]
+fn scope_check() {
+    assert!(allows_scope("read", "read"));
+    assert!(!allows_scope("read", "write"));
+    assert!(allows_scope("read write", "write"));
+    assert!(allows_scope("*", "anything"));
+    assert!(!allows_scope("", "read"));
+}
+
+#[test]
+fn malformed_rejected() {
+    assert_eq!(
+        verify(SECRET, "not-a-capability", 0),
+        Err(CapError::Malformed)
+    );
+    // Structurally two segments but invalid base64url is malformed.
+    assert_eq!(verify(SECRET, "abc.xyz", 0), Err(CapError::Malformed));
+}
