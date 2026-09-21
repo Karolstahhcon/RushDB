@@ -49,3 +49,107 @@ fn describe_labels_and_schema_handle_shaped_queries() {
             "PLANET",
             &serde_json::json!({ "name": "Endor" }),
         )
+        .unwrap();
+        let b = rushdb_lmpg::import::import_document(
+            &lmpg,
+            "BATTLE",
+            &serde_json::json!({ "name": "Endor battle" }),
+        )
+        .unwrap();
+        let s = rushdb_lmpg::import::import_document(
+            &lmpg,
+            "STARSHIP",
+            &serde_json::json!({ "name": "s1", "firepower_score": 90 }),
+        )
+        .unwrap();
+        let _ = lmpg.create_relationship("RELATED", p, b, vec![]);
+        let _ = lmpg.create_relationship("RELATED", b, s, vec![]);
+    }
+
+    // the failing label API shape: labels + predicate + select (multi-hop collect)
+    let env = RequestEnvelope {
+        protocol_version: 1,
+        request_id: None,
+        context: RequestContext {
+            scope: None,
+            deadline_ms: None,
+            ..Default::default()
+        },
+        operation: Operation::Describe {
+            describe: Describe::Labels {
+                query: rushdb_protocol::QueryDocument {
+                    labels: vec!["PLANET".into()],
+                    predicate: serde_json::json!({
+                        "BATTLE": {
+                            "STARSHIP": { "$alias": "$starship", "firepower_score": { "$gte": 60 } }
+                        }
+                    }),
+                    select: Some(serde_json::json!({
+                        "planetName": "$record.name",
+                        "highFirepowerStarships": {
+                            "$collect": {
+                                "from": "$starship",
+                                "select": { "name": "$starship.name", "firepower": "$starship.firepower_score" },
+                                "orderBy": { "firepower": "desc" },
+                                "limit": 10
+                            }
+                        }
+                    })),
+                    group_by: vec![],
+                    order: None,
+                    offset: 0,
+                    limit: None,
+                    cursor_ttl_ms: None,
+                },
+            },
+        },
+    };
+    let resp = handler.execute(env, None).expect("describe labels");
+    match resp.response {
+        rushdb_protocol::Response::Labels { labels } => assert_eq!(labels, vec!["PLANET"]),
+        other => panic!("expected Labels, got {other:?}"),
+    }
+
+    // Describe::Schema had the same unreachable; verify it also returns records.
+    let env = RequestEnvelope {
+        protocol_version: 1,
+        request_id: None,
+        context: RequestContext {
+            scope: None,
+            deadline_ms: None,
+            ..Default::default()
+        },
+        operation: Operation::Describe {
+            describe: Describe::Schema {
+                query: rushdb_protocol::QueryDocument {
+                    labels: vec!["PLANET".into()],
+                    predicate: serde_json::json!({}),
+                    select: Some(serde_json::json!({
+                        "planetName": "$record.name"
+                    })),
+                    group_by: vec![],
+                    order: None,
+                    offset: 0,
+                    limit: None,
+                    cursor_ttl_ms: None,
+                },
+                detail: None,
+                skip: None,
+                limit: None,
+            },
+        },
+    };
+    let resp = handler.execute(env, None).expect("describe schema");
+    match resp.response {
+        rushdb_protocol::Response::Schema { schema } => {
+            assert_eq!(
+                schema.labels,
+                vec![rushdb_protocol::LabelDescription {
+                    name: "PLANET".into(),
+                    records_count: 1
+                }]
+            );
+        }
+        other => panic!("expected Schema, got {other:?}"),
+    }
+}

@@ -160,3 +160,165 @@ fn score_matches_independent_reference_across_dims_and_magnitudes() {
         }
     }
 }
+
+#[test]
+#[expect(
+    clippy::float_cmp,
+    reason = "exact comparison is the assertion: the zero-norm fallback returns exactly 0.0"
+)]
+fn cosine_invariants_and_scale_invariance_hold() {
+    let a = [3.0f32, 4.0];
+    let b = [4.0f32, 3.0];
+    let neg = [-3.0f32, -4.0];
+    let ortho = [4.0f32, -3.0];
+    let zero = [0.0f32, 0.0];
+    assert!((score(&a, &a, Similarity::Cosine) - 1.0).abs() < 1e-6);
+    assert!((score(&a, &neg, Similarity::Cosine) + 1.0).abs() < 1e-6);
+    assert!(score(&a, &ortho, Similarity::Cosine).abs() < 1e-6);
+    assert_eq!(score(&a, &zero, Similarity::Cosine), 0.0);
+
+    // Cosine is scale invariant: cos(a, b) == cos(k*a, b) for k > 0.
+    let k = 7.5f32;
+    let scaled: Vec<f32> = a.iter().map(|x| x * k).collect();
+    assert!(
+        (score(&scaled, &b, Similarity::Cosine) - score(&a, &b, Similarity::Cosine)).abs() < 1e-6,
+        "cosine must be scale invariant"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::float_cmp,
+    reason = "exact comparison is the assertion: identical vectors score exactly 1.0"
+)]
+fn euclidean_and_dot_invariants_hold() {
+    let a = [1.0f32, 2.0, 3.0];
+    let b = [4.0f32, 6.0, 3.0];
+    // L2 = sqrt(9 + 16 + 0) = 5 -> 1 / (1 + 5) = 1/6.
+    assert!((score(&a, &b, Similarity::Euclidean) - 1.0 / 6.0).abs() < 1e-6);
+    assert_eq!(score(&a, &a, Similarity::Euclidean), 1.0);
+    // dot = 4 + 12 + 9 = 25; self = 1 + 4 + 9 = 14.
+    assert!((score(&a, &b, Similarity::Dot) - 25.0).abs() < 1e-5);
+    assert!((score(&a, &a, Similarity::Dot) - 14.0).abs() < 1e-5);
+}
+
+#[test]
+#[expect(
+    clippy::float_cmp,
+    reason = "bit-identical equality is the assertion: same f32 inputs through the same formula"
+)]
+fn exact_search_returns_the_pairwise_score_for_every_hit() {
+    // Calibration: a hit's score must equal the direct pairwise `score` against
+    // the stored vector — no hidden normalization, no ingest-time transform.
+    let mut state = 7u64;
+    let vectors: Vec<Vec<f32>> = (0..24).map(|_| random_vector(&mut state, 8, 1.0)).collect();
+    let (vecs, by_ord) = bind_fixture(
+        Arc::new(Store::new_in_memory()),
+        "cal",
+        8,
+        Similarity::Cosine,
+        &vectors,
+    );
+    let q = random_vector(&mut state, 8, 1.0);
+    let hits = vecs.search_exact("cal", &q, vectors.len(), None).unwrap();
+    assert_eq!(hits.len(), vectors.len());
+    for h in hits {
+        let bound = by_ord.get(&h.source.owner_ord).expect("bound vector");
+        assert_eq!(
+            h.score,
+            score(&q, bound, Similarity::Cosine),
+            "hit score must be bit-identical to the pairwise score"
+        );
+    }
+}
+
+#[test]
+fn high_magnitude_high_dim_cosine_matches_reference() {
+    // f64 accumulation must not drift or overflow at large magnitudes.
+    let mut state = 5u64;
+    let dims = 512usize;
+    let vectors: Vec<Vec<f32>> = (0..8)
+        .map(|_| random_vector(&mut state, dims, 1e3))
+        .collect();
+    let q = random_vector(&mut state, dims, 1e3);
+    let (vecs, by_ord) = bind_fixture(
+        Arc::new(Store::new_in_memory()),
+        "big",
+        u32::try_from(dims).unwrap(),
+        Similarity::Cosine,
+        &vectors,
+    );
+    for h in vecs.search_exact("big", &q, vectors.len(), None).unwrap() {
+        let bound = by_ord.get(&h.source.owner_ord).unwrap();
+        assert_close(
+            h.score,
+            reference_score(&q, bound, Similarity::Cosine),
+            "high-magnitude cosine",
+        );
+        assert!(h.score.is_finite());
+    }
+}
+
+#[test]
+fn exact_search_and_view_path_agree_bit_for_bit() {
+    let mut state = 99u64;
+    let vectors: Vec<Vec<f32>> = (0..16).map(|_| random_vector(&mut state, 4, 1.0)).collect();
+    let (vecs, _) = bind_fixture(
+        Arc::new(Store::new_in_memory()),
+        "paths",
+        4,
+        Similarity::Dot,
+        &vectors,
+    );
+    let q = random_vector(&mut state, 4, 1.0);
+    let direct = vecs.search_exact("paths", &q, 16, None).unwrap();
+    let snap = vecs.snapshot().unwrap();
+    let space = vecs.lookup_space_in_view(&snap, "paths").unwrap().unwrap();
+    let via_view = vecs
+        .search_exact_in_view(&snap, &space, &q, 16, None)
+        .unwrap();
+    assert_eq!(signature(&direct), signature(&via_view));
+}
+
+#[test]
+fn scores_are_bit_identical_across_memory_disk_and_reopen() {
+    let mut state = 4242u64;
+    let vectors: Vec<Vec<f32>> = (0..32)
+        .map(|_| random_vector(&mut state, 16, 1.0))
+        .collect();
+    let q = random_vector(&mut state, 16, 1.0);
+
+    let mem = bind_fixture(
+        Arc::new(Store::new_in_memory()),
+        "s",
+        16,
+        Similarity::Cosine,
+        &vectors,
+    )
+    .0;
+
+    let dir = rushdb_storage::TempPath::dir("vec-drift");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("rushdb.redb");
+    let disk_store = Arc::new(Store::open(&db).unwrap());
+    let disk = bind_fixture(disk_store.clone(), "s", 16, Similarity::Cosine, &vectors).0;
+    let disk_scores = signature(&disk.search_exact("s", &q, 32, None).unwrap());
+    drop(disk);
+    drop(disk_store);
+
+    let reopened_store = Arc::new(Store::open(&db).unwrap());
+    let reopened = VectorEngine::new(Arc::new(Lmpg::new(reopened_store, TENANT)));
+    let reopened_scores = signature(&reopened.search_exact("s", &q, 32, None).unwrap());
+
+    let mem_scores = signature(&mem.search_exact("s", &q, 32, None).unwrap());
+    assert_eq!(mem_scores.len(), vectors.len());
+    assert_eq!(
+        disk_scores, mem_scores,
+        "disk scores must match memory bit-for-bit"
+    );
+    assert_eq!(
+        reopened_scores, mem_scores,
+        "reopened scores must match memory bit-for-bit"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
