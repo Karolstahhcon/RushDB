@@ -759,3 +759,764 @@ fn metadata_and_property_caches_share_one_logical_budget() {
         node.scope()
             .import_json_document(&format!("Label{index}"), &properties.into())
             .unwrap();
+    }
+    let _ = node.scope().labels().unwrap();
+    let view = node.store.read_view().unwrap();
+    let _ = node.scope().proptypes_cached(&view).unwrap();
+    let metadata_entries = node
+        .metadata_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(0, |cache| cache.stats().entries);
+    let property_entries = node
+        .property_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(0, |cache| cache.stats().entries);
+    let snapshot = node.store.resource_budget().snapshot();
+    assert!(snapshot.used <= snapshot.limit);
+    assert!(
+        metadata_entries + property_entries > 0,
+        "at least one derived cache should be resident"
+    );
+}
+
+#[test]
+fn relationship_catalog_matches_scan_for_groups_and_property_shapes() {
+    on_backends(|node| {
+        let lmpg = node.scope().lmpg();
+        let first = node.scope().import_json_document("A", &json!({})).unwrap();
+        let second = node.scope().import_json_document("B", &json!({})).unwrap();
+        let third = node.scope().import_json_document("C", &json!({})).unwrap();
+        lmpg.create_relationship(
+            "R",
+            first,
+            second,
+            vec![("w".into(), rushdb_lmpg::plan::FieldChange::Set(json!(1)))],
+        )
+        .unwrap();
+        lmpg.create_relationship(
+            "R",
+            third,
+            second,
+            vec![("w".into(), rushdb_lmpg::plan::FieldChange::Set(json!(2)))],
+        )
+        .unwrap();
+        lmpg.create_relationship("S", first, third, vec![]).unwrap();
+
+        let catalog = node.scope().describe_relationships().unwrap();
+        let scan = node.scope().describe_relationships_scan().unwrap();
+
+        let groups = |list: &[rushdb_protocol::RelationshipDescription]| {
+            list.iter()
+                .map(|d| {
+                    (
+                        d.source_label.clone(),
+                        d.relationship_type.clone(),
+                        d.target_label.clone(),
+                        d.count,
+                    )
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(groups(&catalog), groups(&scan), "group counts must match");
+
+        // Property names/types per relationship type agree with the scan.
+        let shapes = |list: &[rushdb_protocol::RelationshipDescription]| {
+            let mut out = std::collections::BTreeMap::<
+                String,
+                std::collections::BTreeSet<(String, String)>,
+            >::new();
+            for d in list {
+                for p in &d.properties {
+                    out.entry(d.relationship_type.clone())
+                        .or_default()
+                        .insert((p.name.clone(), p.value_type.clone()));
+                }
+            }
+            out
+        };
+        assert_eq!(shapes(&catalog), shapes(&scan));
+        // Property counts are per shape: each R shape has one edge carrying w.
+        for r in catalog.iter().filter(|d| d.relationship_type == "R") {
+            let w = r.properties.iter().find(|p| p.name == "w").expect("w");
+            assert_eq!(w.relationships_count, 1, "{r:?}");
+        }
+    });
+}
+
+/// The counter-based catalog describe must return exactly what the
+/// member-scan oracle returns, across scalars, arrays, empty arrays,
+/// explicit nulls, type splits, a retype, and a delete.
+#[test]
+fn catalog_detail_counts_match_the_member_scan() {
+    let mut cfg = crate::ServerConfig {
+        data_dir: None,
+        ..Default::default()
+    };
+    let node = Node::bootstrap(&mut cfg).unwrap();
+
+    for i in 0..24 {
+        let mut obj = json!({"name": format!("a{i}")});
+        if i % 2 == 0 {
+            obj["n"] = json!(i);
+        }
+        if i % 3 == 0 {
+            obj["tags"] = json!(["x", "y"]);
+        }
+        if i == 1 {
+            obj["empty"] = json!([]);
+            obj["nv"] = json!(null);
+        }
+        node.scope().import_json_document("A", &obj).unwrap();
+    }
+    // Type split: `n` as int on A and float on B are distinct pids.
+    for i in 0..9 {
+        let n = if i % 3 == 0 {
+            json!(i)
+        } else {
+            json!(f64::from(i) + 0.25)
+        };
+        node.scope()
+            .import_json_document("B", &json!({"n": n, "name": format!("b{i}")}))
+            .unwrap();
+    }
+    // Label-scoped counters must move on retype and delete.
+    let moved = node
+        .scope()
+        .import_json_document("A", &json!({"name": "a-move", "n": 99}))
+        .unwrap();
+    node.scope()
+        .retype_record(&hex_simple(&moved.record_id), "A", "C")
+        .unwrap();
+    node.scope()
+        .delete_records(&json!({"labels": ["A"], "where": {"name": "a0"}}))
+        .unwrap();
+
+    let view = Arc::new(node.store.read_view().unwrap());
+    let meta = node.scope().property_meta_in_view(&view).unwrap();
+    let no_siblings = |_: &str, _: &rushdb_types::model::LogicalType| Vec::new();
+    for body in [
+        json!({"detail": "catalog"}),
+        json!({"detail": "catalog", "labels": ["A"]}),
+        json!({"detail": "catalog", "labels": ["B", "C"]}),
+    ] {
+        let mut counter = node
+            .scope()
+            .describe_properties_catalog(&view, &meta, &[], &no_siblings, &body)
+            .unwrap();
+        let mut scan = node
+            .scope()
+            .describe_properties_catalog_scan(&view, &meta, &no_siblings, &body)
+            .unwrap();
+        let sort = |entries: &mut Vec<rushdb_protocol::PropertyDescription>| {
+            entries.sort_by(|a, b| {
+                (a.label.clone(), a.id.clone()).cmp(&(b.label.clone(), b.id.clone()))
+            });
+        };
+        sort(&mut counter);
+        sort(&mut scan);
+        assert_eq!(counter.len(), scan.len(), "entry count for {body}");
+        for (c, s) in counter.iter().zip(scan.iter()) {
+            assert_eq!((&c.label, &c.id), (&s.label, &s.id), "identity for {body}");
+            assert_eq!(
+                c.records_count, s.records_count,
+                "records_count for {} label {:?}",
+                c.name, c.label
+            );
+            assert_eq!(
+                c.is_array, s.is_array,
+                "is_array for {} label {:?}",
+                c.name, c.label
+            );
+            assert_eq!(c.name, s.name);
+            assert_eq!(c.value_type, s.value_type);
+        }
+    }
+}
+
+#[test]
+fn metrics_expose_storage_byte_accounting() {
+    let node = Node::bootstrap(&mut crate::ServerConfig::default()).unwrap();
+    for i in 0..50 {
+        node.scope()
+            .import_json_document("S", &json!({"u": i}))
+            .unwrap();
+    }
+    node.refresh_storage_stats(std::time::Duration::ZERO);
+    let stats = node.storage_stats().expect("storage stats computed");
+    assert!(stats.data_keys > 0, "canonical data rows counted");
+    assert_eq!(stats.log_keys, 50, "one command-log row per commit");
+    let rendered = node.metrics_render();
+    for metric in [
+        "rushdb_storage_data_bytes",
+        "rushdb_storage_history_bytes",
+        "rushdb_storage_log_bytes",
+        "rushdb_storage_receipt_bytes",
+    ] {
+        assert!(rendered.contains(metric), "missing {metric} in metrics");
+    }
+    drop(node);
+}
+
+#[test]
+fn metrics_expose_attributable_work_counters_and_boot_phases() {
+    let node = Node::bootstrap(&mut crate::ServerConfig::default()).unwrap();
+    node.observe_work("sql_scan", "candidate_rows", 7);
+    node.observe_work("sql_scan", "reconstructed_rows", 3);
+    node.observe_boot_phase("storage", 0.001);
+    let rendered = node.metrics_render();
+    assert!(rendered.contains("rushdb_operation_work_total"));
+    assert!(rendered.contains("operation=\"sql_scan\""));
+    assert!(rendered.contains("counter=\"candidate_rows\""));
+    assert!(rendered.contains("rushdb_boot_phase_duration_seconds"));
+    assert!(rendered.contains("phase=\"config\""));
+    assert!(rendered.contains("phase=\"storage\""));
+    assert!(rendered.contains("phase=\"total\""));
+}
+
+#[test]
+fn sql_scan_records_runtime_work_counters() {
+    let node = Node::bootstrap(&mut crate::ServerConfig::default()).unwrap();
+    node.scope()
+        .import_json_document("Person", &json!({"name": "Ada", "salary": 150_000}))
+        .unwrap();
+    let rows = node
+        .scope()
+        .sql("SELECT name FROM person WHERE salary >= 100000")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let rendered = node.metrics_render();
+    assert!(rendered.contains("operation=\"sql_scan\""));
+    assert!(rendered.contains("counter=\"candidate_rows\""));
+    assert!(rendered.contains("counter=\"reconstructed_rows\""));
+    assert!(rendered.contains("counter=\"posting_bytes\""));
+}
+
+#[test]
+fn raft_node_can_reopen_repeatedly_after_owned_runtime_shutdown() {
+    let dir = rushdb_storage::TempPath::dir("raft-reopen");
+    for round in 0..3 {
+        let mut cfg = crate::ServerConfig {
+            data_dir: Some(dir.to_path_buf()),
+            pgwire_port: 0,
+            raft: Some(crate::RaftConfig { size: 1 }),
+            ..crate::ServerConfig::default()
+        };
+        let node = Node::bootstrap(&mut cfg).expect("raft bootstrap");
+        node.scope()
+            .import_json_document("Round", &json!({"round": round}))
+            .expect("raft commit");
+        assert!(
+            node.committed_version() >= u64::try_from(round + 1).expect("small round fits u64")
+        );
+        drop(node);
+    }
+    let mut cfg = crate::ServerConfig {
+        data_dir: Some(dir.to_path_buf()),
+        pgwire_port: 0,
+        raft: Some(crate::RaftConfig { size: 1 }),
+        ..crate::ServerConfig::default()
+    };
+    let reopened = Node::bootstrap(&mut cfg).expect("reopen raft store");
+    assert_eq!(reopened.committed_version(), 3);
+    drop(reopened);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn label_delete_of_fat_records_removes_the_label() {
+    on_backends(|node| {
+        let blob = "x".repeat(8 * 1024);
+        for i in 0..20 {
+            node.scope()
+                .import_json_document("Fat", &json!({"n": i, "blob": blob}))
+                .unwrap();
+        }
+        node.scope()
+            .import_json_document("Keep", &json!({"n": 1}))
+            .unwrap();
+        let affected = node
+            .scope()
+            .delete_records(&json!({"labels": ["Fat"]}))
+            .unwrap();
+        assert_eq!(affected, 20);
+        assert!(node
+            .scope()
+            .enumerate_records("Fat", None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            node.scope().enumerate_records("Keep", None).unwrap().len(),
+            1
+        );
+    });
+}
+
+#[test]
+fn link_pairs_skip_existing_without_scanning_unrelated_edges() {
+    on_backends(|node| {
+        let source = node
+            .scope()
+            .import_json_document("Src", &json!({"n": 0}))
+            .unwrap();
+        let mut targets = Vec::new();
+        for i in 0..40 {
+            targets.push(
+                node.scope()
+                    .import_json_document("Tgt", &json!({"n": i}))
+                    .unwrap(),
+            );
+        }
+        let extra = node
+            .scope()
+            .import_json_document("Tgt", &json!({"n": 40}))
+            .unwrap();
+        let pairs: Vec<rushdb_protocol::RelationshipPair> = targets
+            .iter()
+            .map(|tgt| rushdb_protocol::RelationshipPair {
+                source_id: hex_simple(&source.record_id),
+                target_id: hex_simple(&tgt.record_id),
+                relation_type: None,
+            })
+            .collect();
+        let first = node
+            .scope()
+            .link_records_pairs(&rushdb_protocol::RelationshipPairsMutation {
+                relation_type: "LINK".into(),
+                direction: rushdb_protocol::Direction::Out,
+                pairs,
+                properties: json!({}),
+            })
+            .unwrap();
+        assert_eq!(first["created"], 40);
+        let second = node
+            .scope()
+            .link_records_pairs(&rushdb_protocol::RelationshipPairsMutation {
+                relation_type: "LINK".into(),
+                direction: rushdb_protocol::Direction::Out,
+                pairs: vec![
+                    rushdb_protocol::RelationshipPair {
+                        source_id: hex_simple(&source.record_id),
+                        target_id: hex_simple(&extra.record_id),
+                        relation_type: None,
+                    },
+                    rushdb_protocol::RelationshipPair {
+                        source_id: hex_simple(&source.record_id),
+                        target_id: hex_simple(&targets[0].record_id),
+                        relation_type: None,
+                    },
+                ],
+                properties: json!({}),
+            })
+            .unwrap();
+        assert_eq!(second["created"], 1);
+        assert_eq!(second["skipped_existing"], 1);
+    });
+}
+
+/// Release profile for the native load composition. Not part of `make gate`.
+/// Run: `cargo test -p rushdb-server --release -- --ignored load_phase_profile --nocapture`
+#[test]
+#[ignore = "prints phase timings; run in release when attributing load cost"]
+fn load_phase_profile() {
+    let dir = rushdb_storage::TempPath::dir("load-phase");
+    let mut cfg = crate::ServerConfig {
+        data_dir: Some(dir.to_path_buf()),
+        max_request_bytes: 64 * 1024 * 1024,
+        listen_addr: "127.0.0.1".into(),
+        tls_cert: None,
+        tls_key: None,
+        ..Default::default()
+    };
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    let n = 1_000usize;
+    let docs = serde_json::Value::Array(
+        (0..n)
+            .map(|i| json!({"i": i, "name": format!("r{i}")}))
+            .collect(),
+    );
+    let t0 = std::time::Instant::now();
+    let ingested = node
+        .scope()
+        .ingest_documents(Some("Load"), &docs, &json!({"returnResult": true}))
+        .unwrap();
+    let ingest_ms = t0.elapsed().as_millis();
+    let data = ingested["data"].as_array().expect("ingest returns records");
+    assert_eq!(data.len(), n);
+    let ids: Vec<String> = data
+        .iter()
+        .map(|rec| rec["id"].as_str().unwrap().to_string())
+        .collect();
+    let pairs: Vec<rushdb_protocol::RelationshipPair> = (0..750)
+        .map(|i| rushdb_protocol::RelationshipPair {
+            source_id: ids[i].clone(),
+            target_id: ids[i + 1].clone(),
+            relation_type: None,
+        })
+        .collect();
+    let t1 = std::time::Instant::now();
+    let linked = node
+        .scope()
+        .link_records_pairs(&rushdb_protocol::RelationshipPairsMutation {
+            relation_type: "REL".into(),
+            direction: rushdb_protocol::Direction::Out,
+            pairs,
+            properties: json!({}),
+        })
+        .unwrap();
+    let link_ms = t1.elapsed().as_millis();
+    assert_eq!(linked["created"], 750);
+    let no_cancel = || false;
+    let search = rushdb_query::SearchRequest {
+        labels: vec!["Load".into()],
+        pagination: rushdb_query::Pagination {
+            skip: 0,
+            limit: Some(200),
+        },
+        ..Default::default()
+    };
+    let t2 = std::time::Instant::now();
+    let (total, page, cursor) = node
+        .scope()
+        .start_cursor(&search, 60_000, &no_cancel)
+        .unwrap();
+    let cursor_ms = t2.elapsed().as_millis();
+    assert_eq!(total, n as u64);
+    assert_eq!(page.len(), 200);
+    assert!(cursor.is_some());
+    let mut offset = search;
+    offset.pagination.skip = 800;
+    let t3 = std::time::Instant::now();
+    let (_off_total, off_page) = node
+        .scope()
+        .search_with_cancel(&offset, &no_cancel)
+        .unwrap();
+    let offset_ms = t3.elapsed().as_millis();
+    assert_eq!(off_page.len(), 200);
+    let t4 = std::time::Instant::now();
+    let described = node.scope().describe_relationships().unwrap();
+    let describe_ms = t4.elapsed().as_millis();
+    assert_eq!(described.len(), 1);
+    assert_eq!(described[0].count, 750);
+    let t5 = std::time::Instant::now();
+    let walked = node
+        .scope()
+        .scan_relationships(&rushdb_protocol::RelationshipQuery {
+            limit: Some(u64::MAX),
+            ..Default::default()
+        })
+        .unwrap();
+    let walk_ms = t5.elapsed().as_millis();
+    assert_eq!(walked["total"], 750);
+    eprintln!(
+        "load_phase n={n} ingest_ms={ingest_ms} link_ms={link_ms} cursor_page_ms={cursor_ms} offset_skip800_ms={offset_ms} describe_relationships_ms={describe_ms} scan_relationships_ms={walk_ms}"
+    );
+    drop(node);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn require_vector_index_name_gate_refuses_derived_alias() {
+    let mut cfg = crate::ServerConfig::default();
+    cfg.resources.require_vector_index_name = true;
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    assert!(node.scope().require_vector_index_name());
+
+    // createVector without a name is refused.
+    let err = node
+        .scope()
+        .create_vector_index(&rushdb_protocol::VectorIndexDefinition {
+            name: None,
+            label: "Doc".into(),
+            property: "emb".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap_err();
+    assert!(err.contains("requires an explicit `name`"), "got: {err}");
+
+    // An explicit name works.
+    node.scope()
+        .create_vector_index(&rushdb_protocol::VectorIndexDefinition {
+            name: Some("doc-emb-2".into()),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+
+    // search.vector without an index is refused.
+    let err = node
+        .scope()
+        .search_vectors(&rushdb_protocol::VectorQuery {
+            labels: vec!["Doc".into()],
+            property: "emb".into(),
+            vector: vec![1.0, 0.0],
+            similarity: "cosine".into(),
+            index: None,
+            predicate: json!({}),
+            offset: 0,
+            limit: 1,
+            ef: None,
+            mode: None,
+            score_threshold: None,
+        })
+        .unwrap_err();
+    assert!(err.contains("requires an explicit `index`"), "got: {err}");
+
+    // Inline `$vectors` without an index is refused before any record exists.
+    let err = node
+        .scope()
+        .create_record(
+            "Doc",
+            &json!({ "n": 1 }),
+            &[json!({ "propertyName": "emb", "vector": [1.0, 0.0] })],
+            &json!({}),
+        )
+        .unwrap_err();
+    assert!(err.contains("require an explicit `index`"), "got: {err}");
+    assert!(
+        node.scope()
+            .enumerate_records("Doc", None)
+            .unwrap()
+            .is_empty(),
+        "a refused inline vector must not create the record"
+    );
+
+    let err = node
+        .scope()
+        .create_record(
+            "Doc",
+            &json!({ "n": 2 }),
+            &[json!({ "propertyName": "emb", "vector": "not-a-vector" })],
+            &json!({}),
+        )
+        .unwrap_err();
+    assert!(err.contains("invalid inline vector"), "got: {err}");
+}
+
+#[test]
+fn derived_vector_alias_still_resolves_without_the_gate() {
+    let mut cfg = crate::ServerConfig::default();
+    cfg.resources.require_vector_index_name = false;
+    let node = Node::bootstrap(&mut cfg).unwrap();
+    assert!(!node.scope().require_vector_index_name());
+    let row = node
+        .scope()
+        .create_vector_index(&rushdb_protocol::VectorIndexDefinition {
+            name: None,
+            label: "Doc".into(),
+            property: "emb".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    assert_eq!(row["nameSource"], "derived");
+}
+
+#[test]
+fn reclaim_vector_slots_erases_superseded_slots_after_gc() {
+    let node = Node::bootstrap(&mut crate::ServerConfig::default()).unwrap();
+    let rec = node
+        .scope()
+        .import_json_document("Doc", &json!({ "emb": [1.0, 0.0] }))
+        .unwrap();
+    node.scope()
+        .create_vector_index(&rushdb_protocol::VectorIndexDefinition {
+            name: Some("idx".into()),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    let id = hex_simple(&rec.record_id);
+    node.scope()
+        .upsert_vector_index(
+            "idx",
+            &[rushdb_protocol::VectorItem {
+                record_id: id.clone(),
+                vector: vec![1.0, 0.0],
+                source_hash: None,
+                index_generation: None,
+            }],
+        )
+        .unwrap();
+    // Re-bind: allocates a fresh slot and stages the superseded one.
+    node.scope()
+        .upsert_vector_index(
+            "idx",
+            &[rushdb_protocol::VectorItem {
+                record_id: id,
+                vector: vec![0.0, 1.0],
+                source_hash: None,
+                index_generation: None,
+            }],
+        )
+        .unwrap();
+    node.store.gc(u64::MAX).unwrap();
+    let reclaimed = node.reclaim_vector_slots(u64::MAX).unwrap();
+    assert!(
+        reclaimed >= 1,
+        "expected a superseded slot reclaimed, got {reclaimed}"
+    );
+    // The current binding still searches correctly.
+    let result = node
+        .scope()
+        .search_vectors(&rushdb_protocol::VectorQuery {
+            labels: vec!["Doc".into()],
+            property: "emb".into(),
+            vector: vec![0.0, 1.0],
+            similarity: "cosine".into(),
+            index: Some("idx".into()),
+            predicate: json!({}),
+            offset: 0,
+            limit: 10,
+            ef: None,
+            mode: None,
+            score_threshold: None,
+        })
+        .unwrap();
+    assert_eq!(result["data"].as_array().map_or(0, Vec::len), 1);
+}
+
+#[test]
+fn reclaim_vector_slots_discovers_cold_tenants_from_the_directory() {
+    let node = Node::bootstrap(&mut crate::ServerConfig::default()).unwrap();
+    // A registered tenant with no resident engine (cold) is still found:
+    // enumeration reads the tenant directory, not resident caches.
+    let cold_tenant =
+        rushdb_lmpg::tenancy::resolve_or_register_scope(&node.store, "cold-tenant").unwrap();
+    let lmpg = rushdb_lmpg::Lmpg::new(Arc::clone(&node.store), cold_tenant);
+    let engine = rushdb_vector::VectorEngine::new(Arc::new(lmpg));
+    engine.ensure_space("cold", 2).unwrap();
+    let source = rushdb_vector::SourceRef {
+        kind: rushdb_types::ids::OwnerKind::Record,
+        owner_ord: 1,
+        pid: 1,
+        elem: 0,
+    };
+    engine.bind_external("cold", source, &[1.0, 0.0]).unwrap();
+    engine.bind_external("cold", source, &[0.0, 1.0]).unwrap();
+    node.store.gc(u64::MAX).unwrap();
+    drop(engine);
+    assert!(node.reclaim_vector_slots(u64::MAX).unwrap() >= 1);
+}
+
+#[test]
+fn metrics_render_serves_cached_stats_without_scanning() {
+    // A fresh node has no cached byte accounting; rendering must not scan the
+    // keyspace (the scan is O(keyspace) and runs off the request path).
+    let node = Node::bootstrap(&mut crate::ServerConfig::default()).unwrap();
+    let rendered = node.metrics_render();
+    assert!(rendered.contains("rushdb_storage_file_bytes"));
+    assert!(rendered.contains("rushdb_retention_consumers"));
+    assert!(rendered.contains("rushdb_retention_protected_floor"));
+    // Store-level gauges render without a keyspace scan.
+    assert!(rendered.contains("rushdb_sequencer_inflight_keys"));
+    assert!(rendered.contains("rushdb_storage_group_commits_total"));
+    assert!(rendered.contains("rushdb_retention_oldest_reader_commit"));
+    // RM-7 backend-mutex measurement gauges render.
+    assert!(rendered.contains("rushdb_storage_backend_mutex_wait_ms_total"));
+    assert!(rendered.contains("rushdb_storage_backend_mutex_hold_ms_total"));
+    assert!(rendered.contains("rushdb_storage_backend_mutex_hold_max_ms"));
+    // An explicit refresh populates the cache the scrape then serves.
+    node.refresh_storage_stats(std::time::Duration::ZERO);
+    let rendered = node.metrics_render();
+    assert!(rendered.contains("rushdb_storage_data_bytes"));
+}
+
+#[test]
+fn ingest_compensation_removes_create_only_records_after_binding_failure() {
+    let node = Node::bootstrap(&mut crate::ServerConfig::default()).unwrap();
+    let record = node
+        .scope()
+        .import_json_document("Doc", &serde_json::json!({"name": "temporary"}))
+        .unwrap();
+    node.scope()
+        .rollback_ingest_records(&[rushdb_lmpg::import::UpsertIdMap {
+            draft_id: record.record_id,
+            persisted_id: record.record_id,
+        }])
+        .unwrap();
+    assert!(node
+        .scope()
+        .get_record(&crate::node::hex_simple(&record.record_id))
+        .is_err());
+}
+
+// RM-3: Node's own tenant-slot guard was deleted — `BoundedScheduler` is now
+// the single admission owner. The equivalent coverage (capacity released
+// after a job completes, including a panicking one) lives in
+// `rushdb-engine/src/scheduler.rs`'s own tests
+// (`per_tenant_cap_rejects_work_before_global_queue_is_full`,
+// `panic_in_tenant_job_is_typed_and_releases_the_tenant_slot`), which this
+// test duplicated at a layer that no longer owns the policy.
+
+/// C2 (cloud-capacity F2): the skip-scan tenant enumeration must return exactly
+/// the tenants a naive walk of every `T/` key finds — including tenant ids at
+/// the byte extremes and one whose bytes contain `/` (0x2F) and `0` (0x30),
+/// the separator and its successor the skip-scan seeks past.
+/// C0 (cloud-capacity F12): durable commits feed the commit-latency histogram
+/// (it was never observed), and the WAL / conflict-window / in-flight-body /
+/// GC-tick families are exported.
+#[test]
+fn commit_latency_and_capacity_gauges_are_exported() {
+    on_backends(|node| {
+        node.scope()
+            .create_record("Doc", &json!({ "n": 1 }), &[], &json!({}))
+            .unwrap();
+        let rendered = node.metrics_render();
+        let count = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("rushdb_commit_latency_seconds_count "))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .expect("commit latency histogram exported");
+        assert!(count >= 1.0, "a durable commit must be observed: {count}");
+        for family in [
+            "rushdb_wal_retained_bytes",
+            "rushdb_conflict_window_bytes",
+            "rushdb_http_inflight_body_bytes",
+            "rushdb_gc_tick_seconds",
+            "rushdb_storage_backend_mutex_wait_ms",
+        ] {
+            assert!(rendered.contains(family), "missing {family}");
+        }
+    });
+}
+
+/// Every commit-pipeline phase is timed and exported, so the commit
+/// line's cost can be attributed before choosing how to scale it.
+#[test]
+fn commit_phase_timings_are_exported() {
+    on_backends(|node| {
+        node.scope()
+            .create_record("Doc", &json!({ "n": 1 }), &[], &json!({}))
+            .unwrap();
+        let rendered = node.metrics_render();
+        for phase in rushdb_storage::CommitPhase::ALL {
+            let prefix = format!(
+                "rushdb_commit_phase_seconds_count{{phase=\"{}\"}} ",
+                phase.label()
+            );
+            let count = rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix.as_str()))
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("phase {} not exported", phase.label()));
+            assert!(count >= 1.0, "phase {} never observed", phase.label());
+        }
+    });
+}
