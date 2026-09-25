@@ -222,3 +222,228 @@
    "id": "IC7",
    "sourcePath": "cypher/queries/interactive-complex-7.cypher",
    "sourceSha256": "691a4e3ee8f36053a19e7c615327b51102df43d81b2309b6052cc5ce810aec7d",
+   "status": "typedUnsupported",
+   "reason": "ORDER BY inside a WITH (it orders the rows head(collect(...)) picks the latest like from) and the pattern predicate not((liker)-[:KNOWS]-(person)) are refused by the embedded engine's parser. Engine defect."
+  },
+  {
+   "id": "IC8",
+   "sourcePath": "cypher/queries/interactive-complex-8.cypher",
+   "sourceSha256": "d393a6d23e5162a4894a4629f9cc18aed69f61c1e6f683b04a2630a26135c357",
+   "status": "accepted",
+   "kind": "read",
+   "translation": "Neo4j :param directives and comments removed. Message (the LDBC supertype of Post and Comment) is matched as `x:Post OR x:Comment`: LMPG records carry one label.",
+   "parameters": {
+    "personId": 8
+   },
+   "statement": "MATCH (start:Person {id: $personId})<-[:HAS_CREATOR]-(msg)<-[:REPLY_OF]-(comment:Comment)-[:HAS_CREATOR]->(person:Person) WHERE msg:Post OR msg:Comment RETURN person.id AS personId, person.firstName AS personFirstName, person.lastName AS personLastName, comment.creationDate AS commentCreationDate, comment.id AS commentId, comment.content AS commentContent ORDER BY commentCreationDate DESC, commentId ASC LIMIT 20",
+   "expectedRows": [
+    {
+     "personId": 9,
+     "personFirstName": "Alan",
+     "personLastName": "Turing",
+     "commentCreationDate": 55,
+     "commentId": 31,
+     "commentContent": "reply one"
+    }
+   ]
+  },
+  {
+   "id": "IC9",
+   "sourcePath": "cypher/queries/interactive-complex-9.cypher",
+   "sourceSha256": "84d05a4cc87a0680b490fc98aa303ff211f363204cc81d936cd5d442bf85cfe7",
+   "status": "accepted",
+   "kind": "read",
+   "translation": "Neo4j :param directives and comments removed. Message (the LDBC supertype of Post and Comment) is matched as `x:Post OR x:Comment`: LMPG records carry one label. `WITH collect(distinct friend) \u2026 UNWIND` (deduplicating friends before the join) is the same set as one MATCH with RETURN DISTINCT over (friend, message); `ORDER BY message.id` becomes the projected `commentOrPostId`.",
+   "parameters": {
+    "personId": 7,
+    "maxDate": 100
+   },
+   "statement": "MATCH (root:Person {id: $personId })-[:KNOWS*1..2]-(friend:Person), (friend)<-[:HAS_CREATOR]-(message) WHERE NOT friend = root AND (message:Post OR message:Comment) AND message.creationDate < $maxDate RETURN DISTINCT friend.id AS personId, friend.firstName AS personFirstName, friend.lastName AS personLastName, message.id AS commentOrPostId, coalesce(message.content,message.imageFile) AS commentOrPostContent, message.creationDate AS commentOrPostCreationDate ORDER BY commentOrPostCreationDate DESC, commentOrPostId ASC LIMIT 20",
+   "expectedRows": [
+    {
+     "personId": 9,
+     "personFirstName": "Alan",
+     "personLastName": "Turing",
+     "commentOrPostId": 32,
+     "commentOrPostContent": "pic.jpg",
+     "commentOrPostCreationDate": 60
+    },
+    {
+     "personId": 9,
+     "personFirstName": "Alan",
+     "personLastName": "Turing",
+     "commentOrPostId": 31,
+     "commentOrPostContent": "reply one",
+     "commentOrPostCreationDate": 55
+    },
+    {
+     "personId": 8,
+     "personFirstName": "Grace",
+     "personLastName": "Hopper",
+     "commentOrPostId": 30,
+     "commentOrPostContent": "post one",
+     "commentOrPostCreationDate": 50
+    }
+   ]
+  },
+  {
+   "id": "IC10",
+   "sourcePath": "cypher/queries/interactive-complex-10.cypher",
+   "sourceSha256": "eca22afe6907cedfc77a80cbb441112ddbc71d63300496159bd070eb7b07b811",
+   "status": "typedUnsupported",
+   "reason": "Pattern predicate NOT (friend)-[:KNOWS]-(person), datetime({epochMillis: \u2026}) and a WITH pipeline: the embedded engine's parser refuses the pattern predicate and its NEXT is defective (see IS2). Engine defect."
+  },
+  {
+   "id": "IC11",
+   "sourcePath": "cypher/queries/interactive-complex-11.cypher",
+   "sourceSha256": "677b80887429445c5319a0d621d86b7df1c07889ae94e40447aacf853729fea1",
+   "status": "accepted",
+   "kind": "read",
+   "translation": "Neo4j :param directives and comments removed. `WITH DISTINCT friend` before the join is the same set as one MATCH with RETURN DISTINCT over the projected row.",
+   "parameters": {
+    "personId": 7,
+    "countryName": "UK",
+    "workFromYear": 2000
+   },
+   "statement": "MATCH (person:Person {id: $personId })-[:KNOWS*1..2]-(friend:Person), (friend)-[workAt:WORK_AT]->(company:Company)-[:IS_LOCATED_IN]->(:Country {name: $countryName }) WHERE NOT person = friend AND workAt.workFrom < $workFromYear RETURN DISTINCT friend.id AS personId, friend.firstName AS personFirstName, friend.lastName AS personLastName, company.name AS organizationName, workAt.workFrom AS organizationWorkFromYear ORDER BY organizationWorkFromYear ASC, toInteger(personId) ASC, organizationName DESC LIMIT 10",
+   "expectedRows": [
+    {
+     "personId": 9,
+     "personFirstName": "Alan",
+     "personLastName": "Turing",
+     "organizationName": "IBM",
+     "organizationWorkFromYear": 1950
+    }
+   ]
+  },
+  {
+   "id": "IC12",
+   "sourcePath": "cypher/queries/interactive-complex-12.cypher",
+   "sourceSha256": "eda861f84d905e43433cd8f589212a2f934ad0bd9b6f9e58c19ade52922a9100",
+   "status": "typedUnsupported",
+   "reason": "collect() of tag ids in a WITH, then a MATCH filtered by membership, over a type-alternation variable-length path (HAS_TYPE|IS_SUBCLASS_OF*0..): needs NEXT, defective in the embedded engine (see IS2). Engine defect."
+  },
+  {
+   "id": "IC13",
+   "sourcePath": "cypher/queries/interactive-complex-13.cypher",
+   "sourceSha256": "1fc0927090f33b336890090b5ffe65fcd6e40ae90fb8b572173fe239f0689d07",
+   "status": "typedUnsupported",
+   "reason": "shortestPath: the embedded engine returns -1 (no path) for two persons joined by a two-hop KNOWS path. Engine defect."
+  },
+  {
+   "id": "IC14",
+   "sourcePath": "cypher/queries/interactive-complex-14.cypher",
+   "sourceSha256": "081ea034b25c7abf6f462a857ab7babe150902eb414a837f9fd3695edaa6cb5b",
+   "status": "typedUnsupported",
+   "reason": "allShortestPaths, list comprehensions with reduce() over pattern comprehensions: refused by the embedded engine's parser, and its shortestPath is defective (see IC13). Engine defect."
+  },
+  {
+   "id": "IU1",
+   "sourcePath": "cypher/queries/interactive-update-1.cypher",
+   "sourceSha256": "a6fce2548cef4fc7a1d1ef9ecb0cd585f4b52c93a8b418d648dbdda1d72b6812",
+   "status": "typedUnsupported",
+   "reason": "After `WITH p, count(*) \u2026 UNWIND \u2026 MATCH \u2026 CREATE`, the embedded engine silently drops every create following the first WITH while reporting success; the statement also matches the Organisation supertype of University and Company, which LMPG's one-label records do not have. Engine defect and data-model exclusion."
+  },
+  {
+   "id": "IU2",
+   "sourcePath": "cypher/queries/interactive-update-2.cypher",
+   "sourceSha256": "713f88b3b913125c3a37d3eaa08bcb6ea82e2b50c514ec0cea1d141e30eec0d6",
+   "status": "accepted",
+   "kind": "write",
+   "translation": "Neo4j :param directives and comments removed.",
+   "parameters": {
+    "personId": 7,
+    "postId": 32,
+    "creationDate": 80
+   },
+   "statement": "MATCH (person:Person {id: $personId}), (post:Post {id: $postId}) CREATE (person)-[:LIKES {creationDate: $creationDate}]->(post)",
+   "check": "MATCH (:Person {id: 7})-[l:LIKES]->(:Post {id: 32}) RETURN l.creationDate AS d",
+   "expectedCheckRows": [
+    {
+     "d": 80
+    }
+   ]
+  },
+  {
+   "id": "IU3",
+   "sourcePath": "cypher/queries/interactive-update-3.cypher",
+   "sourceSha256": "b39450d84fd490a435e80cc09d430fae49a8da5f1ad81e34f0376b50ec5088dc",
+   "status": "accepted",
+   "kind": "write",
+   "translation": "Neo4j :param directives and comments removed.",
+   "parameters": {
+    "personId": 8,
+    "commentId": 31,
+    "creationDate": 81
+   },
+   "statement": "MATCH (person:Person {id: $personId}), (comment:Comment {id: $commentId}) CREATE (person)-[:LIKES {creationDate: $creationDate}]->(comment)",
+   "check": "MATCH (:Person {id: 8})-[l:LIKES]->(:Comment {id: 31}) RETURN l.creationDate AS d",
+   "expectedCheckRows": [
+    {
+     "d": 81
+    }
+   ]
+  },
+  {
+   "id": "IU4",
+   "sourcePath": "cypher/queries/interactive-update-4.cypher",
+   "sourceSha256": "e7af9b991a8c6bad671ce3c9a8bc581c366fd5968cce8715f2e681ff3a362071",
+   "status": "typedUnsupported",
+   "reason": "After `WITH f UNWIND $tagIds \u2026 MATCH \u2026 CREATE`, the embedded engine silently drops the HAS_TAG creates while reporting success (only the forum and HAS_MODERATOR are written). Engine defect."
+  },
+  {
+   "id": "IU5",
+   "sourcePath": "cypher/queries/interactive-update-5.cypher",
+   "sourceSha256": "ca6f899b24cf989e10ed31b3a9787319f27e198f5a1f96f7deb1ab6d10ff5351",
+   "status": "accepted",
+   "kind": "write",
+   "translation": "Neo4j :param directives and comments removed.",
+   "parameters": {
+    "forumId": 20,
+    "personId": 10,
+    "joinDate": 90
+   },
+   "statement": "MATCH (f:Forum {id: $forumId}), (p:Person {id: $personId}) CREATE (f)-[:HAS_MEMBER {joinDate: $joinDate}]->(p)",
+   "check": "MATCH (:Forum {id: 20})-[m:HAS_MEMBER]->(:Person {id: 10}) RETURN m.joinDate AS d",
+   "expectedCheckRows": [
+    {
+     "d": 90
+    }
+   ]
+  },
+  {
+   "id": "IU6",
+   "sourcePath": "cypher/queries/interactive-update-6.cypher",
+   "sourceSha256": "0d104b513466e4521019c7ad15ff1a7bc54948cc6179be992d9798bde83cba13",
+   "status": "typedUnsupported",
+   "reason": "Creates a Post:Message node (two labels: LMPG records carry one), uses CASE inside a property map (refused by the embedded engine with an internal error), and creates HAS_TAG after a WITH/UNWIND (dropped, see IU4). Data-model exclusion and engine defects."
+  },
+  {
+   "id": "IU7",
+   "sourcePath": "cypher/queries/interactive-update-7.cypher",
+   "sourceSha256": "1403f9758945a5b97a5d7435acb7e98bbdc03aaacb396154b43cf92e1e44a886",
+   "status": "typedUnsupported",
+   "reason": "Creates a Comment:Message node (two labels) and matches the Message supertype by a computed id; creates HAS_TAG after a WITH/UNWIND (dropped, see IU4). Data-model exclusion and engine defect."
+  },
+  {
+   "id": "IU8",
+   "sourcePath": "cypher/queries/interactive-update-8.cypher",
+   "sourceSha256": "2af5bc3f2efb7ab200a5161c451e355c2b8fcd8e5612f8cc91d9bc530cd87f46",
+   "status": "accepted",
+   "kind": "write",
+   "translation": "Neo4j :param directives and comments removed.",
+   "parameters": {
+    "person1Id": 7,
+    "person2Id": 10,
+    "creationDate": 95
+   },
+   "statement": "MATCH (p1:Person {id: $person1Id}), (p2:Person {id: $person2Id}) CREATE (p1)-[:KNOWS {creationDate: $creationDate}]->(p2)",
+   "check": "MATCH (:Person {id: 7})-[k:KNOWS]->(:Person {id: 10}) RETURN k.creationDate AS d",
+   "expectedCheckRows": [
+    {
+     "d": 95
+    }
+   ]
+  }
+ ]
+}
