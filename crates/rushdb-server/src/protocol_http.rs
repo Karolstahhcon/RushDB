@@ -48,3 +48,54 @@ pub(crate) fn execute_cancellable(
         | rushdb_protocol::Response::TextHits { rows, .. } => rows.len() as u64,
         _ => 0,
     };
+    node.observe_rows(op_kind, row_count);
+    serde_json::to_value(response).map_err(|error| ApiError::Engine(error.to_string()))
+}
+
+/// Shared HTTP error taxonomy: the same `ErrorCode` maps to the same status on
+/// every adapter. Add below — do not reorder.
+pub(crate) fn http_status(code: rushdb_protocol::ErrorCode) -> u16 {
+    match code {
+        rushdb_protocol::ErrorCode::UnsupportedVersion => 426,
+        rushdb_protocol::ErrorCode::ProtocolViolation
+        | rushdb_protocol::ErrorCode::InvalidRequest => 400,
+        rushdb_protocol::ErrorCode::Unauthorized => 401,
+        rushdb_protocol::ErrorCode::MissingScope | rushdb_protocol::ErrorCode::ScopeMismatch => 403,
+        rushdb_protocol::ErrorCode::NotFound => 404,
+        rushdb_protocol::ErrorCode::Conflict | rushdb_protocol::ErrorCode::WriteConflict => 409,
+        rushdb_protocol::ErrorCode::Cancelled => 499,
+        rushdb_protocol::ErrorCode::ResourceExhausted => 429,
+        rushdb_protocol::ErrorCode::Unavailable => 503,
+        rushdb_protocol::ErrorCode::ExecutionFailed
+        | rushdb_protocol::ErrorCode::LanguageDisabled
+        | rushdb_protocol::ErrorCode::Unsupported => 422,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_error_taxonomy_is_complete_and_stable() {
+        let expected = [
+            (rushdb_protocol::ErrorCode::UnsupportedVersion, 426),
+            (rushdb_protocol::ErrorCode::ProtocolViolation, 400),
+            (rushdb_protocol::ErrorCode::InvalidRequest, 400),
+            (rushdb_protocol::ErrorCode::Unauthorized, 401),
+            (rushdb_protocol::ErrorCode::MissingScope, 403),
+            (rushdb_protocol::ErrorCode::ScopeMismatch, 403),
+            (rushdb_protocol::ErrorCode::NotFound, 404),
+            (rushdb_protocol::ErrorCode::Conflict, 409),
+            (rushdb_protocol::ErrorCode::Cancelled, 499),
+            (rushdb_protocol::ErrorCode::ResourceExhausted, 429),
+            (rushdb_protocol::ErrorCode::Unavailable, 503),
+            (rushdb_protocol::ErrorCode::ExecutionFailed, 422),
+            (rushdb_protocol::ErrorCode::LanguageDisabled, 422),
+            (rushdb_protocol::ErrorCode::Unsupported, 422),
+        ];
+        for (code, status) in expected {
+            assert_eq!(http_status(code), status, "{code:?}");
+        }
+    }
+}
