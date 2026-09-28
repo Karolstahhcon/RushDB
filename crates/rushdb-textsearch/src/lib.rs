@@ -240,3 +240,246 @@ impl TextIndexes {
             }
             let Some(record) = session.reconstruct_record(owner).map_err(err)? else {
                 continue;
+            };
+            let text = record_text(&record, &def.property);
+            if !text.is_empty() {
+                writer
+                    .add_document(tantivy::doc!(
+                        opened.owner_field => owner,
+                        opened.text_field => text
+                    ))
+                    .map_err(err)?;
+            }
+        }
+        writer.commit().map_err(err)?;
+        opened.reader.reload().map_err(err)?;
+        let applied = owners.len();
+        lmpg.index_applied(def.id, snap.commit_index(), owners)
+            .map_err(|e| e.to_string())?;
+        Ok(applied)
+    }
+
+    /// Apply the pending changes of every text index of `lmpg`'s tenant, a
+    /// batch at a time, until done or `budget` elapses. Returns the owners
+    /// applied.
+    ///
+    /// # Errors
+    /// Returns the first apply error.
+    pub fn apply_tenant(
+        &self,
+        lmpg: &rushdb_lmpg::Lmpg,
+        budget: std::time::Duration,
+    ) -> Result<usize, String> {
+        let started = std::time::Instant::now();
+        let view = lmpg.store.read_view().map_err(err)?;
+        let defs = index::definitions(&view, lmpg.tenant).map_err(err)?;
+        drop(view);
+        let mut applied = 0;
+        for def in defs {
+            if !matches!(def.kind, IndexKind::Text { .. })
+                || matches!(def.state, IndexState::Dropping { .. })
+            {
+                continue;
+            }
+            loop {
+                let step = self.apply(lmpg, &def, APPLY_BATCH)?;
+                applied += step;
+                if step < APPLY_BATCH || started.elapsed() >= budget {
+                    break;
+                }
+            }
+            if started.elapsed() >= budget {
+                break;
+            }
+        }
+        Ok(applied)
+    }
+
+    /// BM25 top-k for `request` at `view`, restricted to
+    /// `candidates` when given. An `immediate` index first applies its
+    /// pending changes (bounded); an `eventual` one reports its backlog.
+    ///
+    /// # Errors
+    /// Returns an error if the index is unknown, not a ready text index, or
+    /// the query cannot be parsed or executed.
+    pub fn search(
+        &self,
+        tenant: TenantId,
+        view: &ReadView,
+        request: TextQuery<'_>,
+        candidates: Option<Arc<HashSet<u64>>>,
+    ) -> Result<TextHits, String> {
+        let TextQuery {
+            index: name,
+            query,
+            opts,
+            top_k,
+        } = request;
+        let lmpg = rushdb_lmpg::Lmpg::new(Arc::clone(&self.store), tenant);
+        let def = index::by_name(view, tenant, name)
+            .map_err(err)?
+            .ok_or_else(|| format!("unknown text index `{name}`"))?;
+        let IndexKind::Text { consistency } = def.kind else {
+            return Err(format!("`{name}` is not a text index"));
+        };
+        if def.state != IndexState::Ready {
+            return Err(format!("text index `{name}` is {}", def.state.label()));
+        }
+        if consistency == TextConsistency::Immediate {
+            let mut applied = 0;
+            while applied < IMMEDIATE_APPLY_LIMIT {
+                let step = self.apply(&lmpg, &def, APPLY_BATCH)?;
+                if step == 0 {
+                    break;
+                }
+                applied += step;
+            }
+        }
+        let pending = {
+            let now = lmpg.store.read_view().map_err(err)?;
+            pending(&now, tenant, def.id, IMMEDIATE_APPLY_LIMIT)
+                .map_err(err)?
+                .len() as u64
+        };
+        if query.trim().is_empty() {
+            return Ok(TextHits {
+                hits: Vec::new(),
+                matches: 0,
+                pending,
+            });
+        }
+        let opened = self.open_index(tenant, def.id)?;
+        let (hits, matches) = ranked(&opened, query, opts, top_k, candidates)?;
+        Ok(TextHits {
+            hits,
+            matches: u64::try_from(matches).unwrap_or(u64::MAX),
+            pending,
+        })
+    }
+
+    /// The name of the `ready` text index on exactly `label` and `property`
+    /// (`*` names the index over every string of the record), if any.
+    ///
+    /// # Errors
+    /// Returns an error if the index catalog cannot be read.
+    pub fn index_for<R: rushdb_lmpg::reader::TryRead + ?Sized>(
+        view: &R,
+        tenant: TenantId,
+        label: &str,
+        property: &str,
+    ) -> Result<Option<String>, rushdb_storage::StorageError> {
+        let property = if property == TEXT_ALL_PROPERTIES {
+            TEXT_ALL_PROPERTIES.to_string()
+        } else {
+            rushdb_types::value::normalize_name(property)
+        };
+        Ok(index::definitions(view, tenant)?
+            .into_iter()
+            .find(|def| {
+                matches!(def.kind, IndexKind::Text { .. })
+                    && def.state == IndexState::Ready
+                    && def.label == label
+                    && def.property == property
+            })
+            .map(|def| def.name))
+    }
+}
+
+/// The best `top_k` matches of `query` in `opened` (all of them for
+/// [`ALL_HITS`]) among `candidates`, and how many matched.
+fn ranked(
+    opened: &OpenIndex,
+    query: &str,
+    opts: LexicalOptions,
+    top_k: usize,
+    candidates: Option<Arc<HashSet<u64>>>,
+) -> Result<(Vec<ScoredDoc>, usize), String> {
+    use tantivy::collector::{Count, FilterCollector, TopDocs};
+    use tantivy::query::QueryParser;
+    use tantivy::schema::{TantivyDocument, Value as _};
+    let searcher = opened.reader.searcher();
+    let mut parser = QueryParser::for_index(&opened.index, vec![opened.text_field]);
+    if opts.all_terms {
+        parser.set_conjunction_by_default();
+    }
+    let expression = if opts.phrase {
+        format!("\"{}\"", query.replace('"', "\\\""))
+    } else {
+        query.to_string()
+    };
+    let parsed = parser.parse_query(&expression).map_err(err)?;
+    let accepts = move |owner: u64| candidates.as_ref().is_none_or(|c| c.contains(&owner));
+    let matches = searcher
+        .search(
+            &parsed,
+            &FilterCollector::new("owner".to_string(), accepts.clone(), Count),
+        )
+        .map_err(err)?;
+    // Never size the collector past what matched (`ALL_HITS` included).
+    let limit = top_k.min(matches);
+    let found = if limit == 0 {
+        Vec::new()
+    } else {
+        searcher
+            .search(
+                &parsed,
+                &FilterCollector::new(
+                    "owner".to_string(),
+                    accepts,
+                    TopDocs::with_limit(limit).order_by_score(),
+                ),
+            )
+            .map_err(err)?
+    };
+    let mut hits = Vec::with_capacity(found.len());
+    for (score, address) in found {
+        let doc = searcher.doc::<TantivyDocument>(address).map_err(err)?;
+        if let Some(owner) = doc
+            .get_first(opened.owner_field)
+            .and_then(|v| v.as_value().as_u64())
+        {
+            hits.push(ScoredDoc {
+                owner_ord: owner,
+                score: f64::from(score),
+            });
+        }
+    }
+    // Deterministic ties: score, then owner.
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.owner_ord.cmp(&b.owner_ord))
+    });
+    Ok((hits, matches))
+}
+
+/// The text a record contributes: every string value of `property`
+/// (normalized), or of the whole record for `*`.
+fn record_text(record: &serde_json::Value, property: &str) -> String {
+    let mut values = Vec::new();
+    if property == TEXT_ALL_PROPERTIES {
+        collect_text_values(record, &mut values);
+    } else if let serde_json::Value::Object(fields) = record {
+        for (key, value) in fields {
+            if rushdb_types::value::normalize_name(key) == property {
+                collect_text_values(value, &mut values);
+            }
+        }
+    }
+    values.join(" ")
+}
+
+fn collect_text_values(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => out.push(value.clone()),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .for_each(|value| collect_text_values(value, out)),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .filter(|(key, _)| !rushdb_types::value::is_reserved_name(key))
+            .for_each(|(_, value)| collect_text_values(value, out)),
+        _ => {}
+    }
+}
