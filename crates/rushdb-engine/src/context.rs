@@ -112,3 +112,231 @@ impl ExecutionContext {
     pub fn operation(&self) -> OperationClass {
         self.operation
     }
+
+    /// Pinned read view shared by all engine reads in this request.
+    #[must_use]
+    pub fn read_view(&self) -> &Arc<ReadView> {
+        &self.read_view
+    }
+
+    /// Deadline instant captured by this context, when one was configured.
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Set the policy generation captured by the caller's authorization step.
+    pub fn set_policy_generation(&mut self, generation: u64) {
+        self.policy_generation = generation;
+    }
+
+    /// Policy generation captured for this request.
+    #[must_use]
+    pub fn policy_generation(&self) -> u64 {
+        self.policy_generation
+    }
+
+    /// Attach a transaction identity after the transaction coordinator admits it.
+    pub fn set_transaction_id(&mut self, transaction_id: uuid::Uuid) {
+        self.transaction_id = Some(transaction_id);
+    }
+
+    /// Transaction identity, when this context is transaction-bound.
+    #[must_use]
+    pub fn transaction_id(&self) -> Option<uuid::Uuid> {
+        self.transaction_id
+    }
+
+    /// Check the deadline before entering another engine phase.
+    ///
+    /// # Errors
+    /// Returns [`ExecutionError::Deadline`] after the configured deadline.
+    pub fn check_deadline(&self) -> Result<(), ExecutionError> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(ExecutionError::Deadline);
+        }
+        Ok(())
+    }
+
+    /// Check caller cancellation and the deadline before entering work.
+    ///
+    /// # Errors
+    /// Returns [`ExecutionError::Cancelled`] when the caller cancelled the
+    /// read view, or [`ExecutionError::Deadline`] after the deadline.
+    pub fn check_active(&self) -> Result<(), ExecutionError> {
+        self.read_view
+            .check_cancelled()
+            .map_err(|_| ExecutionError::Cancelled)?;
+        self.check_deadline()
+    }
+
+    /// Return whether this context was opened from `store`.
+    #[must_use]
+    pub fn belongs_to(&self, store: &Store) -> bool {
+        self.read_view.belongs_to(store)
+    }
+
+    /// Charge bounded working bytes and check the deadline atomically with the
+    /// admission decision. Failed charges leave the prior charge unchanged.
+    ///
+    /// # Errors
+    /// Returns [`ExecutionError::Deadline`] when expired or
+    /// [`ExecutionError::Budget`] when the charge exceeds the limit.
+    pub fn charge_bytes(&mut self, bytes: usize) -> Result<(), ExecutionError> {
+        self.check_deadline()?;
+        let next = self.charged_bytes.saturating_add(bytes);
+        if let Some(limit) = self.byte_budget {
+            if next > limit {
+                return Err(ExecutionError::Budget {
+                    requested: bytes,
+                    remaining: limit.saturating_sub(self.charged_bytes),
+                });
+            }
+        }
+        self.charged_bytes = next;
+        Ok(())
+    }
+
+    /// Release previously charged working bytes, used by rollback paths.
+    pub fn release_bytes(&mut self, bytes: usize) {
+        self.charged_bytes = self.charged_bytes.saturating_sub(bytes);
+    }
+
+    /// Current charged working bytes.
+    #[must_use]
+    pub fn charged_bytes(&self) -> usize {
+        self.charged_bytes
+    }
+
+    /// Remaining caller budget for an inner query working-set admission.
+    #[must_use]
+    pub fn remaining_budget(&self) -> Option<usize> {
+        self.byte_budget
+            .map(|limit| limit.saturating_sub(self.charged_bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rushdb_storage::resources::StorageResources;
+
+    #[test]
+    fn context_charges_atomically_and_releases_on_rollback() {
+        let store = Arc::new(Store::new_in_memory());
+        let mut context = ExecutionContext::new(
+            &store,
+            TenantId::single(),
+            OperationClass::Read,
+            None,
+            Some(10),
+        )
+        .unwrap();
+        context.charge_bytes(6).unwrap();
+        assert!(matches!(
+            context.charge_bytes(5),
+            Err(ExecutionError::Budget { .. })
+        ));
+        assert_eq!(context.charged_bytes(), 6);
+        context.release_bytes(4);
+        assert_eq!(context.charged_bytes(), 2);
+    }
+
+    #[test]
+    fn expired_context_rejects_new_work() {
+        let store = Arc::new(Store::new_in_memory());
+        let mut context = ExecutionContext::new(
+            &store,
+            TenantId::single(),
+            OperationClass::Maintenance,
+            Some(Duration::ZERO),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            context.charge_bytes(1),
+            Err(ExecutionError::Deadline)
+        ));
+        assert_eq!(context.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn phase_reservation_is_shared_and_released_with_context() {
+        let resources = StorageResources {
+            phase_budget_bytes: PHASE_RESERVATION_BYTES,
+            ..StorageResources::default()
+        };
+        let store = Arc::new(Store::new_with_resources(resources).unwrap());
+        let first = ExecutionContext::new(
+            &store,
+            TenantId::single(),
+            OperationClass::Read,
+            None,
+            Some(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            ExecutionContext::new(
+                &store,
+                TenantId::single(),
+                OperationClass::Read,
+                None,
+                Some(1),
+            ),
+            Err(ExecutionError::Budget { .. })
+        ));
+        drop(first);
+        ExecutionContext::new(
+            &store,
+            TenantId::single(),
+            OperationClass::Read,
+            None,
+            Some(1),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn default_phase_budget_admits_many_concurrent_contexts() {
+        // Regression: the phase pool was derived from `logical_cache_bytes`
+        // (32 MiB) while each context reserved 8 MiB, capping the process at
+        // four concurrent requests. It is now a dedicated 256 MiB pool.
+        let store = Arc::new(Store::new_with_resources(StorageResources::default()).unwrap());
+        let mut contexts = Vec::with_capacity(16);
+        for _ in 0..16 {
+            contexts.push(
+                ExecutionContext::new(
+                    &store,
+                    TenantId::single(),
+                    OperationClass::Read,
+                    None,
+                    Some(1),
+                )
+                .expect("default phase budget must admit 16 concurrent contexts"),
+            );
+        }
+        assert_eq!(contexts.len(), 16);
+    }
+
+    #[test]
+    fn unbudgeted_contexts_also_contend_on_phase_reservation() {
+        let resources = StorageResources {
+            phase_budget_bytes: PHASE_RESERVATION_BYTES,
+            ..StorageResources::default()
+        };
+        let store = Arc::new(Store::new_with_resources(resources).unwrap());
+        let first =
+            ExecutionContext::new(&store, TenantId::single(), OperationClass::Read, None, None)
+                .unwrap();
+        assert!(matches!(
+            ExecutionContext::new(&store, TenantId::single(), OperationClass::Read, None, None,),
+            Err(ExecutionError::Budget { .. })
+        ));
+        drop(first);
+        ExecutionContext::new(&store, TenantId::single(), OperationClass::Read, None, None)
+            .unwrap();
+    }
+}
