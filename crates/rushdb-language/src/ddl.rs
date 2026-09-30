@@ -117,3 +117,123 @@ fn parse_create(statement: &str, keywords: usize, kind: DdlKind) -> Result<Index
                 && exists.eq_ignore_ascii_case("EXISTS") =>
         {
             (None, true)
+        }
+        [name, if_, not, exists]
+            if if_.eq_ignore_ascii_case("IF")
+                && not.eq_ignore_ascii_case("NOT")
+                && exists.eq_ignore_ascii_case("EXISTS") =>
+        {
+            (Some((*name).to_owned()), true)
+        }
+        _ => return Err(malformed()),
+    };
+    let rest = &text[for_at + " FOR ".len()..];
+    let on_at = rest
+        .to_ascii_uppercase()
+        .find(" ON ")
+        .ok_or_else(malformed)?;
+    // `(n:Label)`
+    let pattern = rest[..on_at].trim();
+    let inner = pattern
+        .strip_prefix('(')
+        .and_then(|p| p.strip_suffix(')'))
+        .ok_or_else(malformed)?;
+    let (variable, label) = inner.split_once(':').ok_or_else(malformed)?;
+    let (variable, label) = (variable.trim(), label.trim().trim_matches('`'));
+    // `(n.prop)`, or `EACH [n.prop]` for a full-text index
+    let target = rest[on_at + " ON ".len()..].trim();
+    let inner = match kind {
+        DdlKind::Ordered => target.strip_prefix('(').and_then(|p| p.strip_suffix(')')),
+        DdlKind::Fulltext { .. } => target
+            .get(4..)
+            .filter(|_| {
+                target
+                    .get(..4)
+                    .is_some_and(|each| each.eq_ignore_ascii_case("EACH"))
+            })
+            .map(str::trim)
+            .and_then(|list| list.strip_prefix('['))
+            .and_then(|list| list.strip_suffix(']')),
+    }
+    .ok_or_else(malformed)?;
+    let (owner, property) = inner.split_once('.').ok_or_else(malformed)?;
+    if owner.trim() != variable || label.is_empty() {
+        return Err(malformed());
+    }
+    let property = property.trim().trim_matches('`').to_owned();
+    if property.is_empty() || property.contains(',') {
+        return Err("a declared index covers exactly one property".into());
+    }
+    Ok(IndexDdl::Create {
+        name: name.unwrap_or_else(|| format!("{label}_{property}")),
+        label: label.to_owned(),
+        property,
+        kind,
+        if_not_exists,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neo4j_index_ddl_forms_parse() {
+        assert_eq!(
+            parse_index_ddl("CREATE INDEX person_age FOR (n:Person) ON (n.age);"),
+            Some(Ok(IndexDdl::Create {
+                name: "person_age".into(),
+                label: "Person".into(),
+                property: "age".into(),
+                kind: DdlKind::Ordered,
+                if_not_exists: false,
+            }))
+        );
+        assert_eq!(
+            parse_index_ddl("create index if not exists for (p:Item) on (p.price)"),
+            Some(Ok(IndexDdl::Create {
+                name: "Item_price".into(),
+                label: "Item".into(),
+                property: "price".into(),
+                kind: DdlKind::Ordered,
+                if_not_exists: true,
+            }))
+        );
+        assert_eq!(
+            parse_index_ddl(
+                "CREATE FULLTEXT INDEX docs FOR (d:Doc) ON EACH [d.body] OPTIONS {indexConfig: {consistency: 'immediate'}}"
+            ),
+            Some(Ok(IndexDdl::Create {
+                name: "docs".into(),
+                label: "Doc".into(),
+                property: "body".into(),
+                kind: DdlKind::Fulltext { immediate: true },
+                if_not_exists: false,
+            }))
+        );
+        assert!(matches!(
+            parse_index_ddl("CREATE FULLTEXT INDEX docs FOR (d:Doc) ON EACH [d.title]"),
+            Some(Ok(IndexDdl::Create {
+                kind: DdlKind::Fulltext { immediate: false },
+                ..
+            }))
+        ));
+        assert_eq!(
+            parse_index_ddl("DROP INDEX person_age IF EXISTS"),
+            Some(Ok(IndexDdl::Drop {
+                name: "person_age".into(),
+                if_exists: true
+            }))
+        );
+        assert_eq!(parse_index_ddl("SHOW INDEXES"), Some(Ok(IndexDdl::Show)));
+        assert_eq!(parse_index_ddl("MATCH (n) RETURN n"), None);
+        assert!(matches!(
+            parse_index_ddl("CREATE INDEX x FOR (n:A) ON (m.p)"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_index_ddl("CREATE INDEX x FOR (n:A) ON (n.p, n.q)"),
+            Some(Err(_))
+        ));
+    }
+}
