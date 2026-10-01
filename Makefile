@@ -16,3 +16,22 @@ gate: fmt-check lint test
 ## Apply rustfmt.
 fmt:
 	$(CARGO) fmt --all
+
+## Verify formatting without writing.
+fmt-check:
+	$(CARGO) fmt --all --check
+
+## Deny every warning, including the workspace clone/allocation lints.
+lint:
+	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+
+## Full test suite (unit, integration, and doc tests).
+test:
+	$(CARGO) test --workspace --no-fail-fast --locked
+
+## Doc tests only (nextest users must run this separately).
+test-doc:
+	$(CARGO) test --workspace --doc --locked
+
+clean:
+	$(CARGO) clean
