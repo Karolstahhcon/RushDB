@@ -68,3 +68,73 @@
  "rules": [
   {
    "category": "grafeo-result",
+   "key": "Match5\\.feature::\\[1[123]\\]",
+   "confirmed": "Grafeo expands an empty variable-length interval (*2..1, *..0). Plain Grafeo returns the same rows for a single MATCH; it passes the TCK's two-MATCH form only through a different join plan."
+  },
+  {
+   "category": "lmpg-single-label",
+   "pattern": "require exactly one label|one primary label|label mutation is unavailable"
+  },
+  {
+   "category": "procedures",
+   "when": "procedures"
+  },
+  {
+   "category": "procedures",
+   "pattern": "CALL procedures require"
+  },
+  {
+   "category": "temporal",
+   "key": "/expressions/temporal/"
+  },
+  {
+   "category": "temporal",
+   "pattern": "\\b(datetime|localdatetime|date|time|localtime|duration)\\.(truncate|between|inSeconds|inMonths|inDays|transaction|statement|realtime|fromepoch)"
+  },
+  {
+   "category": "temporal",
+   "when": "result-mismatch",
+   "key": "(?i)(local )?(date|time|duration)"
+  },
+  {
+   "category": "grafeo-error-detection",
+   "when": "error-not-raised"
+  },
+  {
+   "category": "grafeo-syntax",
+   "pattern": "syntax error"
+  },
+  {
+   "category": "grafeo-semantic",
+   "pattern": "semantic error"
+  },
+  {
+   "category": "grafeo-internal",
+   "pattern": "internal execution error|GRAFEO-X"
+  },
+  {
+   "category": "grafeo-write-column-names",
+   "when": "result-columns"
+  },
+  {
+   "category": "grafeo-lazy-writes",
+   "when": "side-effects-mismatch"
+  },
+  {
+   "category": "grafeo-quantifiers",
+   "key": "/expressions/quantifier/"
+  },
+  {
+   "category": "grafeo-precedence",
+   "key": "/expressions/precedence/"
+  },
+  {
+   "category": "grafeo-nontermination",
+   "pattern": "query execution cancelled"
+  },
+  {
+   "category": "grafeo-result",
+   "when": "result-mismatch"
+  }
+ ]
+}

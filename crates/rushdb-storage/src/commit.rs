@@ -600,3 +600,605 @@ impl Store {
             // A read-view/maintenance operation may hold publish_lock without
             // becoming a publisher. Retry after a bounded wait in that case;
             // a notification must not be the only route to terminal progress.
+            pending = self
+                .health
+                .guard(
+                    self.pending_cv
+                        .wait_timeout(pending, std::time::Duration::from_millis(10)),
+                )?
+                .0;
+            drop(pending);
+        }
+    }
+
+    /// Serializable-optimistic entry point (document 07): `deps` records
+    /// point/range reads performed at `snapshot_ci`; validation rejects if
+    /// any committed mutation between then and now writes into a recorded
+    /// range. Runs while the publish lock is held so validation and
+    /// publication are atomic; a loser records its terminal-aborted outcome.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the publisher has failed, a precondition is
+    /// violated, a conflict summary is missing, the snapshot is in the future,
+    /// or publication fails. A poisoned admission, publish, or data lock
+    /// permanently fences the store and returns [`StorageError::Unhealthy`].
+    ///
+    /// # Panics
+    /// Panics only if `batch` fails to serialize (never, for a well-formed
+    /// `CommitBatch`).
+    pub fn commit_serializable<P, F>(
+        &self,
+        commit_key: Uuid,
+        snapshot_ci: u64,
+        deps: DependencySet,
+        build: F,
+    ) -> Result<CommitOutcome<P>, StorageError>
+    where
+        P: Serialize + DeserializeOwned,
+        F: FnOnce(&mut Txn) -> Result<(CommitBatch, P), String>,
+    {
+        self.check_health()?;
+        let mut admission = self.acquire_admission()?;
+        self.check_publisher()?;
+        if let Some((status, prev_ci)) = self.lookup_outcome_checked(commit_key)? {
+            return match status {
+                OutcomeStatus::Aborted => Ok(CommitOutcome::Conflicted(
+                    "previously aborted under this commit key".to_string(),
+                )),
+                OutcomeStatus::Committed => Ok(CommitOutcome::Committed {
+                    commit_index: prev_ci,
+                    payload: self.committed_payload(commit_key)?,
+                }),
+            };
+        }
+
+        if snapshot_ci > self.committed_version() {
+            return Err(StorageError::FutureSnapshot {
+                requested: snapshot_ci,
+                visible: self.committed_version(),
+            });
+        }
+        // Refresh the pending overlay and plan/expand against it so this commit
+        // sees every lower-index commit, published or not. In-flight writes are
+        // additionally checked against `deps` below because they are not yet in
+        // the conflict window.
+        self.trim_sequencer(&mut admission);
+        let sequencer_overlay = self.sequencer_overlay(&admission)?;
+        // This entry point preserves the existing staging-at-commit contract;
+        // supplied dependencies describe the caller's earlier reads. It does
+        // not itself implement begin-time transactional reads.
+        let dep_recorder = RefCell::new(deps);
+        let (mut batch, payload) = {
+            // The sequencer overlay is authoritative, so base reads go through
+            // it and never touch the live map; taking its read guard would let
+            // the overlay's base read re-enter the same RwLock (self-deadlock).
+            let mut txn = Txn {
+                base: TxnBase::Overlay(Arc::clone(&sequencer_overlay)),
+                buffer: BTreeMap::new(),
+                purge_keys: BTreeSet::default(),
+                set_keys: BTreeSet::default(),
+                deps: Some(&dep_recorder),
+            };
+            match build(&mut txn) {
+                Ok(outcome) => outcome,
+                Err(reason) => {
+                    drop(txn);
+                    self.record_aborted_outcome_admitted(commit_key)?;
+                    return Ok(CommitOutcome::Conflicted(reason));
+                }
+            }
+        };
+        let deps = dep_recorder.into_inner();
+        batch.commit_key = commit_key;
+
+        // Admission excludes concurrent logical writers through publication.
+        // Select a tentative CI; reserve it only after successful expansion.
+        let ci = {
+            let _guard = self.health.guard(self.publish_lock.lock())?;
+            // Publish any pending commits so the committed log is complete.
+            self.drain_and_publish();
+
+            // Never replay an old command against today's state to infer what
+            // it once wrote. Missing legacy summaries are an explicit retry,
+            // not evidence of the absence of a conflict.
+            // In-flight commits (assigned but not yet published) are not in
+            // the conflict window; `first_conflict_since` consults the pending
+            // overlay too, so a dependency cannot be missed against an
+            // unpublished writer.
+            if let Some(probe) = self.first_conflict_since(&admission, snapshot_ci, &deps)? {
+                // An aborted tx consumes no commit index; the terminal aborted
+                // outcome is keyed by the commit key, so the contiguous
+                // publisher never has to fill a hole for it.
+                self.record_outcome_locked(commit_key, OutcomeStatus::Aborted, 0)?;
+                return Ok(CommitOutcome::Conflicted(format!(
+                    "{SERIALIZABLE_CONFLICT} on write at ci {probe}"
+                )));
+            }
+
+            for pc in &batch.preconditions {
+                let exists = sequencer_overlay.get(&pc.key)?.is_some();
+                let violated =
+                    exists != matches!(pc.kind, rushdb_types::command::PreconditionKind::Exists);
+                if violated {
+                    self.record_outcome_locked(commit_key, OutcomeStatus::Aborted, 0)?;
+                    return Err(StorageError::Precondition {
+                        path: rushdb_types::keys::describe_key(&pc.key),
+                    });
+                }
+            }
+
+            // The candidate slot is derived from the published watermark; the
+            // actual reservation happens after expansion succeeds so an
+            // expansion failure never consumes a commit index.
+            self.published.load(Ordering::SeqCst) + 1
+        };
+
+        // Feeds the WAL's embedded command on a durable store, or
+        // the in-memory command-journal row otherwise (no WAL to derive it from).
+        let command_payload = rushdb_types::command_codec::encode(&batch);
+        let payload_bytes =
+            serde_json::to_vec(&payload).map_err(|_| StorageError::OutcomePayload)?;
+        let expand_at = |ci: u64| -> Result<Vec<Op>, StorageError> {
+            // The overlay is authoritative; skip the live map's read guard.
+            let wtxn = Txn {
+                base: TxnBase::Overlay(Arc::clone(&sequencer_overlay)),
+                buffer: BTreeMap::new(),
+                purge_keys: BTreeSet::default(),
+                set_keys: BTreeSet::default(),
+                deps: None,
+            };
+            self.expand_commit_ops(ci, &batch, &payload_bytes, wtxn)
+        };
+
+        // Admission is held for the whole protocol, so the prospective `ci`
+        // cannot move. Expand first (a failure must not consume a slot), then
+        // reserve with a plain store; the previous CAS/`fetch_add` fallback
+        // could leak a reserved index when the re-expansion failed.
+        let ops = expand_at(ci)?;
+        self.reject_oversized_commit(&ops, command_payload.len())?;
+        admission.record(ci, &ops);
+        self.next_commit_index.store(ci + 1, Ordering::SeqCst);
+        let shard =
+            resources::physical_shard_for(Some(&batch.tenant), self.resource_config.shard_count);
+        self.enqueue_and_publish(ci, shard, ops, command_payload)?;
+        Ok(CommitOutcome::Committed {
+            commit_index: ci,
+            payload,
+        })
+    }
+
+    /// Run one statement's planning + expansion against a transaction's
+    /// accumulated overlay (read-your-writes), appending the produced writes to
+    /// the transaction. Nothing is committed or visible outside the tx.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the publisher has failed, no expander is
+    /// installed, or the supplied `build`/expansion closure fails.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn tx_apply<P, F>(
+        &self,
+        tx: &mut TxAccumulator,
+        commit_key: Uuid,
+        build: F,
+    ) -> Result<P, StorageError>
+    where
+        P: Serialize + DeserializeOwned,
+        F: FnOnce(u64, &mut Txn) -> Result<(CommitBatch, P), String>,
+    {
+        self.check_health()?;
+        self.check_publisher()?;
+        let ci = self.next_commit_index.load(Ordering::SeqCst);
+        let payload = {
+            // Statement planning reads the transaction's pinned snapshot, not
+            // current committed state, so read-your-writes is stable and
+            // later commits cannot leak into the plan.
+            let snapshot = tx.base_view.is_some();
+            let guard = self.txn_data(snapshot)?;
+            let native = if snapshot {
+                None
+            } else {
+                self.native_transaction_view()?
+            };
+            let base = TxnBase::resolve(None, tx.base_view.clone(), native, guard.as_deref());
+            // Both statement planning and deterministic expansion can branch
+            // on committed state. Preserve those reads in the accumulator so
+            // tx_commit can reject a stale read-dependent transaction even
+            // when the branch did not emit the key it inspected.
+            let dep_recorder = RefCell::new(tx.deps.clone());
+            let mut txn = Txn {
+                base,
+                buffer: tx.buffer.clone(),
+                purge_keys: BTreeSet::default(),
+                set_keys: BTreeSet::default(),
+                deps: Some(&dep_recorder),
+            };
+            let (batch, payload) = build(ci, &mut txn).map_err(StorageError::Builder)?;
+            let mut batch = batch;
+            batch.commit_key = commit_key;
+            let expander = self.health.guard(self.expander.read())?.clone();
+            let Some(expand) = expander.as_ref() else {
+                return Err(StorageError::CorruptLog);
+            };
+            expand(ci, &batch, &mut txn).map_err(StorageError::Builder)?;
+            tx.buffer = txn.buffer;
+            tx.mutations.append(&mut batch.mutations);
+            tx.preconditions.append(&mut batch.preconditions);
+            tx.deps = dep_recorder.into_inner();
+            payload
+        };
+        Ok(payload)
+    }
+
+    /// Run a read inside a transaction: the closure sees committed state merged
+    /// with the transaction's overlay (read-your-writes) and records its reads
+    /// into the transaction's dependency set. Use `get_tracked`/range-tracked
+    /// reads so the conflict check at commit covers what this read observed.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if a backend read fails or the closure returns
+    /// an error.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn tx_read<P, F>(&self, tx: &mut TxAccumulator, f: F) -> Result<P, StorageError>
+    where
+        F: FnOnce(&mut Txn) -> Result<P, String>,
+    {
+        self.check_health()?;
+        // Reads resolve at the transaction's pinned snapshot.
+        let snapshot = tx.base_view.is_some();
+        let guard = self.txn_data(snapshot)?;
+        let native = if snapshot {
+            None
+        } else {
+            self.native_transaction_view()?
+        };
+        let base = TxnBase::resolve(None, tx.base_view.clone(), native, guard.as_deref());
+        let dep_recorder = RefCell::new(tx.deps.clone());
+        let mut txn = Txn {
+            base,
+            buffer: tx.buffer.clone(),
+            purge_keys: BTreeSet::default(),
+            set_keys: BTreeSet::default(),
+            deps: Some(&dep_recorder),
+        };
+        let result = f(&mut txn).map_err(StorageError::Builder);
+        tx.deps = dep_recorder.into_inner();
+        result
+    }
+
+    /// Stage a pre-built commit batch (e.g. a statement-language mutation delta)
+    /// into a transaction: the batch's writes expand against the transaction's
+    /// overlay and append to its accumulated mutations. Nothing is committed or
+    /// visible outside the tx.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the publisher has failed, no expander is
+    /// installed, or expansion fails.
+    ///
+    /// Lock poisoning fences the store until reopen.
+    pub fn tx_apply_batch(
+        &self,
+        tx: &mut TxAccumulator,
+        commit_key: Uuid,
+        batch: &CommitBatch,
+    ) -> Result<(), StorageError> {
+        self.check_health()?;
+        self.check_publisher()?;
+        let mut batch = batch.clone();
+        batch.commit_key = commit_key;
+        let ci = self.next_commit_index.load(Ordering::SeqCst);
+        // Batch expansion reads the transaction's pinned snapshot.
+        let snapshot = tx.base_view.is_some();
+        let guard = self.txn_data(snapshot)?;
+        let native = if snapshot {
+            None
+        } else {
+            self.native_transaction_view()?
+        };
+        let base = TxnBase::resolve(None, tx.base_view.clone(), native, guard.as_deref());
+        // A batch expander may read a key to decide which derived rows to
+        // produce. Track that dependency just like tx_apply tracks planner
+        // and expansion reads; otherwise stale read-dependent commits can
+        // pass conflict validation when their write-set is disjoint.
+        let dep_recorder = RefCell::new(tx.deps.clone());
+        let mut txn = Txn {
+            base,
+            buffer: tx.buffer.clone(),
+            purge_keys: BTreeSet::default(),
+            set_keys: BTreeSet::default(),
+            deps: Some(&dep_recorder),
+        };
+        let expander = self.health.guard(self.expander.read())?.clone();
+        let Some(expand) = expander.as_ref() else {
+            return Err(StorageError::CorruptLog);
+        };
+        expand(ci, &batch, &mut txn).map_err(StorageError::Builder)?;
+        tx.buffer = txn.buffer;
+        tx.mutations.append(&mut batch.mutations);
+        tx.preconditions.append(&mut batch.preconditions);
+        tx.deps = dep_recorder.into_inner();
+        Ok(())
+    }
+
+    /// Atomically commit a transaction's accumulated writes. Conflict rule: any
+    /// committed mutation since `base_ci` that wrote a key the transaction read
+    /// (public read-set) or writes (write-set, including counters) aborts it —
+    /// this catches read-write anomalies and ordinal/counter clashes without the
+    /// planner tracking its internal reads. Success publishes the writes as one
+    /// atomic commit; conflict aborts the transaction, which may retry or roll back.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the publisher has failed, the base snapshot
+    /// is in the future, a precondition fails, a conflict is detected, or
+    /// publication fails.
+    pub fn tx_commit(&self, commit_key: Uuid, tx: &TxAccumulator) -> Result<u64, StorageError> {
+        self.check_health()?;
+        self.tx_commit_impl(commit_key, tx, None)
+    }
+
+    /// Commit a cross-request transaction with an optional revalidator that runs inside
+    /// the publish lock (atomic with conflict detection), reading keys via the injected
+    /// reader — never by opening a new store view, which would nest view locks under the
+    /// publish lock — and returning `Err` to abort the commit and record a terminal outcome.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the publisher has failed, the base snapshot is in the future,
+    /// a precondition fails, the revalidator rejects, a conflict is detected, or publication fails.
+    pub fn tx_commit_revalidated(
+        &self,
+        commit_key: Uuid,
+        tx: &TxAccumulator,
+        revalidate: impl FnOnce(&dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, StorageError>) -> Result<(), String>
+            + 'static,
+    ) -> Result<u64, StorageError> {
+        self.check_health()?;
+        let revalidate: Box<
+            dyn FnOnce(
+                &dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, StorageError>,
+            ) -> Result<(), String>,
+        > = Box::new(revalidate);
+        self.tx_commit_impl(commit_key, tx, Some(revalidate))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "transaction commit keeps conflict probing, revalidation, index reservation, and publication in one linear protocol for auditability"
+    )]
+    pub(super) fn tx_commit_impl(
+        &self,
+        commit_key: Uuid,
+        tx: &TxAccumulator,
+        revalidate: Option<
+            Box<
+                dyn FnOnce(
+                    &dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, StorageError>,
+                ) -> Result<(), String>,
+            >,
+        >,
+    ) -> Result<u64, StorageError> {
+        self.check_health()?;
+        // A replicated commit is assigned and published by the replication
+        // path. Reserving a local slot first would advance
+        // `next_commit_index`; a loopback replicator would then apply at the
+        // following index and leave the reserved slot permanently missing.
+        // Keep the selected replicator for the call below so the admission
+        // decision and the publication path agree.
+        let replicator = self.replicator();
+        // One writer-admission protocol for the whole commit: discovery,
+        // validation, expansion, CI reservation, publication and ack. Without
+        // it, two transactions can validate against the same published
+        // watermark and both reserve, missing interleaved write/read conflicts
+        // (a lost update). A replicator owns ordering, so admission is skipped
+        // there exactly as in the autocommit path (holding it across the
+        // synchronous replication call would deadlock the state-machine apply).
+        let mut admission = if replicator.is_none() {
+            Some(self.acquire_admission()?)
+        } else {
+            None
+        };
+        self.check_publisher()?;
+        if let Some((OutcomeStatus::Committed, ci)) = self.lookup_outcome_checked(commit_key)? {
+            return Ok(ci);
+        }
+        if matches!(
+            self.try_outcome_for(commit_key)?,
+            Some(OutcomeKind::Aborted)
+        ) {
+            return Err(StorageError::Builder(
+                "commit key has a terminal aborted outcome".into(),
+            ));
+        }
+        if tx.base_ci > self.committed_version() {
+            return Err(StorageError::FutureSnapshot {
+                requested: tx.base_ci,
+                visible: self.committed_version(),
+            });
+        }
+        // This path expands against the transaction's pinned snapshot, not the
+        // live overlay: a cross-request transaction must not observe commits
+        // after its snapshot. `drain_and_publish` below publishes every
+        // assigned-but-unpublished commit before validation, so the durable
+        // conflict summaries already cover them; the pending buffer is trimmed
+        // here and consulted below as a defensive second source.
+        if let Some(state) = admission.as_mut() {
+            self.trim_sequencer(state);
+        }
+
+        // Conflict check + CI selection under the publish lock. The guard is
+        // scoped to this block: `enqueue_and_publish` must be able to become
+        // the publisher afterwards.
+        let ci = {
+            let _guard = self.health.guard(self.publish_lock.lock())?;
+            self.drain_and_publish();
+            // The slot is reserved only after every abort check passes. An
+            // aborted transaction must NOT consume a commit index: it records
+            // a terminal aborted outcome keyed by its commit key, and the
+            // contiguous publisher never has to fill a hole for it.
+            let published = self.published.load(Ordering::SeqCst);
+
+            // Authorization revalidation runs before the generic read/write
+            // conflict scan so a rotated or malformed policy surfaces as an
+            // explicit `authorization_changed`/`invalid authorization policy`
+            // abort rather than being masked by the policy key's read-write
+            // conflict. It still runs under the publish lock, atomic with
+            // conflict detection and publication.
+            if let Some(revalidate) = revalidate {
+                let read =
+                    |key: &[u8]| -> Result<Option<Vec<u8>>, StorageError> { self.try_get(key) };
+                if let Err(reason) = revalidate(&read) {
+                    self.record_outcome_locked(commit_key, OutcomeStatus::Aborted, 0)?;
+                    return Err(StorageError::Builder(reason));
+                }
+            }
+
+            // Read-set (public reads) + write-set (buffer, incl. counters) check.
+            // Only published commits since the tx's snapshot can conflict; an
+            // in-flight reserved slot is not visible yet and is serialized by
+            // the publisher before this commit.
+            let mut conflicted: Option<u64> = None;
+            let window = self.health.guard(self.conflicts.lock())?;
+            for probe in (tx.base_ci + 1)..=published {
+                let key_set =
+                    window
+                        .keys(probe)
+                        .ok_or(StorageError::ConflictHistoryUnavailable {
+                            commit_index: probe,
+                        })?;
+                for k in key_set.iter() {
+                    if tx.deps.intersects_key(k) || tx.buffer.contains_key(k) {
+                        conflicted = Some(probe);
+                        break;
+                    }
+                }
+                if conflicted.is_some() {
+                    break;
+                }
+            }
+            drop(window);
+            // Defensive: consult the pending overlay for any commit that
+            // `drain_and_publish` did not publish (for example a mid-assignment
+            // gap), so an unpublished writer cannot be missed.
+            if let Some(state) = admission.as_ref() {
+                for (key, (ci, _)) in &state.buffer {
+                    if *ci > tx.base_ci
+                        && (tx.deps.intersects_key(key) || tx.buffer.contains_key(key))
+                    {
+                        conflicted = Some(*ci);
+                        break;
+                    }
+                }
+            }
+            if let Some(probe) = conflicted {
+                self.record_outcome_locked(commit_key, OutcomeStatus::Aborted, 0)?;
+                return Err(StorageError::Builder(format!(
+                    "transaction_conflict on write at ci {probe}"
+                )));
+            }
+            for pc in &tx.preconditions {
+                // Preconditions from statements in one transaction must see
+                // the transaction's own write overlay. Relationship batches,
+                // for example, require endpoints created earlier in this same
+                // transaction to exist before the final commit is published.
+                let exists = match pc.kind {
+                    // An `Absent` guard belongs to the create operation that
+                    // also stages this key. Check committed state so that the
+                    // operation does not conflict with its own overlay.
+                    rushdb_types::command::PreconditionKind::Absent => {
+                        self.try_get(&pc.key)?.is_some()
+                    }
+                    // An `Exists` guard holds when the key is committed or
+                    // this transaction wrote it: relationship batches need
+                    // endpoints created earlier in the same transaction, and
+                    // a delete guards a key its own write removes.
+                    rushdb_types::command::PreconditionKind::Exists => {
+                        matches!(tx.buffer.get(&pc.key), Some(Some(_)))
+                            || self.try_get(&pc.key)?.is_some()
+                    }
+                };
+                let violated =
+                    exists != matches!(pc.kind, rushdb_types::command::PreconditionKind::Exists);
+                if violated {
+                    self.record_outcome_locked(commit_key, OutcomeStatus::Aborted, 0)?;
+                    return Err(StorageError::Precondition {
+                        path: rushdb_types::keys::describe_key(&pc.key),
+                    });
+                }
+            }
+            // Prospective slot only. The slot is reserved after expansion
+            // succeeds so a fallible expansion can never consume (and strand) a
+            // commit index. Admission is held for the local path, so no other
+            // local writer can change the counter in between; a replicator owns
+            // index assignment and must observe the current slot unchanged.
+            self.next_commit_index.load(Ordering::SeqCst)
+        };
+
+        let batch = CommitBatch {
+            command_version: rushdb_types::command::COMMAND_VERSION,
+            tenant: tx.tenant,
+            transaction_id: String::new(),
+            commit_key,
+            start_index: ci.saturating_sub(1),
+            isolation: rushdb_types::command::IsolationMode::Snapshot,
+            preconditions: tx.preconditions.clone(),
+            mutations: tx.mutations.clone(),
+        };
+
+        // When a replication seam is installed, the tx commits by replicating
+        // the batch (like every other commit) instead of publishing locally.
+        if let Some(replicator) = replicator {
+            let payload_bytes: Vec<u8> = b"{}".to_vec();
+            replicator
+                .replicate(&batch, &payload_bytes)
+                .map_err(StorageError::Builder)?;
+            return match self.lookup_outcome_checked(commit_key)? {
+                Some((OutcomeStatus::Committed, replicated_ci)) => Ok(replicated_ci),
+                _ => Err(StorageError::CorruptLog),
+            };
+        }
+
+        // Feeds the WAL's embedded command on a durable store, or
+        // the in-memory command-journal row otherwise (no WAL to derive it from).
+        let command_payload = rushdb_types::command_codec::encode(&batch);
+        let ops = {
+            // Deterministic expansion reads the transaction's snapshot so it
+            // matches the state the transaction observed.
+            let snapshot = tx.base_view.is_some();
+            let guard = self.txn_data(snapshot)?;
+            let native = if snapshot {
+                None
+            } else {
+                self.native_transaction_view()?
+            };
+            let base = TxnBase::resolve(None, tx.base_view.clone(), native, guard.as_deref());
+            let mut wtxn = Txn {
+                base,
+                buffer: BTreeMap::new(),
+                purge_keys: BTreeSet::default(),
+                set_keys: BTreeSet::default(),
+                deps: None,
+            };
+            let expander = self.health.guard(self.expander.read())?.clone();
+            let Some(expand) = expander.as_ref() else {
+                return Err(StorageError::CorruptLog);
+            };
+            expand(ci, &batch, &mut wtxn).map_err(StorageError::Builder)?;
+            if !self.is_durable() {
+                wtxn.put(log_key(ci), wal::encode_wal_record(0, ci, &command_payload));
+            }
+            // Interactive transactions return no stored response body.
+            self.put_receipt(&mut wtxn, commit_key, OutcomeStatus::Committed, ci, None);
+            wtxn.set(LAST_APPLIED_KEY.to_vec(), wal::encode_last_applied(0, ci));
+            wtxn.drain()
+        };
+
+        self.reject_oversized_commit(&ops, command_payload.len())?;
+        // Expansion succeeded: reserve the slot. Admission is held until this
+        // function returns, so the prospective `ci` is still current.
+        self.next_commit_index.store(ci + 1, Ordering::SeqCst);
+        let shard =
+            resources::physical_shard_for(Some(&batch.tenant), self.resource_config.shard_count);
+        self.enqueue_and_publish(ci, shard, ops, command_payload)?;
+        Ok(ci)
+    }
+}
