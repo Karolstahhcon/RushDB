@@ -170,3 +170,175 @@ impl RequestScope<'_> {
             Ok(serde_json::json!({
                 "message": format!("Import complete. {count} records processed."),
                 "count": count,
+                "relationships": plan.relations.len()
+            }))
+        } else {
+            Ok(serde_json::json!({
+                "count": count,
+                "relationships": plan.relations.len(),
+                "data": true
+            }))
+        }
+    }
+
+    /// Bind inline vector drafts through the shared deterministic path after
+    /// draft ids are remapped to persisted ids.
+    pub(super) fn bind_inline_vectors(
+        &self,
+        plan: &rushdb_lmpg::import::BfsPlan,
+        idmap: &[rushdb_lmpg::import::UpsertIdMap],
+    ) -> Result<(), String> {
+        self.bind_inline_vectors_with_cancel(plan, idmap, &|| false)
+    }
+
+    pub(super) fn bind_inline_vectors_with_cancel(
+        &self,
+        plan: &rushdb_lmpg::import::BfsPlan,
+        idmap: &[rushdb_lmpg::import::UpsertIdMap],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        // Group the batch's inline vectors per (index, property) and bind each
+        // group in ONE commit: one durable commit per vector made an ingest
+        // batch of N vectors cost N fsyncs (C9, cloud-capacity F10).
+        let mut groups: std::collections::BTreeMap<(String, String), Vec<InlineVector>> =
+            std::collections::BTreeMap::new();
+        for vd in &plan.vector_drafts {
+            let persisted = idmap
+                .iter()
+                .find(|m| m.draft_id == vd.draft_id)
+                .map_or(vd.draft_id, |m| m.persisted_id);
+            let hex = crate::node::hex_simple(&persisted);
+            for entry in &vd.entries {
+                if is_cancelled() {
+                    return Err("import cancelled".into());
+                }
+                let alias = self.resolve_inline_vector_alias(&vd.label, entry)?;
+                groups
+                    .entry((alias, entry.property_name.clone()))
+                    .or_default()
+                    .push((hex.clone(), entry.vector.clone()));
+            }
+        }
+        let lmpg = self.lmpg();
+        for ((alias, property), vectors) in groups {
+            if is_cancelled() {
+                return Err("import cancelled".into());
+            }
+            // The embedding property family may not exist (vectors are
+            // external data, not stored occurrences): ensure it first.
+            lmpg.ensure_record_family(&property)
+                .map_err(|e| e.to_string())?;
+            let items: Vec<(&str, &[f32])> = vectors
+                .iter()
+                .map(|(hex, vector)| (hex.as_str(), vector.as_slice()))
+                .collect();
+            self.bind_field_vectors_external(&alias, &property, &items)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn rollback_ingest_records(
+        &self,
+        idmap: &[rushdb_lmpg::import::UpsertIdMap],
+    ) -> Result<(), String> {
+        let lmpg = self.lmpg();
+        let view = self.store.read_view().map_err(|e| e.to_string())?;
+        for mapping in idmap {
+            let Some(header) = rushdb_lmpg::reader::try_access::record_by_id(
+                &view,
+                self.tenant(),
+                &rushdb_types::ids::RecordId(mapping.persisted_id),
+            )
+            .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            lmpg.delete_record(rushdb_lmpg::RecordRef {
+                record_id: mapping.persisted_id,
+                ordinal: header.ordinal,
+            })
+            .map_err(|e| e.to_reason())?;
+        }
+        Ok(())
+    }
+
+    /// Resolve every inline vector against the scope-local index registry.
+    /// Validation happens before record import so a bad or ambiguous vector
+    /// cannot leave a partially-created record behind.
+    pub(super) fn validate_inline_vectors(
+        &self,
+        plan: &rushdb_lmpg::import::BfsPlan,
+    ) -> Result<(), String> {
+        for draft in &plan.vector_drafts {
+            for entry in &draft.entries {
+                self.resolve_inline_vector_alias(&draft.label, entry)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn resolve_inline_vector_alias(
+        &self,
+        label: &str,
+        entry: &rushdb_lmpg::import::InlineVectorEntry,
+    ) -> Result<String, String> {
+        // An explicit index name is authoritative: validate it exists so a bad
+        // vector fails before any record is created, then use it directly
+        // (no shape guessing among same-dimension siblings).
+        // Resolution is a metadata lookup, never a readiness-stats computation:
+        // computing stats per vector made binding cost O(index size) per vector
+        // (C9, cloud-capacity F10).
+        if let Some(index) = entry.index.as_deref() {
+            if !self.vector_index_exists(index)? {
+                return Err(format!("no embedding index named `{index}`"));
+            }
+            return Ok(index.to_string());
+        }
+        if self.require_vector_index_name {
+            return Err("inline `$vectors` require an explicit `index` \
+                 (resources.require-vector-index-name is on)"
+                .into());
+        }
+        let mut matches: Vec<String> = self
+            .vector_index_rows()?
+            .into_iter()
+            .filter(|index| {
+                index.get("label").and_then(|v| v.as_str()) == Some(label)
+                    && index.get("property").and_then(|v| v.as_str())
+                        == Some(entry.property_name.as_str())
+                    && index.get("dimensions").and_then(serde_json::Value::as_u64)
+                        == Some(entry.vector.len() as u64)
+                    && entry
+                        .similarity_function
+                        .as_deref()
+                        .is_none_or(|similarity| {
+                            index.get("similarity").and_then(|v| v.as_str()) == Some(similarity)
+                        })
+            })
+            .filter_map(|index| {
+                index
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        matches.sort();
+        matches.dedup();
+
+        match matches.as_slice() {
+            [alias] => Ok(alias.clone()),
+            [] => Err(format!(
+                "no matching external embedding index for label `{label}`, property `{}`, and {} dimensions",
+                entry.property_name,
+                entry.vector.len()
+            )),
+            _ => Err(format!(
+                "multiple external embedding indexes match label `{label}` and property `{}`; similarityFunction is required",
+                entry.property_name
+            )),
+        }
+    }
+}
+
+/// One inline vector awaiting its batch bind: `(record id hex, components)`.
+type InlineVector = (String, Vec<f32>);
