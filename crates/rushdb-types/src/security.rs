@@ -84,3 +84,90 @@ fn is_zero(value: &u64) -> bool {
 
 /// Stable digest of a policy's semantic content and enforcement mode.
 ///
+/// # Panics
+///
+/// Panics if the policy cannot be serialized to JSON, which cannot happen for
+/// the plain data types held by [`DataAccessPolicy`].
+#[must_use]
+pub fn policy_fingerprint(policy: &DataAccessPolicy, mode: AuthorizationMode) -> u64 {
+    let json = serde_json::json!({
+        "labels": policy.allowed_labels, "denied": policy.denied_rel_types,
+        "visible": policy.visible_properties, "max": policy.max_results,
+        "mode": format!("{mode:?}"),
+    });
+    crate::hash::stable_hash64(&serde_json::to_vec(&json).expect("policy JSON is serializable"))
+}
+
+/// [`policy_fingerprint`] covering a small-count threshold too; equal to it
+/// when `min_count` is 0, so a policy without one keeps its digest.
+///
+/// # Panics
+///
+/// Panics if the policy cannot be serialized to JSON, which cannot happen for
+/// the plain data types held by [`DataAccessPolicy`].
+#[must_use]
+pub fn policy_fingerprint_with_min_count(
+    policy: &DataAccessPolicy,
+    mode: AuthorizationMode,
+    min_count: u64,
+) -> u64 {
+    if min_count == 0 {
+        return policy_fingerprint(policy, mode);
+    }
+    let json = serde_json::json!({
+        "labels": policy.allowed_labels, "denied": policy.denied_rel_types,
+        "visible": policy.visible_properties, "max": policy.max_results,
+        "mode": format!("{mode:?}"), "minCount": min_count,
+    });
+    crate::hash::stable_hash64(&serde_json::to_vec(&json).expect("policy JSON is serializable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_threshold_changes_the_fingerprint_only_when_set() {
+        let policy = DataAccessPolicy {
+            allowed_labels: vec!["A".into()],
+            ..DataAccessPolicy::default()
+        };
+        let mode = AuthorizationMode::PolicyEnforced;
+        assert_eq!(
+            policy_fingerprint_with_min_count(&policy, mode, 0),
+            policy_fingerprint(&policy, mode)
+        );
+        assert_ne!(
+            policy_fingerprint_with_min_count(&policy, mode, 5),
+            policy_fingerprint(&policy, mode)
+        );
+        // A stored policy without a threshold reads back as 0 and writes no field.
+        let active = ActivePolicy {
+            generation: 1,
+            policy,
+            mode,
+            fingerprint: 7,
+            min_count: 0,
+        };
+        let json = serde_json::to_value(&active).unwrap();
+        assert!(json.get("min_count").is_none());
+        let back: ActivePolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(back.min_count, 0);
+    }
+
+    #[test]
+    fn the_allow_list_is_empty_for_none_star_for_all_and_ignores_case() {
+        let policy = |labels: &[&str]| DataAccessPolicy {
+            allowed_labels: labels.iter().map(ToString::to_string).collect(),
+            ..DataAccessPolicy::default()
+        };
+        assert!(!policy(&[]).allows_label("Note"));
+        assert!(!policy(&[]).allows_every_label());
+        assert!(policy(&["*"]).allows_label("Note"));
+        assert!(policy(&["Note", "*"]).allows_every_label());
+        assert!(policy(&["note"]).allows_label("Note"));
+        assert!(policy(&["first-name"]).allows_label("First_Name"));
+        assert!(!policy(&["Note"]).allows_label("Notes"));
+        assert!(!policy(&["Note"]).allows_every_label());
+    }
+}
