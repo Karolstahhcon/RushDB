@@ -132,3 +132,137 @@ fn time_bucket_and_ordering_aggregate() {
     } else {
         // order_by without total sums may use group metric; fall back to
         // asserting the fixed bucket count only
+        assert_eq!(buckets.len(), 3);
+    }
+
+    // AggregateThenPaginate explicit domain:
+    let sliced = aggregate(
+        &lmpg,
+        &AggregateRequest {
+            labels: vec!["Event".into()],
+            group_by: vec!["kind".into()],
+            skip: 1,
+            limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(sliced.len(), 1);
+}
+
+#[test]
+fn search_request_with_empty_labels_scans_all() {
+    let lmpg = setup();
+    rec(&lmpg, &json!({"x": "one"}));
+    rec(&lmpg, &json!({"y": "two"}));
+
+    let page = find_records(
+        &lmpg,
+        &SearchRequest {
+            pagination: Pagination {
+                skip: 0,
+                limit: Some(10),
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(page.total_matched, 2);
+
+    // import cycles avoided; ensure no nested promotion triggered here
+    let snap = lmpg.store.read_view().unwrap();
+    let labels = try_access::labels(&snap, lmpg.tenant).unwrap();
+    assert_eq!(labels, vec!["Event".to_string()]);
+}
+
+use rushdb_query::OutputExpr;
+
+#[test]
+fn derived_outputs_evaluate_refs_in_order() {
+    let lmpg = setup();
+    rec(&lmpg, &json!({"kind": "x", "v": 10.0}));
+    rec(&lmpg, &json!({"kind": "x", "v": 5.0}));
+
+    let buckets = aggregate(
+        &lmpg,
+        &AggregateRequest {
+            labels: vec!["Event".into()],
+            group_by: vec!["kind".into()],
+            sums: vec![("total".into(), "v".into())],
+            outputs: vec![
+                (
+                    "avg_x2".into(),
+                    OutputExpr::Divide {
+                        dividend: Box::new(OutputExpr::Ref("total".into())),
+                        divisor: Box::new(OutputExpr::Literal(2.0)),
+                        precision: 4,
+                    },
+                ),
+                (
+                    "scaled".into(),
+                    OutputExpr::Multiply(
+                        Box::new(OutputExpr::Ref("total".into())),
+                        Box::new(OutputExpr::Add(
+                            Box::new(OutputExpr::Literal(1.0)),
+                            Box::new(OutputExpr::Literal(1.0)),
+                        )),
+                    ),
+                ),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let b0 = &buckets[0];
+    assert_eq!(b0.derived_outputs.get("total"), Some(&json!(15.0)));
+    assert_eq!(b0.derived_outputs.get("avg_x2"), Some(&json!(7.5)));
+    assert_eq!(b0.derived_outputs.get("scaled"), Some(&json!(30.0)));
+}
+
+#[test]
+fn time_bucket_size_zero_is_rejected_at_parse() {
+    let Err(error) = rushdb_query::document::parse_document(&json!({
+        "select": { "b": { "$timeBucket": { "field": "at", "unit": "day", "size": 0 } } }
+    })) else {
+        panic!("size=0 must be rejected");
+    };
+    assert!(error.to_string().contains("size"), "{error}");
+}
+
+#[test]
+fn time_bucket_size_zero_does_not_panic_when_built_directly() {
+    let graph = setup();
+    import::import_document(&graph, "Ev", &json!({"at": 1_700_000_000_000i64})).unwrap();
+    let request = AggregateRequest {
+        labels: vec!["Ev".into()],
+        time_bucket: Some(TimeBucketSpec {
+            field: "at".into(),
+            unit: TimeUnit::Days,
+            size: 0,
+        }),
+        time_bucket_alias: Some("bucket".into()),
+        ..Default::default()
+    };
+    // A directly constructed spec must not divide by zero; the defensive floor
+    // treats a zero size as one.
+    let buckets = aggregate(&graph, &request).unwrap();
+    assert_eq!(buckets.len(), 1);
+}
+
+#[test]
+fn average_precision_is_clamped_and_never_overflows() {
+    let graph = setup();
+    import::import_document(&graph, "Ev", &json!({"v": 1.234_567_89})).unwrap();
+    for precision in [0u64, 2, 15, 4_294_967_295, u64::MAX] {
+        let parsed = rushdb_query::document::parse_document(&json!({
+            "select": { "avg": { "$avg": "v", "$precision": precision } },
+            "labels": ["Ev"]
+        }))
+        .unwrap();
+        let request = parsed.aggregate.expect("select produced an aggregate");
+        let buckets = aggregate(&graph, &request).unwrap();
+        let avg = buckets[0].sums["avg"].as_f64().unwrap();
+        assert!(avg.is_finite(), "precision {precision} produced {avg}");
+    }
+}

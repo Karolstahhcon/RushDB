@@ -68,3 +68,74 @@ fn a_walk_over_the_limit_is_refused_with_the_index_to_declare() {
 #[test]
 fn an_indexed_filter_or_a_walk_within_the_limit_runs() {
     assert_eq!(
+        find(
+            &engine(1_000),
+            &json!({"labels": ["Big"], "where": {"n": 5}})
+        )
+        .unwrap(),
+        30
+    );
+    assert_eq!(
+        find(&engine(0), &json!({"labels": ["Big"], "where": {"n": 5}})).unwrap(),
+        30,
+        "0 = off"
+    );
+    let lmpg = engine(100);
+    let def = lmpg
+        .define_index("big_n", "Big", "n", IndexKind::Ordered)
+        .unwrap();
+    while !matches!(
+        lmpg.index_step(def.id, 1_000).unwrap(),
+        IndexStep::Finished | IndexStep::Idle
+    ) {}
+    assert_eq!(
+        find(&lmpg, &json!({"labels": ["Big"], "where": {"n": 5}})).unwrap(),
+        30
+    );
+}
+
+#[test]
+fn a_request_limit_refuses_a_walk_the_server_allows() {
+    let lmpg = engine(0).with_request_limits(RequestLimits {
+        unindexed_walk_max_owners: Some(100),
+        ..RequestLimits::default()
+    });
+    assert!(matches!(
+        find(&lmpg, &json!({"labels": ["Big"], "where": {"n": 5}})),
+        Err(QueryError::UnindexedWalk(_))
+    ));
+    // `0` refuses every walk, as `disallow_full_table_scans` does.
+    let strict = engine(0).with_request_limits(RequestLimits {
+        unindexed_walk_max_owners: Some(0),
+        ..RequestLimits::default()
+    });
+    assert!(matches!(
+        find(&strict, &json!({"labels": ["Big"], "where": {"n": 5}})),
+        Err(QueryError::UnindexedWalk(_))
+    ));
+    assert_eq!(find(&strict, &json!({"labels": ["Big"]})).unwrap(), 300);
+}
+
+#[test]
+fn a_request_cannot_lift_the_server_limit() {
+    let lmpg = engine(100).with_request_limits(RequestLimits {
+        unindexed_walk_max_owners: Some(1_000),
+        ..RequestLimits::default()
+    });
+    assert!(matches!(
+        find(&lmpg, &json!({"labels": ["Big"], "where": {"n": 5}})),
+        Err(QueryError::UnindexedWalk(_))
+    ));
+}
+
+#[test]
+fn a_passed_deadline_stops_a_walk_the_caller_never_cancels() {
+    let lmpg = engine(0).with_request_limits(RequestLimits {
+        deadline: Some(std::time::Instant::now()),
+        ..RequestLimits::default()
+    });
+    assert!(matches!(
+        find(&lmpg, &json!({"labels": ["Big"], "where": {"n": 5}})),
+        Err(QueryError::Cancelled)
+    ));
+}
