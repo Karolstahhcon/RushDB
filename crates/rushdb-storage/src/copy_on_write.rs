@@ -118,3 +118,123 @@ mod imp {
 
     /// The store's files in `dir`: shard files (`name`, `name-N`) and the
     /// regular files of the WAL directory (`name.wal`).
+    fn data_files(dir: &Path, name: &str) -> Vec<PathBuf> {
+        let shard = |file: &str| {
+            file == name
+                || file
+                    .strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let wal = format!("{name}.wal");
+        let mut files = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return files;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file = entry.file_name();
+            let file = file.to_string_lossy();
+            match entry.file_type() {
+                Ok(kind) if kind.is_file() && shard(&file) => files.push(path),
+                Ok(kind) if kind.is_dir() && file == wal => {
+                    if let Ok(inner) = std::fs::read_dir(&path) {
+                        files.extend(
+                            inner
+                                .flatten()
+                                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                                .map(|entry| entry.path()),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        files
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod imp {
+    use super::CopyOnWrite;
+    use std::path::Path;
+
+    pub(super) fn opt_out(_db: &Path) -> CopyOnWrite {
+        CopyOnWrite::NotApplicable
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{opt_out, CopyOnWrite};
+    use rustix::fs::{ioctl_getflags, IFlags};
+    use std::path::{Path, PathBuf};
+
+    /// A fresh directory on the filesystem holding the build (`/tmp` is often
+    /// tmpfs, which has no copy-on-write to turn off).
+    struct BuildDir(PathBuf);
+
+    impl BuildDir {
+        fn new() -> Self {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/copy-on-write-tests")
+                .join(uuid::Uuid::now_v7().to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for BuildDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn nocow(path: &Path) -> bool {
+        ioctl_getflags(std::fs::File::open(path).unwrap())
+            .unwrap()
+            .contains(IFlags::NOCOW)
+    }
+
+    #[test]
+    fn a_durable_store_creates_its_files_without_copy_on_write() {
+        let dir = BuildDir::new();
+        let db = dir.0.join("data").join("store.redb");
+        let store = crate::Store::open_with_deriver(
+            &db,
+            crate::resources::StorageResources::default(),
+            None,
+        )
+        .unwrap();
+        match store.copy_on_write().expect("a durable store records it") {
+            CopyOnWrite::NotApplicable => {}
+            CopyOnWrite::Off => {
+                assert!(nocow(db.parent().unwrap()));
+                assert!(nocow(&db));
+                let wal = PathBuf::from(format!("{}.wal", db.display()));
+                for segment in std::fs::read_dir(wal).unwrap() {
+                    assert!(nocow(&segment.unwrap().path()));
+                }
+            }
+            CopyOnWrite::On { paths, reason } => panic!("{paths:?} still copy on write: {reason}"),
+        }
+    }
+
+    #[test]
+    fn a_file_written_before_the_opt_out_is_reported_by_path() {
+        let dir = BuildDir::new();
+        let db = dir.0.join("store.redb");
+        std::fs::write(&db, b"written while the directory still copied on write").unwrap();
+        let unrelated = dir.0.join("config.yml");
+        std::fs::write(&unrelated, b"not a store file").unwrap();
+        match opt_out(&db) {
+            CopyOnWrite::NotApplicable => {}
+            CopyOnWrite::On { paths, reason } => {
+                assert_eq!(paths, vec![db.display().to_string()]);
+                assert!(reason.contains("restore from a backup"), "{reason}");
+                assert!(nocow(&dir.0), "new files still inherit the opt-out");
+            }
+            CopyOnWrite::Off => panic!("a non-empty file cannot drop copy-on-write in place"),
+        }
+    }
+}
