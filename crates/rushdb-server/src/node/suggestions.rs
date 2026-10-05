@@ -248,3 +248,253 @@ impl RequestScope<'_> {
         view: &Arc<rushdb_storage::ReadView>,
         label: &str,
         column: &PropertyDescription,
+        few_values: u64,
+        access: &CatalogAccess,
+        meter: &mut WorkingSet<'_>,
+    ) -> Result<PropertySummary, String> {
+        let scope = [label.to_string()];
+        let mut summary = PropertySummary {
+            name: column.name.clone(),
+            value_type: column.value_type.clone(),
+            records_count: column.records_count,
+            is_array: column.is_array,
+            sibling_types: column.sibling_types.clone(),
+            distinct_count: None,
+            min: None,
+            max: None,
+            values: Vec::new(),
+        };
+        if column.value_type == "null" {
+            return Ok(summary);
+        }
+        // This entry's own type: a type split's text and datetime entries
+        // each read their own values, range and distinct count.
+        let types = logical_types_of(&column.value_type);
+        let Some(domain) =
+            self.value_domain_of_types_in_view(view, &column.name, &scope, types, meter)?
+        else {
+            // The dictionary cannot answer for values too long for it: a
+            // text column is counted from the long-value counters too, so
+            // every scalar column reports its distinct count (arrays still
+            // do not: their values are whole arrays).
+            if column.value_type == "string" && !column.is_array {
+                if let Some((distinct, ranked)) =
+                    self.long_text_values_in_view(view, &column.name, label, few_values, meter)?
+                {
+                    summary.distinct_count = Some(distinct);
+                    summary.values = ranked
+                        .into_iter()
+                        .filter(|(_, count)| access.counted(*count))
+                        .map(|(value, _)| value)
+                        .collect();
+                }
+            }
+            return Ok(summary);
+        };
+        let distinct = domain.distinct_total();
+        summary.distinct_count = Some(distinct);
+        // Under a small-count threshold extremes are withheld: a minimum or
+        // maximum is often one record's value.
+        if domain.numeric_only && access.shows_extremes() {
+            summary.min = domain.min;
+            summary.max = domain.max;
+        }
+        let wants_values = distinct > 0 && distinct <= few_values;
+        let wants_dates = column.value_type == "datetime"
+            && distinct <= MAX_COMPARED_DISTINCT
+            && access.shows_extremes();
+        if wants_values || wants_dates {
+            let before = meter.charged();
+            let ranked = self.value_dictionary_of_types_in_view(
+                view,
+                &column.name,
+                &scope,
+                types,
+                None,
+                meter,
+            )?;
+            // Only the few values listed outlive this property.
+            meter.release(meter.charged() - before);
+            if let Some(ranked) = ranked {
+                if wants_dates {
+                    // By instant: rendered text does not order signed years.
+                    let instants = ranked.iter().filter_map(|(value, _)| {
+                        let text = value.as_str()?;
+                        Some((rushdb_types::datetime::parse_datetime(text)?, text))
+                    });
+                    summary.min = instants
+                        .clone()
+                        .min_by_key(|(ms, _)| *ms)
+                        .map(|(_, text)| serde_json::Value::from(text));
+                    summary.max = instants
+                        .max_by_key(|(ms, _)| *ms)
+                        .map(|(_, text)| serde_json::Value::from(text));
+                }
+                if wants_values {
+                    summary.values = ranked
+                        .into_iter()
+                        .filter(|(_, count)| access.counted(*count))
+                        .map(|(value, _)| value)
+                        .collect();
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// A column's dictionary for comparison; the values stay charged to
+    /// `meter` while the overlap holds them.
+    fn dictionary(
+        &self,
+        view: &Arc<rushdb_storage::ReadView>,
+        column: &Column,
+        meter: &mut WorkingSet<'_>,
+    ) -> Result<Dictionary, String> {
+        if column.is_array {
+            return Ok(Dictionary::NotCompared("array values"));
+        }
+        let scope = [column.label.clone()];
+        match self.value_domain_from_index_in_view(view, &column.property, &scope, meter)? {
+            Some(domain) if domain.distinct_total() > MAX_COMPARED_DISTINCT => {
+                return Ok(Dictionary::NotCompared("too many distinct values"));
+            }
+            Some(_) => {}
+            None => return Ok(Dictionary::NotCompared("long or array values")),
+        }
+        Ok(
+            match self.value_dictionary_in_view(view, &column.property, &scope, None, meter)? {
+                Some(ranked) => {
+                    // Join keys replace the read values: charge the keys,
+                    // release the values.
+                    let mut counts = HashMap::with_capacity(ranked.len());
+                    for (value, count) in ranked {
+                        if let Some(key) = join_key(&value) {
+                            meter.charge(value_bytes(key.len()))?;
+                            counts.insert(key, count);
+                        }
+                        let encoded = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
+                        meter.release(value_bytes(encoded));
+                    }
+                    Dictionary::Values(Values::new(counts))
+                }
+                None => Dictionary::NotCompared("long or array values"),
+            },
+        )
+    }
+
+    /// Value overlap for each pair, in request order. A pair naming
+    /// a property that does not exist, or that `access` hides, comes back
+    /// not compared (the two are indistinguishable); under a policy's
+    /// `minCount`, overlap over fewer records is withheld. The dictionaries
+    /// compared are working set (`meter`) until the response is built.
+    pub(crate) fn value_overlap_in_view(
+        &self,
+        view: &Arc<rushdb_storage::ReadView>,
+        pairs: &[JoinPair],
+        access: &CatalogAccess,
+        meter: &mut WorkingSet<'_>,
+    ) -> Result<Vec<ValueOverlap>, String> {
+        if pairs.len() > MAX_OVERLAP_PAIRS {
+            return Err(format!(
+                "invalid request: at most {MAX_OVERLAP_PAIRS} pairs per valueOverlap"
+            ));
+        }
+        let columns: Vec<Column> = self
+            .catalog_columns(view, &[], access)?
+            .into_iter()
+            .filter_map(|description| {
+                Some(Column {
+                    label: description.label?,
+                    property: description.name,
+                    records_count: description.records_count,
+                    is_array: description.is_array,
+                })
+            })
+            .collect();
+        let find = |end: &JoinEnd| {
+            columns
+                .iter()
+                .position(|column| column.label == end.label && column.property == end.property)
+        };
+        let mut dictionaries: HashMap<usize, Dictionary> = HashMap::new();
+        let mut out = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            meter.check()?;
+            let mut overlap = ValueOverlap {
+                source: pair.source.clone(),
+                target: pair.target.clone(),
+                source_distinct: None,
+                target_distinct: None,
+                matched_distinct: None,
+                matched_records: None,
+                coverage: None,
+                source_uniqueness: None,
+                target_uniqueness: None,
+                numeric_span: None,
+                not_compared: None,
+            };
+            let (Some(s), Some(t)) = (find(&pair.source), find(&pair.target)) else {
+                overlap.not_compared = Some("no such property".into());
+                out.push(overlap);
+                continue;
+            };
+            for index in [s, t] {
+                if let std::collections::hash_map::Entry::Vacant(entry) = dictionaries.entry(index)
+                {
+                    entry.insert(self.dictionary(view, &columns[index], meter)?);
+                }
+            }
+            match (&dictionaries[&s], &dictionaries[&t]) {
+                (Dictionary::Values(from), Dictionary::Values(to)) => {
+                    let (matched, records) = from
+                        .counts
+                        .iter()
+                        .filter(|(key, _)| to.counts.contains_key(*key))
+                        .fold((0u64, 0u64), |(n, r), (_, count)| (n + 1, r + count));
+                    if !access.counted(records) {
+                        overlap.not_compared = Some("withheld under the policy's minCount".into());
+                        out.push(overlap);
+                        continue;
+                    }
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "counts are far below 2^52; the ratios are scores"
+                    )]
+                    {
+                        let ratio = |n: usize, d: u64| (d > 0).then(|| n as f64 / d as f64);
+                        overlap.coverage =
+                            (from.len() > 0).then(|| matched as f64 / from.len() as f64);
+                        overlap.source_uniqueness = ratio(from.len(), columns[s].records_count);
+                        overlap.target_uniqueness = ratio(to.len(), columns[t].records_count);
+                    }
+                    if let (Some((lo, hi)), Some((target_lo, target_hi))) = (from.span, to.span) {
+                        overlap.numeric_span =
+                            Some((hi - lo + 1.0) / (target_hi - target_lo + 1.0));
+                    }
+                    overlap.source_distinct = Some(from.len() as u64);
+                    overlap.target_distinct = Some(to.len() as u64);
+                    overlap.matched_distinct = Some(matched);
+                    overlap.matched_records = Some(records);
+                }
+                (Dictionary::NotCompared(why), _) | (_, Dictionary::NotCompared(why)) => {
+                    overlap.not_compared = Some((*why).to_string());
+                }
+            }
+            out.push(overlap);
+        }
+        Ok(out)
+    }
+}
+
+/// The stored logical types a catalog entry's type name covers (`number`
+/// covers both integers and floats).
+fn logical_types_of(value_type: &str) -> &'static [rushdb_types::model::LogicalType] {
+    use rushdb_types::model::LogicalType;
+    match value_type {
+        "number" => &[LogicalType::Int64, LogicalType::Float64],
+        "string" => &[LogicalType::Utf8],
+        "datetime" => &[LogicalType::DateTime],
+        "boolean" => &[LogicalType::Boolean],
+        _ => &[],
+    }
+}
