@@ -69,3 +69,75 @@ impl Histogram {
         clippy::cast_precision_loss,
         clippy::cast_sign_loss,
         reason = "selectivity estimate: a non-negative fraction of a u32 bucket count"
+    )]
+    pub fn estimate(&self, bound: &[u8], above: bool) -> u64 {
+        let total = self.total();
+        if total == 0 || self.max.is_empty() {
+            return 0;
+        }
+        let (min_v, max_v, bound_v) = (
+            encoded_to_u128(&self.min),
+            encoded_to_u128(&self.max),
+            encoded_to_u128(bound),
+        );
+        if above {
+            if bound_v <= min_v {
+                return total;
+            }
+            if bound_v > max_v {
+                return 0;
+            }
+        } else {
+            if bound_v > max_v {
+                return total;
+            }
+            if bound_v <= min_v {
+                return 0;
+            }
+        }
+        let width = self.min.len().max(self.max.len()).max(bound.len());
+        let bidx = fixed_bucket_index(bound);
+        let (lo, hi) = fixed_bucket_bounds(width, bidx);
+        let bucket_width = hi.saturating_sub(lo).max(1);
+        let within = if above {
+            hi.saturating_sub(bound_v)
+        } else {
+            bound_v.saturating_sub(lo)
+        };
+        let fraction = (within as f64 / bucket_width as f64).clamp(0.0, 1.0);
+        let partial = (f64::from(self.buckets[bidx]) * fraction).round() as u32;
+        let rest: u64 = if above {
+            self.buckets[bidx + 1..].iter().map(|&b| u64::from(b)).sum()
+        } else {
+            self.buckets[..bidx].iter().map(|&b| u64::from(b)).sum()
+        };
+        rest.saturating_add(u64::from(partial)).min(total)
+    }
+}
+
+fn encoded_to_u128(bytes: &[u8]) -> u128 {
+    let mut buf = [0u8; 16];
+    let take = bytes.len().min(16);
+    buf[16 - take..].copy_from_slice(&bytes[bytes.len() - take..]);
+    u128::from_be_bytes(buf)
+}
+
+fn fixed_bucket_index(encoded: &[u8]) -> usize {
+    let bits = encoded.len().saturating_mul(8);
+    let shift = bits.saturating_sub(6);
+    ((encoded_to_u128(encoded) >> shift) & 0x3F) as usize
+}
+
+fn fixed_bucket_bounds(width: usize, idx: usize) -> (u128, u128) {
+    let bits = width.saturating_mul(8);
+    let shift = bits.saturating_sub(6);
+    let lo = (idx as u128) << shift;
+    let hi = if idx + 1 < VALUE_DISTRIBUTION_BUCKETS {
+        (idx as u128 + 1) << shift
+    } else if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    (lo, hi)
+}
