@@ -91,3 +91,96 @@ fn workload(store: &Arc<Store>) {
         .unwrap();
     let acme = a
         .create_record(
+            "Company",
+            None,
+            vec![("name".into(), FieldChange::Set(json!("Acme")))],
+        )
+        .unwrap();
+    b.create_record(
+        "Other",
+        None,
+        vec![("x".into(), FieldChange::Set(json!(1)))],
+    )
+    .unwrap();
+    check("records in two tenants");
+    let works = a
+        .create_relationship(
+            "WORKS_AT",
+            alice,
+            acme,
+            vec![("since".into(), FieldChange::Set(json!(2020)))],
+        )
+        .unwrap();
+    a.create_relationship("KNOWS", alice, bob, vec![]).unwrap();
+    a.create_relationship("KNOWS", bob, alice, vec![]).unwrap();
+    check("relationships");
+    import_document(
+        &a,
+        "Order",
+        &json!({"total": 12.5, "lines": [{"sku": "x", "qty": 2}, {"sku": "y", "qty": 1}]}),
+    )
+    .unwrap();
+    check("nested import");
+    a.update_fields(
+        alice,
+        vec![
+            ("age".into(), FieldChange::Delete),
+            ("name".into(), FieldChange::Set(json!("Alice Longer Name"))),
+        ],
+    )
+    .unwrap();
+    check("update and property delete");
+    a.update_fields(bob, vec![("nick".into(), FieldChange::Delete)])
+        .unwrap();
+    check("last carrier of a property removed");
+    a.retype_record(acme, "Company", "Org").unwrap();
+    check("retype empties a label");
+    a.delete_relationship(works).unwrap();
+    check("relationship delete");
+    a.delete_record(bob).unwrap();
+    check("record delete with incident edges");
+}
+
+#[test]
+fn usage_counters_match_a_scan_in_memory() {
+    workload(&Arc::new(Store::new_in_memory()));
+}
+
+#[test]
+fn usage_counters_match_a_scan_on_disk_and_survive_restart() {
+    let dir = rushdb_storage::TempPath::store("tenant-usage");
+    let path = dir.path().to_path_buf();
+    let before = {
+        let store = Arc::new(rushdb_lmpg::open_store(&path).unwrap());
+        workload(&store);
+        let usage = counted(&store, TenantId::from_ordinal(11));
+        assert!(usage.records > 0 && usage.logical_bytes > 0);
+        usage
+    };
+    // Reopen replays any WAL tail beyond the last checkpoint through the
+    // same apply path; the totals must come back unchanged and exact.
+    let store = Arc::new(rushdb_lmpg::open_store(&path).unwrap());
+    assert_eq!(counted(&store, TenantId::from_ordinal(11)), before);
+    assert_exact(&store, TenantId::from_ordinal(11), "restart");
+}
+
+#[test]
+fn purge_takes_usage_to_zero_and_spares_other_tenants() {
+    let store = Arc::new(Store::new_in_memory());
+    workload(&store);
+    let a = Lmpg::new(Arc::clone(&store), TenantId::from_ordinal(11));
+    let other = counted(&store, TenantId::from_ordinal(12));
+    a.purge_tenant_chunked(16).unwrap();
+    assert_exact(&store, a.tenant, "purge");
+    let left = counted(&store, a.tenant);
+    assert_eq!(
+        (
+            left.records,
+            left.relationships,
+            left.labels,
+            left.properties
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(counted(&store, TenantId::from_ordinal(12)), other);
+}
