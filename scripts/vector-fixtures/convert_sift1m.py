@@ -23,3 +23,28 @@ def write_fvecs(rows, path: str) -> None:
 
 
 def write_ivecs(rows, path: str) -> None:
+    with open(path, "wb") as f:
+        for r in rows:
+            f.write(struct.pack("<I", len(r)))
+            for v in r:
+                f.write(struct.pack("<i", int(v)))
+
+
+def main() -> int:
+    src, out_dir = sys.argv[1], sys.argv[2]
+    with h5py.File(src, "r") as h5:
+        train = h5["train"][:]
+        test = h5["test"][:]
+        neighbors = h5["neighbors"][:]
+
+    write_fvecs(train, f"{out_dir}/base.fvecs")
+    write_fvecs(test, f"{out_dir}/query.fvecs")
+    write_ivecs(neighbors, f"{out_dir}/neighbors.ivecs")
+    print(f"  SIFT1M base {train.shape} -> {out_dir}/base.fvecs")
+    print(f"  SIFT1M query {test.shape} -> {out_dir}/query.fvecs")
+    print(f"  SIFT1M neighbors {neighbors.shape} -> {out_dir}/neighbors.ivecs")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
