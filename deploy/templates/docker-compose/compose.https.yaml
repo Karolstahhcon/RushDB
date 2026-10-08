@@ -17,3 +17,22 @@ services:
       - '127.0.0.1:${RUSHDB_PGWIRE_PORT:-5432}:5432'
     volumes:
       - rushdb-data:/data
+    stop_grace_period: 90s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    command: ['caddy', 'reverse-proxy', '--from', '${RUSHDB_DOMAIN:?set RUSHDB_DOMAIN}', '--to', 'rushdb:3000']
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - caddy-data:/data
+    depends_on:
+      rushdb:
+        condition: service_healthy
+
+volumes:
+  rushdb-data:
+  caddy-data:
