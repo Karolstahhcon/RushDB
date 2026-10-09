@@ -143,3 +143,149 @@ pub const ID_FIELD: &str = "__id";
 pub const LABEL_FIELD: &str = "__label";
 /// The relationship type in a reconstructed relationship.
 pub const TYPE_FIELD: &str = "__type";
+/// The source record id in a reconstructed relationship.
+pub const SOURCE_FIELD: &str = "__source_id";
+/// The target record id in a reconstructed relationship.
+pub const TARGET_FIELD: &str = "__target_id";
+
+/// Whether a normalized property name is reserved for the engine: every name
+/// starting with `__` ([`ID_FIELD`], [`LABEL_FIELD`], `__proptypes`,
+/// `__score`, …). No record or relationship stores a property under such a
+/// name, so system fields never collide with user properties; `_id` is an
+/// ordinary property.
+///
+/// # Examples
+///
+/// ```
+/// use rushdb_types::value::{is_reserved_name, normalize_name};
+///
+/// assert!(is_reserved_name("__id"));
+/// assert!(is_reserved_name(&normalize_name("__Score")));
+/// assert!(!is_reserved_name("_id"));
+/// ```
+#[must_use]
+pub fn is_reserved_name(normalized: &str) -> bool {
+    normalized.starts_with("__")
+}
+
+/// Convert a canonical scalar to its JSON representation.
+#[must_use]
+pub fn scalar_to_json(s: &Scalar) -> Json {
+    match s {
+        Scalar::Boolean(b) => Json::Bool(*b),
+        Scalar::Int64(i) => Json::Number((*i).into()),
+        Scalar::Float64(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
+        Scalar::Utf8(st) => Json::String(st.clone()),
+        Scalar::DateTime(ms) => Json::Number((*ms).into()),
+    }
+}
+
+/// Infer a logical type and scalar from a JSON value.
+///
+/// Returns `None` for JSON nulls, arrays and objects, which have no scalar
+/// interpretation.
+#[must_use]
+pub fn infer_scalar(v: &Json) -> Option<(LogicalType, Scalar)> {
+    match v {
+        Json::Bool(b) => Some((LogicalType::Boolean, Scalar::Boolean(*b))),
+        Json::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some((LogicalType::Int64, Scalar::Int64(i)))
+            } else if n.as_u64().is_some() {
+                // The engine's canonical integer domain is signed i64. Do
+                // not silently widen an out-of-domain JSON integer through
+                // f64: values above 2^63-1 would lose identity and could
+                // match the wrong index entry.
+                None
+            } else {
+                n.as_f64()
+                    .map(|f| (LogicalType::Float64, Scalar::Float64(f)))
+            }
+        }
+        Json::String(s) => Some((LogicalType::Utf8, Scalar::Utf8(s.clone()))),
+        _ => None,
+    }
+}
+
+/// Name of the JSON kind of a value (`"null"`, `"boolean"`, ...).
+#[must_use]
+pub fn json_type_name(v: &Json) -> &'static str {
+    match v {
+        Json::Null => "null",
+        Json::Bool(_) => "boolean",
+        Json::Number(_) => "number",
+        Json::String(_) => "string",
+        Json::Array(_) => "array",
+        Json::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_ordering_preserves_integer_precision() {
+        assert_eq!(
+            scalar_cmp(
+                &Scalar::Int64(9_007_199_254_740_993),
+                &Scalar::Float64(9_007_199_254_740_992.0)
+            ),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            scalar_cmp(&Scalar::Int64(2), &Scalar::Float64(2.5)),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn out_of_domain_unsigned_json_integer_is_not_widened() {
+        let value = serde_json::json!(u64::MAX);
+        assert!(infer_scalar(&value).is_none());
+    }
+
+    #[test]
+    fn json_scalar_ordering_preserves_integer_precision() {
+        let left = Json::Number(9_007_199_254_740_993i64.into());
+        let right = Json::Number(9_007_199_254_740_992i64.into());
+        assert_eq!(json_scalar_cmp(&left, &right), Some(Ordering::Greater));
+        assert_eq!(json_scalar_cmp(&Json::String("a".into()), &right), None);
+    }
+
+    #[test]
+    fn scalar_equality_preserves_integer_precision() {
+        assert!(scalar_equal(&Scalar::Int64(1), &Scalar::Float64(1.0)));
+        assert!(!scalar_equal(
+            &Scalar::Int64(9_007_199_254_740_993),
+            &Scalar::Float64(9_007_199_254_740_992.0)
+        ));
+        assert!(!scalar_equal(
+            &Scalar::Float64(f64::NAN),
+            &Scalar::Float64(f64::NAN)
+        ));
+        assert!(!scalar_equal(&Scalar::Utf8("1".into()), &Scalar::Int64(1)));
+        assert!(!scalar_equal(
+            &Scalar::Int64(i64::MAX),
+            &Scalar::Float64(9_223_372_036_854_775_808.0)
+        ));
+    }
+
+    #[test]
+    fn scalar_ordering_rejects_saturating_integer_boundary_aliases() {
+        assert_eq!(
+            scalar_cmp(
+                &Scalar::Int64(i64::MAX),
+                &Scalar::Float64(9_223_372_036_854_775_808.0)
+            ),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            scalar_cmp(
+                &Scalar::Int64(i64::MIN),
+                &Scalar::Float64(-9_223_372_036_854_775_808.0)
+            ),
+            Some(Ordering::Equal)
+        );
+    }
+}
