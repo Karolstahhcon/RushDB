@@ -195,3 +195,201 @@ pub fn scrub_report<R: TryRead>(r: &R, t: TenantId) -> Result<ScrubReport, Stora
     }
     Ok(ScrubReport {
         violations,
+        occurrence_rows,
+        record_rows,
+        derived_rows,
+        complete: true,
+    })
+}
+
+/// Stored derived rows compared with [`derive_from_scratch`]: violations,
+/// and the number of stored derived rows.
+fn derived_violations<R: TryRead>(
+    r: &R,
+    t: TenantId,
+    rows: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(Vec<Violation>, usize), StorageError> {
+    let deriver = LmpgDeriver;
+    let mut violations = Vec::new();
+    let mut flag = |what: &str, detail: String| {
+        violations.push(Violation {
+            what: what.into(),
+            detail,
+        });
+    };
+    let stored: BTreeMap<&[u8], &[u8]> = rows
+        .iter()
+        .filter(|(key, _)| deriver.is_derived_key(key))
+        .map(|(key, value)| (key.as_slice(), value.as_slice()))
+        .collect();
+    let expected = derive_from_scratch(r, t)?;
+    for (key, value) in &expected {
+        match stored.get(key.as_slice()) {
+            None => flag("derived_missing", k::describe_key(key)),
+            Some(found) if found != value => flag(
+                "derived_mismatch",
+                format!(
+                    "{}: stored {found:?}, derived {value:?}",
+                    k::describe_key(key)
+                ),
+            ),
+            Some(_) => {}
+        }
+    }
+    for key in stored.keys() {
+        if !expected.contains_key(*key) {
+            flag("derived_extra", k::describe_key(key));
+        }
+    }
+    Ok((violations, stored.len()))
+}
+
+fn owner_exists<R: TryRead>(
+    r: &R,
+    t: TenantId,
+    kind: OwnerKind,
+    owner: u64,
+) -> Result<bool, StorageError> {
+    Ok(match kind {
+        OwnerKind::Record => r.get(&k::record_hdr_key(t, owner))?.is_some(),
+        OwnerKind::Relationship => r.get(&kx::rel_by_ord_key(t, owner))?.is_some(),
+    })
+}
+
+/// A directed adjacency entry: `(rel_type, source, target, rel_ordinal)`.
+type Edge = (String, u64, u64, u64);
+
+fn adjacency_violations<R: TryRead>(r: &R, t: TenantId) -> Result<Vec<Violation>, StorageError> {
+    let mut out_edges: BTreeSet<Edge> = BTreeSet::new();
+    let mut in_edges: BTreeSet<Edge> = BTreeSet::new();
+    let mut nodes = BTreeSet::new();
+    for (key, _) in r.range_prefix(&k::key(t, &[b"adj"]))? {
+        let Some(rest) = key
+            .get(TENANT_PREFIX_LEN..)
+            .and_then(|rest| rest.strip_prefix(b"/adj/"))
+        else {
+            continue;
+        };
+        let (outgoing, rest) = if let Some(rest) = rest.strip_prefix(b"out/") {
+            (true, rest)
+        } else if let Some(rest) = rest.strip_prefix(b"in/") {
+            (false, rest)
+        } else {
+            continue;
+        };
+        if let Some(node) = rest.get(..8).and_then(|bytes| bytes.try_into().ok()) {
+            nodes.insert((u64::from_be_bytes(node), outgoing));
+        }
+    }
+    for (node, outgoing) in nodes {
+        let edges = if outgoing {
+            try_access::adj_out(r, t, node, None)?
+        } else {
+            try_access::adj_in(r, t, node, None)?
+        };
+        for (rel_type, other, rel) in edges {
+            if outgoing {
+                out_edges.insert((rel_type, node, other, rel));
+            } else {
+                in_edges.insert((rel_type, other, node, rel));
+            }
+        }
+    }
+    let mut violations = Vec::new();
+    for edge in out_edges.symmetric_difference(&in_edges) {
+        violations.push(Violation {
+            what: "adjacency_asymmetric".into(),
+            detail: format!("{edge:?}"),
+        });
+    }
+    for (rel_type, source, target, rel) in &out_edges {
+        match try_access::relationship_by_ord(r, t, *rel)? {
+            Some(header)
+                if header.rel_type == *rel_type
+                    && header.source_ord == *source
+                    && header.target_ord == *target => {}
+            _ => violations.push(Violation {
+                what: "adjacency_without_relationship".into(),
+                detail: format!("{rel_type}/{source}/{target}/{rel}"),
+            }),
+        }
+    }
+    Ok(violations)
+}
+
+/// Build a bounded, read-only repair plan: occurrence rows whose owner no
+/// longer exists. The returned keys are only candidates;
+/// [`repair_orphan_occurrences`] revalidates them inside its commit.
+///
+/// # Errors
+///
+/// Returns the underlying storage error if the scan or point reads fail.
+pub fn plan_orphan_occurrences<R: TryRead>(
+    r: &R,
+    t: TenantId,
+    max_keys: usize,
+) -> Result<OrphanRepairPlan, StorageError> {
+    let mut keys = Vec::new();
+    let mut complete = true;
+    if max_keys == 0 {
+        return Ok(OrphanRepairPlan { keys, complete });
+    }
+    for kind in [OwnerKind::Record, OwnerKind::Relationship] {
+        for (key, _) in r.range_prefix(&k::occ_kind_prefix(t, kind))? {
+            let orphan = match k::parse_occ_key(&key) {
+                Some((_, kind, owner, _, _)) => !owner_exists(r, t, kind, owner)?,
+                None => true,
+            };
+            if orphan {
+                if keys.len() < max_keys {
+                    keys.push(key);
+                } else {
+                    complete = false;
+                    return Ok(OrphanRepairPlan { keys, complete });
+                }
+            }
+        }
+    }
+    Ok(OrphanRepairPlan { keys, complete })
+}
+
+/// Delete at most `max_keys` orphaned occurrence rows in one bounded commit.
+/// This is an explicit repair operation; scrubbing itself remains read-only.
+/// A zero limit performs no mutation.
+///
+/// # Errors
+///
+/// Returns the storage error if the repair scan or commit fails.
+pub fn repair_orphan_occurrences(
+    store: &rushdb_storage::Store,
+    t: TenantId,
+    max_keys: usize,
+) -> Result<usize, StorageError> {
+    if max_keys == 0 {
+        return Ok(0);
+    }
+    let outcome = store.commit_for_tenant(&t, uuid::Uuid::now_v7(), |_ci, txn| {
+        let orphaned = plan_orphan_occurrences(txn, t, max_keys)
+            .map_err(|e| e.to_string())?
+            .keys;
+        let batch = rushdb_types::command::CommitBatch {
+            command_version: rushdb_types::command::COMMAND_VERSION,
+            tenant: t,
+            transaction_id: "scrub-repair".into(),
+            commit_key: uuid::Uuid::nil(),
+            start_index: 0,
+            isolation: rushdb_types::command::IsolationMode::Snapshot,
+            preconditions: Vec::new(),
+            mutations: orphaned
+                .iter()
+                .cloned()
+                .map(|key| rushdb_types::command::Mutation::DeleteRawKey { key })
+                .collect(),
+        };
+        Ok((batch, orphaned.len()))
+    })?;
+    match outcome {
+        rushdb_storage::CommitOutcome::Committed { payload, .. } => Ok(payload),
+        rushdb_storage::CommitOutcome::Conflicted(reason) => Err(StorageError::Builder(reason)),
+    }
+}
