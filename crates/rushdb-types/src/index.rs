@@ -68,3 +68,74 @@ pub const TEXT_ALL_PROPERTIES: &str = "*";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TextConsistency {
+    /// A search first applies every pending change up to its snapshot
+    /// (read-your-writes).
+    Immediate,
+    /// A search reads what the background applier has applied and reports
+    /// the backlog.
+    Eventual,
+}
+
+/// Lifecycle of an index. Records covered by the entries:
+/// `Building{cursor}` covers ordinals `< cursor`, `Ready` covers all, and
+/// `Dropping{cursor}` covers ordinals `≥ cursor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum IndexState {
+    /// Backfill has covered records below `cursor`.
+    Building {
+        /// First record ordinal not yet backfilled.
+        cursor: u64,
+    },
+    /// Every record is covered; the planner may use the index.
+    Ready,
+    /// Entries of records below `cursor` have been removed.
+    Dropping {
+        /// First record ordinal whose entries remain.
+        cursor: u64,
+    },
+}
+
+impl IndexState {
+    /// Half-open ordinal interval `[start, end)` of covered records.
+    #[must_use]
+    pub fn covered(self) -> (u64, u64) {
+        match self {
+            Self::Building { cursor } => (0, cursor),
+            Self::Ready => (0, u64::MAX),
+            Self::Dropping { cursor } => (cursor, u64::MAX),
+        }
+    }
+
+    /// Whether record ordinal `ord` is covered.
+    #[must_use]
+    pub fn covers(self, ord: u64) -> bool {
+        let (start, end) = self.covered();
+        start <= ord && ord < end
+    }
+
+    /// Wire label (`building`, `ready`, `dropping`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Building { .. } => "building",
+            Self::Ready => "ready",
+            Self::Dropping { .. } => "dropping",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_follows_the_cursor() {
+        assert!(!IndexState::Building { cursor: 0 }.covers(0));
+        let building = IndexState::Building { cursor: 5 };
+        assert!(building.covers(0) && building.covers(4) && !building.covers(5));
+        assert!(IndexState::Ready.covers(u64::MAX - 1));
+        let dropping = IndexState::Dropping { cursor: 5 };
+        assert!(!dropping.covers(4) && dropping.covers(5));
+    }
+}
