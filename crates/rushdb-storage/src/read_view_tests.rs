@@ -580,3 +580,585 @@ fn a_failed_batch_does_not_consume_undelivered_rows_across_multiple_prior_rows()
             ],
         );
         let view = store
+            .read_with_limits(
+                None,
+                ReadLimits {
+                    max_item_bytes: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut cursor = view
+            .scan(ScanBounds::prefix(b"u/"), ScanProjection::KeyValue)
+            .unwrap();
+        assert!(matches!(
+            cursor.next_batch(10, 1024),
+            Err(StorageError::ResourceExhausted(_))
+        ));
+        // Exactly matching the two undelivered rows avoids re-touching the
+        // oversized "u/c" in this same call (which would re-stash and
+        // re-error — the same shape v1 already has: a caller must shrink
+        // its limits to step past a poison row, not just retry blindly).
+        let delivered = cursor.next_batch(2, 1024).unwrap();
+        assert_eq!(
+            delivered.rows.len(),
+            2,
+            "both prior rows arrive, not just one"
+        );
+        assert_eq!(delivered.rows[0].key, b"u/a");
+        assert_eq!(delivered.rows[1].key, b"u/b");
+        assert!(!delivered.done);
+    });
+}
+
+#[test]
+fn a_tighter_byte_limit_on_a_later_call_still_errors_on_a_stashed_row() {
+    // Regression for a real bug caught in review of the native path's
+    // `pending_native` undo buffer (see
+    // `a_failed_batch_does_not_consume_undelivered_rows_across_multiple_prior_rows`):
+    // every stashed row already passed the absolute `max_item_bytes` check
+    // when it was first read, so the *only* way it can still not fit is a
+    // caller using a tighter `byte_limit` on a later call. The first
+    // version of this buffer silently returned an empty, non-done `Ok`
+    // batch in that case instead of `ResourceExhausted` — indistinguishable
+    // from "nothing left yet" to a caller, so it would spin forever
+    // instead of ever being told to raise its limit or give up.
+    on_backends(|store| {
+        commit(
+            store,
+            vec![
+                (b"u/a".to_vec(), Some(vec![1])),
+                (b"u/b".to_vec(), Some(vec![2])),
+                (b"u/c".to_vec(), Some(vec![3; 100])),
+            ],
+        );
+        let view = store
+            .read_with_limits(
+                None,
+                ReadLimits {
+                    max_item_bytes: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut cursor = view
+            .scan(ScanBounds::prefix(b"u/"), ScanProjection::KeyValue)
+            .unwrap();
+        assert!(matches!(
+            cursor.next_batch(10, 1024),
+            Err(StorageError::ResourceExhausted(_))
+        ));
+        // "u/a" alone (key + value) is 4 bytes; a byte_limit of 1 cannot
+        // admit it even though it already passed the absolute item limit.
+        assert!(matches!(
+            cursor.next_batch(2, 1),
+            Err(StorageError::ResourceExhausted(_))
+        ));
+    });
+}
+
+#[test]
+fn cancellation_and_invalid_bounds_are_explicit_errors() {
+    on_backends(|store| {
+        let view = store.read_view().unwrap();
+        assert!(matches!(
+            view.scan(
+                ScanBounds {
+                    start: Included(vec![2]),
+                    end: Included(vec![1])
+                },
+                ScanProjection::Keys
+            ),
+            Err(StorageError::InvalidRead(_))
+        ));
+        let mut cursor = view
+            .scan(ScanBounds::prefix(b"u/"), ScanProjection::Keys)
+            .unwrap();
+        assert!(matches!(
+            cursor.next_batch(0, 1),
+            Err(StorageError::InvalidRead(_))
+        ));
+        view.cancellation().cancel();
+        assert!(matches!(view.get(b"u/a"), Err(StorageError::Cancelled)));
+        assert!(matches!(
+            cursor.next_batch(1, 1),
+            Err(StorageError::Cancelled)
+        ));
+    });
+}
+
+#[test]
+fn native_reads_do_not_depend_on_application_maps_and_survive_reopen() {
+    let path = crate::TempPath::store("native-read");
+    {
+        let store = Store::open(&path).unwrap();
+        configure(&store);
+        commit(&store, vec![(b"u/a".to_vec(), Some(vec![1]))]);
+        commit(&store, vec![(b"u/a".to_vec(), Some(vec![2]))]);
+    }
+    let store = Store::open(&path).unwrap();
+    // Test-only removal proves the new path reads redb itself, not the
+    // transitional mirrors still needed by the legacy writer.
+    store.data.write().unwrap().clear();
+    store.created.write().unwrap().clear();
+    store.history.write().unwrap().clear();
+    let view = store.read_view().unwrap();
+    assert_eq!(view.commit_index(), 2);
+    assert_eq!(view.get(b"u/a").unwrap(), Some(vec![2]));
+    assert_eq!(
+        store.read_at(1).unwrap().get(b"u/a").unwrap(),
+        Some(vec![1])
+    );
+    assert_eq!(
+        rows(&view, ScanBounds::prefix(b"u/"), ScanProjection::KeyValue),
+        vec![ScanRow {
+            key: b"u/a".to_vec(),
+            value: Some(vec![2])
+        }]
+    );
+    drop(view);
+    drop(store);
+    crate::remove_store(&path).unwrap();
+}
+
+#[test]
+fn transaction_key_scans_skip_large_payloads_and_merge_binary_overlay() {
+    on_backends(|store| {
+        // Generate the large fixture in expansion so the test WAL need not
+        // encode millions of JSON array elements just to exercise a read.
+        store.set_expander(Arc::new(Box::new(|_, _, txn| {
+            txn.put(vec![255, 0], vec![7; 8 * 1024 * 1024 + 1]);
+            txn.put(vec![255, 2], vec![2]);
+            txn.put(vec![255, 255], vec![3]);
+            Ok(())
+        })));
+        commit(store, vec![]);
+        let result = store.commit::<(), _>(Uuid::new_v4(), |_, txn| {
+            assert!(matches!(
+                txn.range_prefix(&[255]),
+                Err(StorageError::ResourceExhausted(_))
+            ));
+            assert_eq!(
+                txn.keys_prefix(&[255]).unwrap(),
+                vec![vec![255, 0], vec![255, 2], vec![255, 255]]
+            );
+            txn.del(vec![255, 0]);
+            txn.put(vec![255, 1], vec![8; 8 * 1024 * 1024 + 1]);
+            txn.put(vec![255, 2], vec![9; 8 * 1024 * 1024 + 1]);
+            txn.del(vec![255, 254]); // Absent-base tombstones do not appear.
+            txn.put(vec![255, 255, 0], vec![4]);
+            let expected = vec![
+                vec![255, 1],
+                vec![255, 2],
+                vec![255, 255],
+                vec![255, 255, 0],
+            ];
+            assert_eq!(txn.keys_prefix(&[255]).unwrap(), expected);
+            assert_eq!(
+                txn.keys_prefix(&[255, 255]).unwrap(),
+                vec![vec![255, 255], vec![255, 255, 0]]
+            );
+            let all = txn.keys_prefix(&[]).unwrap();
+            assert!(all.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(
+                all.into_iter()
+                    .filter(|key| key.starts_with(&[255]))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            Err("inspection only".into())
+        });
+        assert!(
+            matches!(&result, Ok(CommitOutcome::Conflicted(message)) if message == "inspection only"),
+            "unexpected inspection outcome: {result:?}"
+        );
+        assert_eq!(store.committed_version(), 1);
+    });
+}
+
+#[test]
+fn persistent_planning_expansion_preconditions_and_retry_ignore_application_maps() {
+    let path = crate::TempPath::store("native-writer");
+    let store = Store::open(&path).unwrap();
+    configure(&store);
+    commit(
+        &store,
+        vec![
+            (b"u/a".to_vec(), Some(vec![1])),
+            (b"u/b".to_vec(), Some(vec![2])),
+        ],
+    );
+    let mut first: CommitBatch =
+        rushdb_types::command_codec::decode(&store.log_bytes()[0]).unwrap();
+    store.data.write().unwrap().clear();
+    store.created.write().unwrap().clear();
+    store.history.write().unwrap().clear();
+    let retry = store.commit::<(), _>(first.commit_key, |_, _| panic!("native outcome was missed"));
+    assert!(matches!(
+        retry,
+        Ok(CommitOutcome::Committed {
+            commit_index: 1,
+            ..
+        })
+    ));
+    store.set_expander(Arc::new(Box::new(|_, _, txn| {
+        assert_eq!(txn.get(b"u/a").map_err(|e| e.to_string())?, Some(vec![1]));
+        assert_eq!(txn.range_prefix(b"u/").map_err(|e| e.to_string())?.len(), 2);
+        assert_eq!(
+            txn.keys_prefix(b"u/").unwrap(),
+            vec![b"u/a".to_vec(), b"u/b".to_vec()]
+        );
+        txn.del(b"u/b".to_vec());
+        txn.put(b"u/a".to_vec(), vec![3]);
+        txn.put(b"u/c".to_vec(), vec![4]);
+        assert_eq!(
+            txn.keys_prefix(b"u/").unwrap(),
+            vec![b"u/a".to_vec(), b"u/c".to_vec()]
+        );
+        assert_eq!(
+            txn.range_prefix(b"u/").map_err(|e| e.to_string())?,
+            vec![(b"u/a".to_vec(), vec![3]), (b"u/c".to_vec(), vec![4])]
+        );
+        Ok(())
+    })));
+    let second = Uuid::new_v4();
+    first.commit_key = second;
+    first.preconditions = vec![rushdb_types::command::Precondition::exists(b"u/a".to_vec())];
+    store
+        .commit(second, |_, txn| {
+            assert_eq!(txn.get(b"u/b").map_err(|e| e.to_string())?, Some(vec![2]));
+            Ok((first, ()))
+        })
+        .unwrap();
+    assert_eq!(
+        store.read_view().unwrap().get(b"u/a").unwrap(),
+        Some(vec![3])
+    );
+    assert_eq!(
+        store.read_at(1).unwrap().get(b"u/a").unwrap(),
+        Some(vec![1])
+    );
+    assert_eq!(
+        store.try_outcome_for(second).unwrap(),
+        Some(OutcomeKind::Committed(2))
+    );
+    let mut deps = DependencySet::default();
+    deps.record(b"u/b".to_vec(), b"u/b".to_vec());
+    let mut batch: CommitBatch =
+        rushdb_types::command_codec::decode(&store.log_bytes()[0]).unwrap();
+    batch.commit_key = Uuid::new_v4();
+    assert!(matches!(
+        store.commit_serializable(batch.commit_key, 0, deps, |_| Ok((batch, ()))),
+        Ok(CommitOutcome::Conflicted(_))
+    ));
+    drop(store);
+    crate::remove_store(&path).unwrap();
+}
+
+#[test]
+fn corrupt_outcome_is_an_error_not_an_idempotency_miss() {
+    on_backends(|store| {
+        let key = Uuid::new_v4();
+        let ops = vec![Op::Put(crate::receipt::receipt_key(key), vec![9; 17])];
+        store.persist_ops_local(&ops, 1).unwrap();
+        store.persist_ops_local(&ops, 1).unwrap();
+        assert!(matches!(
+            store.commit::<(), _>(key, |_, _| panic!("corrupt outcome caused reexecution")),
+            Err(StorageError::CorruptLog)
+        ));
+        assert_eq!(store.committed_version(), 0);
+    });
+}
+
+#[test]
+fn native_history_decode_has_an_explicit_block_ceiling() {
+    let path = crate::TempPath::store("history-limit");
+    let store = Store::open(&path).unwrap();
+    configure(&store);
+    commit(&store, vec![(b"u/a".to_vec(), Some(vec![1; 100]))]);
+    commit(&store, vec![(b"u/a".to_vec(), Some(vec![2]))]);
+    let view = store
+        .read_with_limits(
+            Some(1),
+            ReadLimits {
+                max_history_block_bytes: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        view.get(b"u/a"),
+        Err(StorageError::ResourceExhausted(_))
+    ));
+    drop(view);
+    drop(store);
+    crate::remove_store(&path).unwrap();
+}
+
+#[test]
+fn native_current_reads_do_not_decode_deleted_key_history() {
+    let path = crate::TempPath::store("current-only");
+    let store = Store::open(&path).unwrap();
+    configure(&store);
+    commit(&store, vec![(b"u/deleted".to_vec(), Some(vec![1; 100]))]);
+    commit(
+        &store,
+        vec![
+            (b"u/deleted".to_vec(), None),
+            (b"u/live".to_vec(), Some(vec![2])),
+        ],
+    );
+    let limits = ReadLimits {
+        max_history_block_bytes: 1,
+        ..Default::default()
+    };
+    let current = store.read_with_limits(None, limits).unwrap();
+    assert_eq!(current.get(b"u/deleted").unwrap(), None);
+    assert_eq!(
+        rows(
+            &current,
+            ScanBounds::prefix(b"u/"),
+            ScanProjection::KeyValue
+        ),
+        vec![ScanRow {
+            key: b"u/live".to_vec(),
+            value: Some(vec![2]),
+        }]
+    );
+    commit(&store, vec![(b"u/live".to_vec(), Some(vec![3]))]);
+    assert_eq!(current.get(b"u/live").unwrap(), Some(vec![2]));
+    assert!(matches!(
+        store
+            .read_with_limits(Some(1), limits)
+            .unwrap()
+            .get(b"u/deleted"),
+        Err(StorageError::ResourceExhausted(_))
+    ));
+    drop(current);
+    drop(store);
+    crate::remove_store(&path).unwrap();
+}
+
+#[test]
+fn views_are_send_and_sync_without_unsafe_lifetimes() {
+    fn assert_traits<T: Send + Sync>() {}
+    assert_traits::<ReadView>();
+}
+
+#[test]
+fn active_views_remain_consistent_during_concurrent_writes_and_gc() {
+    on_backends(|store| {
+        commit(store, vec![(b"u/a".to_vec(), Some(vec![1]))]);
+        let view = store.read_view().unwrap();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for value in 2..40 {
+                    commit(store, vec![(b"u/a".to_vec(), Some(vec![value]))]);
+                    store.gc(store.committed_version()).unwrap();
+                }
+            });
+            for _ in 0..40 {
+                assert_eq!(view.get(b"u/a").unwrap(), Some(vec![1]));
+                assert_eq!(
+                    rows(&view, ScanBounds::prefix(b"u/"), ScanProjection::KeyValue),
+                    vec![ScanRow {
+                        key: b"u/a".to_vec(),
+                        value: Some(vec![1])
+                    }]
+                );
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(store.gc_watermark(), 1);
+        drop(view);
+        store.gc(store.committed_version()).unwrap();
+        assert_eq!(store.gc_watermark(), store.committed_version());
+    });
+}
+
+/// P02 property test: for arbitrary randomized keys, the native scan (bounded
+/// batches, byte-ordered) must equal the store's own memory `data` map (the
+/// complete key oracle, including operational metadata keys) for every prefix
+/// and for included/excluded byte bounds, on both backends. This is the
+/// "property-based arbitrary-key scan" acceptance item.
+#[test]
+fn randomized_keys_scan_matches_memory_oracle_for_arbitrary_bounds() {
+    on_backends(|store| {
+        let mut rng = {
+            let mut state = 0xDEAD_BEEF_1234_5678u64;
+            move || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33).to_le_bytes()[0]
+            }
+        };
+        // Seed random data keys (dedup). Operational metadata keys are added by
+        // `commit` and appear in BOTH the native scan and the memory-map oracle.
+        let mut seen = std::collections::BTreeSet::<Vec<u8>>::new();
+        let mut keys = Vec::new();
+        for _ in 0..500 {
+            let len = (rng() % 8) as usize;
+            let mut k = Vec::with_capacity(len);
+            for _ in 0..len {
+                k.push(rng());
+            }
+            if seen.insert(k.clone()) {
+                keys.push(k);
+            }
+        }
+        keys.push(vec![]);
+        keys.push(vec![255, 255, 255]);
+        commit(store, keys.iter().map(|k| (k.clone(), Some(vec![7]))));
+        let view = store.read_view().unwrap();
+
+        // Complete-key oracle: the store's own range_prefix (native for a
+        // redb-backed store, maps for in-memory). Includes operational keys.
+        let oracle = || {
+            store
+                .try_range_prefix(&[])
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>()
+        };
+
+        // 1) Every prefix: native range_prefix must equal the memory map.
+        for _ in 0..200 {
+            let plen = (rng() % 6) as usize;
+            let mut prefix = Vec::with_capacity(plen);
+            for _ in 0..plen {
+                prefix.push(rng());
+            }
+            let expected: Vec<Vec<u8>> = oracle()
+                .range::<Vec<u8>, _>(prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&prefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let got: Vec<Vec<u8>> = rows(&view, ScanBounds::prefix(&prefix), ScanProjection::Keys)
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            assert_eq!(got, expected, "prefix {prefix:?}");
+        }
+
+        // 2) Included byte-range bounds: [start, end).
+        for _ in 0..200 {
+            let a_len = (rng() % 5) as usize;
+            let b_len = (rng() % 5) as usize;
+            let mut a = Vec::with_capacity(a_len);
+            let mut b = Vec::with_capacity(b_len);
+            for _ in 0..a_len {
+                a.push(rng());
+            }
+            for _ in 0..b_len {
+                b.push(rng());
+            }
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let expected: Vec<Vec<u8>> = oracle()
+                .range::<Vec<u8>, _>(lo.clone()..hi.clone())
+                .map(|(k, _)| k.clone())
+                .collect();
+            let got: Vec<Vec<u8>> = rows(
+                &view,
+                ScanBounds {
+                    start: Included(lo.clone()),
+                    end: Excluded(hi.clone()),
+                },
+                ScanProjection::Keys,
+            )
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+            assert_eq!(got, expected, "bounds {lo:?}..{hi:?}");
+        }
+    });
+}
+
+/// P03 acceptance: concurrent read handles each own a native redb read
+/// transaction and serve reads without a global mutex held across the read
+/// operation. Many reader threads, each with its own view, must all observe
+/// the committed data and complete without serialization artifacts.
+#[test]
+fn concurrent_read_views_serve_independently_without_global_lock() {
+    on_backends(|store| {
+        // Commit a set of keys the readers will scan.
+        let keys: Vec<Vec<u8>> = (0..256)
+            .map(|i| vec![0xAB, u8::try_from(i).unwrap()])
+            .collect();
+        commit(store, keys.iter().map(|k| (k.clone(), Some(vec![7]))));
+        let expected = keys.len();
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let store_ref = store;
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    // Each thread opens its OWN view (its own redb read txn).
+                    let view = store_ref.read_view().unwrap();
+                    let rows = rows(&view, ScanBounds::prefix(&[0xAB]), ScanProjection::Keys);
+                    assert_eq!(rows.len(), expected, "reader must see all committed keys");
+                    barrier.wait();
+                });
+            }
+        });
+    });
+}
+
+/// P06: read leases are expirable by age so an abandoned reader cannot block
+/// history advancement forever, and retention is observable.
+#[test]
+fn read_lease_expiry_releases_abandoned_pins_and_is_observable() {
+    on_backends(|store| {
+        // Two views pin two CIs.
+        let v1 = store.read_view().unwrap();
+        let v2 = store.read_view().unwrap();
+        assert!(v1.commit_index() > 0 || store.committed_version() == 0);
+        let (oldest, count) = store.retention_summary();
+        assert_eq!(count, 1, "both views pin the same (current) CI");
+        assert_eq!(oldest, Some(v1.commit_index()));
+
+        // A very small max_age must expire the leases (safe release) once some
+        // wall time passes.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let released = store.expire_read_pins(1);
+        assert!(released >= 1, "lease expiry must release the pin");
+        let (oldest_after, count_after) = store.retention_summary();
+        assert_eq!(count_after, 0, "expired leases release retention");
+        assert!(oldest_after.is_none());
+        assert!(matches!(v1.check_cancelled(), Err(StorageError::Cancelled)));
+        assert!(matches!(v2.check_cancelled(), Err(StorageError::Cancelled)));
+
+        // Dropping the views after expiry is harmless (pins already removed).
+        drop(v1);
+        drop(v2);
+    });
+}
+
+/// A stale view that drops after its lease expired must not decrement a newer,
+/// unrelated pin admitted at the same commit index (pin-generation identity).
+#[test]
+fn stale_view_drop_does_not_corrupt_a_newer_pin_at_the_same_ci() {
+    on_backends(|store| {
+        let stale = store.read_view().unwrap();
+        let ci = stale.commit_index();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(store.expire_read_pins(1) >= 1, "expire the stale lease");
+
+        // A new view at the same CI re-creates the pin entry (new generation).
+        let live = store.read_view().unwrap();
+        assert_eq!(live.commit_index(), ci);
+        assert_eq!(store.retention_summary(), (Some(ci), 1));
+
+        // Dropping the expired view must leave the live pin untouched.
+        drop(stale);
+        assert_eq!(
+            store.retention_summary(),
+            (Some(ci), 1),
+            "a stale drop must not release a live pin"
+        );
+
+        drop(live);
+        assert_eq!(store.retention_summary(), (None, 0));
+    });
+}
