@@ -201,3 +201,409 @@ pub fn definition<R: TryRead + ?Sized>(
     id: u64,
 ) -> Result<Option<PropertyDefinition>, StorageError> {
     decode(r.get(&definition_row_key(t, id))?)
+}
+
+/// Owner kind of a property id (from its family's owner scope), or `None`
+/// when the pid is unknown.
+///
+/// # Errors
+/// Returns [`StorageError`] if a read fails or a row is corrupt.
+pub fn kind_of_pid<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    pid: u64,
+) -> Result<Option<OwnerKind>, StorageError> {
+    let Some(def) = definition(r, t, pid)? else {
+        return Ok(None);
+    };
+    Ok(family(r, t, def.family_id)?.map(|family| family.owner_scope))
+}
+
+/// Every property definition belonging to a family.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a definition row is corrupt.
+pub fn definitions_of_family<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    id: u64,
+) -> Result<Vec<PropertyDefinition>, StorageError> {
+    let mut out = Vec::new();
+    for (_, raw) in r.range_prefix(&key(t, &[b"property-row"]))? {
+        let def: PropertyDefinition =
+            serde_json::from_slice(&raw).map_err(|_| StorageError::CorruptLog)?;
+        if def.family_id == id {
+            out.push(def);
+        }
+    }
+    Ok(out)
+}
+
+/// Record ordinals currently carrying `label`, ascending.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a membership key is corrupt.
+pub fn label_members<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    label: &str,
+) -> Result<Vec<u64>, StorageError> {
+    let prefix = k::label_member_prefix(t, label);
+    r.range_prefix(&prefix)?
+        .into_iter()
+        .map(|(key, _)| k::read_ord_tail(&key, prefix.len()).ok_or(StorageError::CorruptLog))
+        .collect()
+}
+
+/// Live labels in first-appearance order (oldest live record first).
+///
+/// # Errors
+/// Returns [`StorageError`] if the counters cannot be read or are malformed.
+pub fn labels<R: TryRead + ?Sized>(r: &R, t: TenantId) -> Result<Vec<String>, StorageError> {
+    Ok(derived::label_catalog(r, t)?
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect())
+}
+
+/// Per-label live record counts, in first-appearance order.
+///
+/// # Errors
+/// Returns [`StorageError`] if the counters cannot be read or are malformed.
+pub fn label_counts<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+) -> Result<Vec<(String, u64)>, StorageError> {
+    derived::label_catalog(r, t)
+}
+
+/// Total live owner support of a property (its owner kind resolved from the
+/// family).
+///
+/// # Errors
+/// Returns a storage error when a counter is corrupt or cannot be read.
+pub fn prop_support_total<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    pid: u64,
+) -> Result<u64, StorageError> {
+    match kind_of_pid(r, t, pid)? {
+        Some(kind) => derived::prop_support_total(r, t, kind, pid),
+        None => Ok(0),
+    }
+}
+
+/// Per-label live owner counts of one property id, ordered by label.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a counter is corrupt.
+pub fn prop_support_label_counts<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    pid: u64,
+) -> Result<Vec<(String, u64)>, StorageError> {
+    match kind_of_pid(r, t, pid)? {
+        Some(kind) => derived::prop_support_by_label(r, t, kind, pid),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// One label-scoped support count.
+///
+/// # Errors
+/// Returns [`StorageError`] when the counter is malformed or the read fails.
+pub fn prop_support_label<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    pid: u64,
+    label: &str,
+) -> Result<u64, StorageError> {
+    match kind_of_pid(r, t, pid)? {
+        Some(kind) => derived::prop_support_label(r, t, kind, pid, label),
+        None => Ok(0),
+    }
+}
+
+/// Relationship catalog rows `(type, source_label, target_label, count)`.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a counter is corrupt.
+pub fn relationship_catalog<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+) -> Result<Vec<(String, String, String, u64)>, StorageError> {
+    derived::rel_catalog(r, t)
+}
+
+/// Relationship-property owner counts for one shape `(type, source label,
+/// target label)`: `(pid, count)`.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or a counter is corrupt.
+pub fn rel_prop_counts<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    (rel_type, source, target): (&str, &str, &str),
+) -> Result<Vec<(u64, u64)>, StorageError> {
+    derived::rel_shape_prop_counts(r, t, rel_type, source, target)
+}
+
+/// Looks up a relationship header by public id.
+///
+/// # Errors
+/// Returns [`StorageError`] if the read fails or the row is corrupt.
+pub fn relationship_by_id<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    id: &RelationshipId,
+) -> Result<Option<RelationshipHeader>, StorageError> {
+    decode(r.get(&rel_row_key(t, &id.0))?)
+}
+
+/// Looks up a relationship header by storage ordinal.
+///
+/// # Errors
+/// Returns [`StorageError`] if the read fails or an id row is corrupt.
+pub fn relationship_by_ord<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    ord: u64,
+) -> Result<Option<RelationshipHeader>, StorageError> {
+    let Some(raw) = r.get(&rel_by_ord_key(t, ord))? else {
+        return Ok(None);
+    };
+    let id = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| StorageError::CorruptLog)?;
+    relationship_by_id(r, t, &RelationshipId(id))
+}
+
+/// True when a directed edge of `rel_type` already runs from `node` to `other`.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails.
+pub fn edge_exists<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    node: u64,
+    rel_type: &str,
+    other: u64,
+) -> Result<bool, StorageError> {
+    let prefix = adj_pair_prefix(t, b"out", node, rel_type, other);
+    for (key, _) in r.range_prefix(&prefix)? {
+        let Some(rest) = key.strip_prefix(prefix.as_slice()) else {
+            continue;
+        };
+        // Stored edge keys append `/` and the 8-byte relationship ordinal.
+        if rest.len() == 9 && rest[0] == b'/' {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Adjacency scan: outgoing edges of a node, optionally filtered by type.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or an adjacency key is corrupt.
+pub fn adj_out<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    node: u64,
+    rel_type: Option<&str>,
+) -> Result<Vec<Edge>, StorageError> {
+    adjacency(r, t, b"out", node, rel_type)
+}
+
+/// Adjacency scan: incoming edges of a node, optionally filtered by type.
+///
+/// # Errors
+/// Returns [`StorageError`] if the scan fails or an adjacency key is corrupt.
+pub fn adj_in<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    node: u64,
+    rel_type: Option<&str>,
+) -> Result<Vec<Edge>, StorageError> {
+    adjacency(r, t, b"in", node, rel_type)
+}
+
+fn adjacency<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    dir: &[u8],
+    node: u64,
+    rel_type: Option<&str>,
+) -> Result<Vec<Edge>, StorageError> {
+    let base = match rel_type {
+        Some(rt) => adj_prefix_typed(t, dir, node, rt),
+        None => key(t, &[b"adj", dir, &u64be(node)]),
+    };
+    parse_adjacency(&base, r.range_prefix(&base)?, rel_type)
+}
+
+/// Every record adjacent to `node` (either direction, any type, ascending,
+/// without repeats), or `None` when it has more than `limit` relationships.
+///
+/// # Errors
+/// Returns [`StorageError`] if a scan fails or an adjacency key is corrupt.
+pub fn neighbours_limited<R: TryRead + ?Sized>(
+    r: &R,
+    t: TenantId,
+    node: u64,
+    limit: usize,
+) -> Result<Option<Vec<u64>>, StorageError> {
+    let mut out = Vec::new();
+    for dir in [b"out".as_slice(), b"in".as_slice()] {
+        let base = key(t, &[b"adj", dir, &u64be(node)]);
+        let rows = r.range_prefix_limited(&base, limit.saturating_add(1))?;
+        if rows.len() > limit {
+            return Ok(None);
+        }
+        out.extend(
+            parse_adjacency(&base, rows, None)?
+                .into_iter()
+                .map(|(_, other, _)| other),
+        );
+        if out.len() > limit {
+            return Ok(None);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(Some(out))
+}
+
+fn parse_adjacency(
+    base: &[u8],
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    rel_type: Option<&str>,
+) -> Result<Vec<Edge>, StorageError> {
+    let mut edges = Vec::new();
+    for (key, _) in rows {
+        let rest = key.strip_prefix(base).ok_or(StorageError::CorruptLog)?;
+        let (rel_type, tail) = match rel_type {
+            Some(rt) if rest.len() == 18 && rest[0] == b'/' && rest[9] == b'/' => {
+                (rt.to_owned(), &rest[1..])
+            }
+            None if rest.len() >= 19
+                && rest[0] == b'/'
+                && rest[rest.len() - 18] == b'/'
+                && rest[rest.len() - 9] == b'/' =>
+            {
+                let name = std::str::from_utf8(&rest[1..rest.len() - 18])
+                    .map_err(|_| StorageError::CorruptLog)?;
+                (name.to_owned(), &rest[rest.len() - 17..])
+            }
+            // An adjacent prefix (e.g. a longer type name) is not a row in the
+            // requested exact type. Match the existing typed scan contract.
+            _ => continue,
+        };
+        let other = u64::from_be_bytes(tail[..8].try_into().map_err(|_| StorageError::CorruptLog)?);
+        let ordinal =
+            u64::from_be_bytes(tail[9..].try_into().map_err(|_| StorageError::CorruptLog)?);
+        edges.push((rel_type, other, ordinal));
+    }
+    edges.sort_by_key(|(_, _, ordinal)| *ordinal);
+    Ok(edges)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct Map(BTreeMap<Vec<u8>, Vec<u8>>);
+
+    impl TryRead for Map {
+        fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            Ok(self.0.get(k).cloned())
+        }
+        fn range_prefix(&self, p: &[u8]) -> Result<super::super::KeyValueRows, StorageError> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|(key, _)| key.starts_with(p))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
+        }
+        fn range(
+            &self,
+            start: &[u8],
+            end: &[u8],
+        ) -> Result<super::super::KeyValueRows, StorageError> {
+            let end = if end.is_empty() {
+                std::ops::Bound::Unbounded
+            } else {
+                std::ops::Bound::Excluded(end)
+            };
+            Ok(self
+                .0
+                .range::<[u8], _>((std::ops::Bound::Included(start), end))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
+        }
+    }
+
+    #[test]
+    fn record_by_ord_reads_the_header_row() {
+        let t = TenantId::from_ordinal(5);
+        let mut map = BTreeMap::new();
+        map.insert(
+            k::record_hdr_key(t, 3),
+            k::encode_record_hdr(&[7u8; 16], "Doc"),
+        );
+        assert_eq!(
+            record_by_ord(&Map(map), t, 3).unwrap(),
+            Some(RecordHeader {
+                record_id: [7u8; 16],
+                ordinal: 3,
+                label: "Doc".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn record_by_ord_rejects_a_malformed_header() {
+        let t = TenantId::from_ordinal(5);
+        let mut map = BTreeMap::new();
+        map.insert(k::record_hdr_key(t, 3), vec![1, 2, 3]);
+        assert!(matches!(
+            record_by_ord(&Map(map), t, 3),
+            Err(StorageError::CorruptLog)
+        ));
+    }
+
+    #[test]
+    fn occurrences_reject_malformed_values() {
+        let t = TenantId::from_ordinal(5);
+        let mut map = BTreeMap::new();
+        map.insert(k::occ_key(t, OwnerKind::Record, 1, 9, 0), vec![0]);
+        assert!(matches!(
+            occurrences_of_owner(&Map(map), t, OwnerKind::Record, 1),
+            Err(StorageError::CorruptLog)
+        ));
+    }
+
+    #[test]
+    fn relationship_catalog_rejects_malformed_counters() {
+        let t = TenantId::from_ordinal(5);
+        let mut map = BTreeMap::new();
+        map.insert(
+            k::rel_catalog_key(t, "KNOWS", "Person", "Person"),
+            vec![1, 2, 3],
+        );
+        assert!(matches!(
+            relationship_catalog(&Map(map), t),
+            Err(StorageError::CorruptLog)
+        ));
+    }
+
+    #[test]
+    fn store_implements_the_fallible_reader_boundary() {
+        let store = rushdb_storage::Store::new_in_memory();
+        let t = TenantId::from_ordinal(5);
+        assert_eq!(prop_support_label_counts(&store, t, 7).unwrap(), Vec::new());
+    }
+}

@@ -73,3 +73,153 @@ fn parse_signed_year(value: &str) -> Option<i64> {
 /// fall outside the representable range.
 ///
 /// Returns `None` if any component is out of range or the combination is not a
+/// valid calendar instant.
+#[must_use]
+pub fn components_to_epoch_ms_checked(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millis: i64,
+) -> Option<i64> {
+    let year = i32::try_from(year).ok()?;
+    let month = u32::try_from(month).ok()?;
+    let day = u32::try_from(day).ok()?;
+    let hour = u32::try_from(hour).ok()?;
+    let minute = u32::try_from(minute).ok()?;
+    let second = u32::try_from(second).ok()?;
+    let millis = u32::try_from(millis).ok()?;
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+        .single()?
+        .with_nanosecond(millis.checked_mul(1_000_000)?)
+        .map(|datetime| datetime.timestamp_millis())
+}
+
+/// Build epoch milliseconds from validated calendar components.
+///
+/// Callers that accept untrusted components should use
+/// [`components_to_epoch_ms_checked`].
+///
+/// # Panics
+///
+/// Panics if the components do not form a valid calendar instant.
+#[must_use]
+pub fn components_to_epoch_ms(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millis: i64,
+) -> i64 {
+    components_to_epoch_ms_checked(year, month, day, hour, minute, second, millis)
+        .expect("valid datetime components")
+}
+
+/// Report whether a string parses as any supported datetime form.
+#[must_use]
+pub fn is_datetime_string(value: &str) -> bool {
+    parse_datetime(value).is_some()
+}
+
+/// Extract epoch milliseconds from a JSON number or datetime string.
+///
+/// Returns `None` for JSON values that are neither an integer nor a parseable
+/// datetime string.
+#[must_use]
+pub fn json_datetime_ms(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::String(value) => parse_datetime(value),
+        _ => None,
+    }
+}
+
+fn utc(ms: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(ms).expect("epoch milliseconds in Chrono range")
+}
+
+/// Epoch milliseconds for the first instant of the calendar month containing
+/// `ms`.
+///
+/// # Panics
+///
+/// Panics if `ms` is outside the range representable by Chrono.
+#[must_use]
+pub fn start_of_month(ms: i64) -> i64 {
+    let datetime = utc(ms);
+    Utc.with_ymd_and_hms(datetime.year(), datetime.month(), 1, 0, 0, 0)
+        .single()
+        .expect("valid month start")
+        .timestamp_millis()
+}
+
+/// Epoch milliseconds for the first instant of the calendar year containing
+/// `ms`.
+///
+/// # Panics
+///
+/// Panics if `ms` is outside the range representable by Chrono.
+#[must_use]
+pub fn start_of_year(ms: i64) -> i64 {
+    let datetime = utc(ms);
+    Utc.with_ymd_and_hms(datetime.year(), 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid year start")
+        .timestamp_millis()
+}
+
+/// Start of the 3-month calendar quarter containing `ms`
+/// (quarters start at months 1, 4, 7, 10).
+///
+/// # Panics
+///
+/// Panics if `ms` is outside the range representable by Chrono.
+#[must_use]
+pub fn start_of_quarter(ms: i64) -> i64 {
+    let datetime = utc(ms);
+    let quarter_start_month = ((datetime.month() - 1) / 3) * 3 + 1;
+    Utc.with_ymd_and_hms(datetime.year(), quarter_start_month, 1, 0, 0, 0)
+        .single()
+        .expect("valid quarter start")
+        .timestamp_millis()
+}
+
+/// Serialize epoch milliseconds as a date at midnight UTC, otherwise as an
+/// RFC-3339 UTC timestamp with millisecond precision.
+#[must_use]
+pub fn ms_to_datetime_string(ms: i64) -> String {
+    let datetime = utc(ms);
+    if ms.rem_euclid(MS_PER_DAY) == 0 {
+        datetime.format(DATE).to_string()
+    } else {
+        // RFC 3339 layout with milliseconds and `Z`; `%Y` also signs a year
+        // before 0000 or after 9999, which Chrono's RFC 3339 writer cannot.
+        datetime.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    }
+}
+
+/// Extract one calendar component from epoch milliseconds, using Chrono's
+/// field order: `0` year, `1` month, `2` day, `3` hour, `4` minute,
+/// `5` second, `6` millisecond, `7` microsecond, `8` nanosecond.
+///
+/// Returns `0` for unknown component indices.
+#[must_use]
+pub fn component_of(ms: i64, which: u8) -> i64 {
+    let datetime = utc(ms);
+    match which {
+        0 => i64::from(datetime.year()),
+        1 => i64::from(datetime.month()),
+        2 => i64::from(datetime.day()),
+        3 => i64::from(datetime.hour()),
+        4 => i64::from(datetime.minute()),
+        5 => i64::from(datetime.second()),
+        6 => i64::from(datetime.timestamp_subsec_millis()),
+        7 => i64::from(datetime.timestamp_subsec_micros()),
+        8 => i64::from(datetime.timestamp_subsec_nanos()),
+        _ => 0,
+    }
+}
