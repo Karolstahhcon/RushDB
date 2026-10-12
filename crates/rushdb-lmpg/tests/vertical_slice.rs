@@ -461,3 +461,466 @@ fn purge_tenant_chunks_erase_large_tenants_and_retain_no_history() {
         .read_view()
         .unwrap()
         .range_prefix(&key(eng.tenant, &[]))
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .find(|k| !k.starts_with(&rushdb_types::keys::security_prefix(eng.tenant)))
+        .expect("tenant has keys before purge");
+
+    let before = eng.store.committed_version();
+    let last = eng.purge_tenant_chunked(64).unwrap();
+    assert!(last > before, "purge advanced the commit index");
+    assert!(
+        last - before > 1,
+        "a small chunk bound must take multiple commits, took {}",
+        last - before
+    );
+
+    let snap = eng.store.read_view().unwrap();
+    assert!(try_access::label_members(&snap, eng.tenant, "Bulk")
+        .unwrap()
+        .is_empty());
+    let tenant_keys: Vec<Vec<u8>> = snap
+        .range_prefix(&key(eng.tenant, &[]))
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .filter(|k| !k.starts_with(&rushdb_types::keys::security_prefix(eng.tenant)))
+        .collect();
+    assert!(
+        tenant_keys.is_empty(),
+        "tenant keyspace not fully purged: {} keys remain",
+        tenant_keys.len()
+    );
+    // Destructive erase: the key is gone now *and* at every older snapshot
+    // (no retained version), which the raw history bytes cannot show because
+    // global `meta/last-applied` also accrues history.
+    assert!(
+        eng.store
+            .read_view()
+            .unwrap()
+            .get(&sample)
+            .unwrap()
+            .is_none(),
+        "key still readable"
+    );
+    assert!(
+        eng.store.try_get_at(&sample, before).unwrap().is_none(),
+        "purge retained a version of an erased key"
+    );
+}
+
+#[test]
+fn purge_tenant_chunked_with_cancel_aborts_between_chunks() {
+    let eng = engine();
+    for i in 0..80 {
+        eng.create_record(
+            "Cancel",
+            None,
+            vec![("i".into(), FieldChange::Set(Json::from(i)))],
+        )
+        .unwrap();
+    }
+    // Cancel on the second poll: the first chunk is applied, then the purge
+    // aborts with a cancellation error rather than running to completion.
+    let calls = std::cell::Cell::new(0usize);
+    let err = eng
+        .purge_tenant_chunked_with_cancel(16, &|| {
+            let n = calls.get();
+            calls.set(n + 1);
+            n >= 1
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("operation cancelled"),
+        "expected cancellation, got: {err}"
+    );
+    // Resumable: an uncancelled purge finishes the job.
+    eng.purge_tenant().unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert!(try_access::label_members(&snap, eng.tenant, "Cancel")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn purge_tenant_is_noop_on_an_already_empty_tenant() {
+    let eng = engine();
+    eng.create_record(
+        "Bulk",
+        None,
+        vec![("idx".into(), FieldChange::Set(Json::from(1)))],
+    )
+    .unwrap();
+    eng.purge_tenant().unwrap();
+    // Reissuing erases nothing new; the tenant stays gone.
+    eng.purge_tenant().unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert!(try_access::label_members(&snap, eng.tenant, "Bulk")
+        .unwrap()
+        .is_empty());
+    let has_tenant_key = snap
+        .range_prefix(&key(eng.tenant, &[]))
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .any(|k| !k.starts_with(&rushdb_types::keys::security_prefix(eng.tenant)));
+    assert!(!has_tenant_key);
+}
+
+#[test]
+fn label_catalog_tracks_create_retype_delete() {
+    let eng = engine();
+    let a1 = eng.create_record("A", None, vec![]).unwrap();
+    let a2 = eng.create_record("A", None, vec![]).unwrap();
+    let b = eng.create_record("B", None, vec![]).unwrap();
+
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::labels(&snap, eng.tenant).unwrap(),
+        vec!["A", "B"]
+    );
+    assert_eq!(
+        try_access::label_counts(&snap, eng.tenant).unwrap(),
+        vec![("A".to_string(), 2), ("B".to_string(), 1)]
+    );
+
+    eng.retype_record(b, "B", "C").unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::labels(&snap, eng.tenant).unwrap(),
+        vec!["A", "C"]
+    );
+    assert_eq!(
+        try_access::label_counts(&snap, eng.tenant).unwrap(),
+        vec![("A".to_string(), 2), ("C".to_string(), 1)]
+    );
+
+    eng.delete_record(a1).unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::label_counts(&snap, eng.tenant).unwrap(),
+        vec![("A".to_string(), 1), ("C".to_string(), 1)]
+    );
+
+    eng.delete_record(a2).unwrap();
+    // `b` kept the same identity through the retype; deleting it removes C.
+    eng.delete_record(b).unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert!(try_access::labels(&snap, eng.tenant).unwrap().is_empty());
+    assert!(try_access::label_counts(&snap, eng.tenant)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn derived_counter_history_is_reclaimed_by_gc() {
+    // Derived counters are MVCC rows written at their base commit's index
+    //, so a pinned view answers exactly for its snapshot. Their
+    // superseded versions are ordinary history: GC past the watermark
+    // reclaims all of it.
+    let eng = engine();
+    for i in 0..50 {
+        eng.create_record(
+            "H",
+            None,
+            vec![("n".into(), FieldChange::Set(Json::from(i)))],
+        )
+        .unwrap();
+    }
+    let (current, history) = eng.store.approximate_map_bytes();
+    assert!(current > 0, "records exist");
+    assert!(history > 0, "50 commits superseded the label counter");
+    eng.store.gc(u64::MAX).unwrap();
+    let (after_gc, history) = eng.store.approximate_map_bytes();
+    assert_eq!(history, 0, "GC reclaims all superseded derived versions");
+    assert_eq!(after_gc, current, "current state is untouched by GC");
+}
+
+#[test]
+fn relationship_catalog_tracks_type_and_endpoint_labels() {
+    // Maintained relationship catalog: (type, source_label, target_label) ->
+    // count, decremented exactly on delete (endpoint labels are captured at
+    // create so a cascade cannot lose them).
+    let eng = engine();
+    let a1 = eng.create_record("A", None, vec![]).unwrap();
+    let a2 = eng.create_record("A", None, vec![]).unwrap();
+    let b1 = eng.create_record("B", None, vec![]).unwrap();
+    let c1 = eng.create_record("C", None, vec![]).unwrap();
+    let r1 = eng.create_relationship("R", a1, b1, vec![]).unwrap();
+    let _r2 = eng.create_relationship("R", a2, b1, vec![]).unwrap();
+    let _s1 = eng.create_relationship("S", a1, c1, vec![]).unwrap();
+
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::relationship_catalog(&snap, eng.tenant).unwrap(),
+        vec![
+            ("R".to_string(), "A".to_string(), "B".to_string(), 2),
+            ("S".to_string(), "A".to_string(), "C".to_string(), 1),
+        ]
+    );
+
+    eng.delete_relationship(r1).unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::relationship_catalog(&snap, eng.tenant).unwrap(),
+        vec![
+            ("R".to_string(), "A".to_string(), "B".to_string(), 1),
+            ("S".to_string(), "A".to_string(), "C".to_string(), 1),
+        ]
+    );
+}
+
+fn pid_of(eng: &Lmpg, name: &str, ty: rushdb_types::model::LogicalType) -> u64 {
+    use rushdb_types::model::TypeState;
+    let sig = kx::family_sig_key(
+        eng.tenant,
+        "default",
+        OwnerKind::Record,
+        &rushdb_types::value::normalize_name(name),
+    );
+    let raw = eng
+        .store
+        .read_view()
+        .unwrap()
+        .get(&sig)
+        .unwrap()
+        .expect("family signature");
+    let fid = u64::from_be_bytes(raw[..8].try_into().unwrap());
+    let dkey = kx::definition_key(eng.tenant, fid, TypeState::Known(ty));
+    let def = eng
+        .store
+        .read_view()
+        .unwrap()
+        .get(&dkey)
+        .unwrap()
+        .expect("definition");
+    u64::from_be_bytes(def[..8].try_into().unwrap())
+}
+
+#[test]
+fn owner_support_counts_are_owner_grain_and_label_scoped() {
+    use rushdb_types::model::LogicalType;
+    let eng = engine();
+    let a1 = eng
+        .create_record(
+            "A",
+            None,
+            vec![
+                ("n".into(), FieldChange::Set(Json::from(1))),
+                ("arr".into(), FieldChange::Set(json!([1, 2, 2]))),
+            ],
+        )
+        .unwrap();
+    let a2 = eng
+        .create_record(
+            "A",
+            None,
+            vec![("n".into(), FieldChange::Set(Json::from(3)))],
+        )
+        .unwrap();
+    let b1 = eng
+        .create_record(
+            "B",
+            None,
+            vec![("n".into(), FieldChange::Set(Json::from(5)))],
+        )
+        .unwrap();
+
+    let n_pid = pid_of(&eng, "n", LogicalType::Int64);
+    let arr_pid = pid_of(&eng, "arr", LogicalType::Int64);
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::prop_support_total(&snap, eng.tenant, n_pid).unwrap(),
+        3
+    );
+    assert_eq!(
+        try_access::prop_support_label(&snap, eng.tenant, n_pid, "A").unwrap(),
+        2
+    );
+    assert_eq!(
+        try_access::prop_support_label(&snap, eng.tenant, n_pid, "B").unwrap(),
+        1
+    );
+    // Array elements for one record count as one owner.
+    assert_eq!(
+        try_access::prop_support_total(&snap, eng.tenant, arr_pid).unwrap(),
+        1
+    );
+
+    // Overwriting the value keeps the owner counted once.
+    eng.update_fields(a1, vec![("n".into(), FieldChange::Set(Json::from(9)))])
+        .unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::prop_support_total(&snap, eng.tenant, n_pid).unwrap(),
+        3
+    );
+
+    // Deleting a record drops its support.
+    eng.delete_record(a2).unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::prop_support_total(&snap, eng.tenant, n_pid).unwrap(),
+        2
+    );
+    assert_eq!(
+        try_access::prop_support_label(&snap, eng.tenant, n_pid, "A").unwrap(),
+        1
+    );
+
+    // Retype moves label-scoped support.
+    eng.retype_record(b1, "B", "C").unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::prop_support_label(&snap, eng.tenant, n_pid, "B").unwrap(),
+        0
+    );
+    assert_eq!(
+        try_access::prop_support_label(&snap, eng.tenant, n_pid, "C").unwrap(),
+        1
+    );
+    assert_eq!(
+        try_access::prop_support_total(&snap, eng.tenant, n_pid).unwrap(),
+        2
+    );
+}
+
+#[test]
+fn owner_support_counts_are_exact_across_owners() {
+    // The derived index maintains exact owner support without the sharded
+    // summary rows (sharding is obsolete with derived state).
+    use rushdb_types::model::LogicalType;
+    let eng = engine();
+    for _ in 0..64 {
+        eng.create_record(
+            "Hub",
+            None,
+            vec![("status".into(), FieldChange::Set(json!("active")))],
+        )
+        .unwrap();
+    }
+    let status_pid = pid_of(&eng, "status", LogicalType::Utf8);
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::prop_support_total(&snap, eng.tenant, status_pid).unwrap(),
+        64
+    );
+    assert_eq!(
+        try_access::prop_support_label(&snap, eng.tenant, status_pid, "Hub").unwrap(),
+        64
+    );
+}
+
+#[test]
+fn concurrent_hot_property_writes_keep_exact_support() {
+    // Many writers hammering one hot property must not lose counter
+    // updates (shard-and-sum stays exact under the serialized publisher).
+    use rushdb_types::model::LogicalType;
+    let store = std::sync::Arc::new(Store::new_in_memory());
+    let tenant = TenantId::from_ordinal(7);
+    let eng = Lmpg::new(store.clone(), tenant);
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        handles.push(std::thread::spawn(move || {
+            let lmpg = Lmpg::new(store, tenant);
+            for _ in 0..25 {
+                lmpg.create_record(
+                    "Hub",
+                    None,
+                    vec![("status".into(), FieldChange::Set(json!("active")))],
+                )
+                .unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let status_pid = pid_of(&eng, "status", LogicalType::Utf8);
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::prop_support_total(&snap, tenant, status_pid).unwrap(),
+        200
+    );
+    assert_eq!(
+        try_access::prop_support_label(&snap, tenant, status_pid, "Hub").unwrap(),
+        200
+    );
+}
+
+fn pid_of_kind(
+    eng: &Lmpg,
+    kind: OwnerKind,
+    name: &str,
+    ty: rushdb_types::model::LogicalType,
+) -> u64 {
+    use rushdb_types::model::TypeState;
+    let sig = kx::family_sig_key(
+        eng.tenant,
+        "default",
+        kind,
+        &rushdb_types::value::normalize_name(name),
+    );
+    let raw = eng
+        .store
+        .read_view()
+        .unwrap()
+        .get(&sig)
+        .unwrap()
+        .expect("family signature");
+    let fid = u64::from_be_bytes(raw[..8].try_into().unwrap());
+    let dkey = kx::definition_key(eng.tenant, fid, TypeState::Known(ty));
+    let def = eng
+        .store
+        .read_view()
+        .unwrap()
+        .get(&dkey)
+        .unwrap()
+        .expect("definition");
+    u64::from_be_bytes(def[..8].try_into().unwrap())
+}
+
+#[test]
+fn relationship_property_counts_are_owner_grain() {
+    use rushdb_types::model::LogicalType;
+    let eng = engine();
+    let a = eng.create_record("A", None, vec![]).unwrap();
+    let b = eng.create_record("B", None, vec![]).unwrap();
+    let c = eng.create_record("C", None, vec![]).unwrap();
+    let r1 = eng
+        .create_relationship("R", a, b, vec![("w".into(), FieldChange::Set(json!(1)))])
+        .unwrap();
+    let _r2 = eng
+        .create_relationship(
+            "R",
+            c,
+            b,
+            vec![("w".into(), FieldChange::Set(json!([1, 2, 2])))],
+        )
+        .unwrap();
+
+    let w_pid = pid_of_kind(&eng, OwnerKind::Relationship, "w", LogicalType::Int64);
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::rel_prop_counts(&snap, eng.tenant, ("R", "A", "B")).unwrap(),
+        vec![(w_pid, 1)]
+    );
+    assert_eq!(
+        try_access::rel_prop_counts(&snap, eng.tenant, ("R", "C", "B")).unwrap(),
+        vec![(w_pid, 1)],
+        "array elements count a relationship owner once"
+    );
+
+    eng.delete_relationship(r1).unwrap();
+    let snap = eng.store.read_view().unwrap();
+    assert_eq!(
+        try_access::rel_prop_counts(&snap, eng.tenant, ("R", "A", "B")).unwrap(),
+        vec![]
+    );
+    assert_eq!(
+        try_access::rel_prop_counts(&snap, eng.tenant, ("R", "C", "B")).unwrap(),
+        vec![(w_pid, 1)]
+    );
+}
