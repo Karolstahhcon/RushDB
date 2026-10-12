@@ -309,3 +309,625 @@ impl OverlayStore {
                 });
             }
         }
+        for (id, original) in &state.original_edges {
+            if matches!(state.edges.get(id), Some(None))
+                && current_node(original.entity.src).is_some()
+                && current_node(original.entity.dst).is_some()
+            {
+                batch.ops.push(rushdb_lmpg::BatchOp::DeleteRelationship {
+                    rel: original.reference,
+                });
+            }
+        }
+        for (id, original) in &state.original_nodes {
+            if matches!(state.nodes.get(id), Some(None)) {
+                batch.ops.push(rushdb_lmpg::BatchOp::DeleteRecord {
+                    record: original.reference,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates of the records the statement made, with the public ids
+    /// chosen for them (so relationships in the same batch resolve them).
+    #[expect(
+        clippy::type_complexity,
+        reason = "the created ids in batch order and their public ids, consumed together"
+    )]
+    fn created_nodes(
+        state: &State,
+        batch: &mut rushdb_lmpg::BatchTx,
+    ) -> Result<(Vec<NodeId>, HashMap<NodeId, [u8; 16]>), LanguageError> {
+        let mut public_ids = HashMap::new();
+        let mut created = Vec::new();
+        for id in &state.created_nodes {
+            let Some(Some(node)) = state.nodes.get(id) else {
+                continue;
+            };
+            if node.labels.len() != 1 {
+                return Err(LanguageError::UnsupportedMutation(
+                    "new LMPG records require exactly one label".into(),
+                ));
+            }
+            let record_id = *uuid::Uuid::now_v7().as_bytes();
+            public_ids.insert(*id, record_id);
+            created.push(*id);
+            batch.ops.push(rushdb_lmpg::BatchOp::CreateRecord {
+                label: node.labels[0].to_string(),
+                explicit_id: Some(record_id),
+                fields: all_fields(&node.properties_as_btree()),
+            });
+        }
+        Ok((created, public_ids))
+    }
+
+    /// Field updates of touched relationships.
+    fn edge_updates(state: &State, batch: &mut rushdb_lmpg::BatchTx) {
+        for (id, original) in &state.original_edges {
+            let Some(Some(edge)) = state.edges.get(id) else {
+                continue;
+            };
+            let fields = changed_fields(
+                &original.entity.properties_as_btree(),
+                &edge.properties_as_btree(),
+            );
+            if !fields.is_empty() {
+                batch.ops.push(rushdb_lmpg::BatchOp::UpdateFields {
+                    owner: rushdb_types::ids::OwnerKind::Relationship,
+                    owner_ord: original.reference.ordinal,
+                    owner_public_id: original.reference.relationship_id,
+                    fields,
+                });
+            }
+        }
+    }
+
+    fn current_node_in(&self, state: &State, id: NodeId) -> Option<Node> {
+        match state.nodes.get(&id) {
+            Some(entry) => entry.clone(),
+            None if id.as_u64() >= CREATED_BASE => None,
+            None => self.base.get_node(id),
+        }
+    }
+
+    fn base_record_id(&self, state: &State, id: NodeId) -> Result<[u8; 16], LanguageError> {
+        if let Some(original) = state.original_nodes.get(&id) {
+            return Ok(original.reference.record_id);
+        }
+        Ok(
+            access::record_by_ord(self.base.view().as_ref(), self.base.tenant(), id.as_u64())?
+                .ok_or_else(|| LanguageError::Initialization("record vanished".into()))?
+                .record_id,
+        )
+    }
+
+    /// The public id of node `id` after the commit: `created` for a new one,
+    /// the record's id otherwise.
+    pub(crate) fn public_node_id(
+        &self,
+        id: NodeId,
+        created: &HashMap<NodeId, [u8; 16]>,
+    ) -> Option<[u8; 16]> {
+        if let Some(public) = created.get(&id) {
+            return Some(*public);
+        }
+        self.base_record_id(&self.read_state(), id).ok()
+    }
+
+    /// The public id of edge `id` after the commit.
+    pub(crate) fn public_edge_id(
+        &self,
+        id: EdgeId,
+        created: &HashMap<EdgeId, [u8; 16]>,
+    ) -> Option<[u8; 16]> {
+        if let Some(public) = created.get(&id) {
+            return Some(*public);
+        }
+        if let Some(original) = self.read_state().original_edges.get(&id) {
+            return Some(original.reference.relationship_id);
+        }
+        access::relationship_by_ord(self.base.view().as_ref(), self.base.tenant(), id.as_u64())
+            .ok()
+            .flatten()
+            .map(|header| header.relationship_id)
+    }
+}
+
+fn labels_of(node: &Node) -> Vec<String> {
+    node.labels.iter().map(ToString::to_string).collect()
+}
+
+fn node_bytes(node: &Node) -> usize {
+    256usize
+        .saturating_add(
+            node.labels
+                .iter()
+                .map(grafeo_common::types::ArcStr::len)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            node.properties
+                .iter()
+                .map(|(key, value)| property_bytes(key.as_str(), value))
+                .sum::<usize>(),
+        )
+}
+
+fn edge_bytes(edge: &Edge) -> usize {
+    256usize
+        .saturating_add(edge.edge_type.len())
+        .saturating_add(
+            edge.properties
+                .iter()
+                .map(|(key, value)| property_bytes(key.as_str(), value))
+                .sum::<usize>(),
+        )
+}
+
+fn conditions_hold(node: &Node, conditions: &[(&str, Value)]) -> bool {
+    conditions.iter().all(|(property, expected)| {
+        node.get_property(property)
+            .is_some_and(|actual| values_equal(actual, expected))
+    })
+}
+
+impl GraphStore for OverlayStore {
+    fn get_node(&self, id: NodeId) -> Option<Node> {
+        self.current_node(id)
+    }
+    fn get_edge(&self, id: EdgeId) -> Option<Edge> {
+        self.current_edge(id)
+    }
+    fn get_node_versioned(&self, id: NodeId, _: EpochId, _: TransactionId) -> Option<Node> {
+        self.current_node(id)
+    }
+    fn get_edge_versioned(&self, id: EdgeId, _: EpochId, _: TransactionId) -> Option<Edge> {
+        self.current_edge(id)
+    }
+    fn get_node_at_epoch(&self, id: NodeId, _: EpochId) -> Option<Node> {
+        self.current_node(id)
+    }
+    fn get_edge_at_epoch(&self, id: EdgeId, _: EpochId) -> Option<Edge> {
+        self.current_edge(id)
+    }
+    fn get_node_property(&self, id: NodeId, key: &PropertyKey) -> Option<Value> {
+        if let Some(entry) = self.read_state().nodes.get(&id) {
+            return entry.as_ref()?.get_property(key.as_str()).cloned();
+        }
+        if id.as_u64() >= CREATED_BASE {
+            return None;
+        }
+        self.base.get_node_property(id, key)
+    }
+    fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value> {
+        self.current_edge(id)?.get_property(key.as_str()).cloned()
+    }
+    fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>> {
+        ids.iter()
+            .map(|id| self.get_node_property(*id, key))
+            .collect()
+    }
+    fn get_nodes_properties_batch(&self, ids: &[NodeId]) -> Vec<FxHashMap<PropertyKey, Value>> {
+        ids.iter()
+            .map(|id| {
+                self.current_node(*id)
+                    .map(|node| {
+                        node.properties
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+    fn get_nodes_properties_selective_batch(
+        &self,
+        ids: &[NodeId],
+        keys: &[PropertyKey],
+    ) -> Vec<FxHashMap<PropertyKey, Value>> {
+        ids.iter()
+            .map(|id| {
+                keys.iter()
+                    .filter_map(|key| self.get_node_property(*id, key).map(|v| (key.clone(), v)))
+                    .collect()
+            })
+            .collect()
+    }
+    fn get_edges_properties_selective_batch(
+        &self,
+        ids: &[EdgeId],
+        keys: &[PropertyKey],
+    ) -> Vec<FxHashMap<PropertyKey, Value>> {
+        ids.iter()
+            .map(|id| {
+                keys.iter()
+                    .filter_map(|key| self.get_edge_property(*id, key).map(|v| (key.clone(), v)))
+                    .collect()
+            })
+            .collect()
+    }
+    fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
+        self.edges_from(node, direction)
+            .into_iter()
+            .map(|(other, _)| other)
+            .collect()
+    }
+    fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
+        if self.current_node(node).is_none() {
+            return Vec::new();
+        }
+        let mut edges = if node.as_u64() >= CREATED_BASE {
+            Vec::new()
+        } else {
+            self.base.edges_from(node, direction)
+        };
+        let state = self.read_state();
+        edges.retain(|(_, edge)| !matches!(state.edges.get(edge), Some(None)));
+        let added = |map: &HashMap<NodeId, Vec<(NodeId, EdgeId)>>| {
+            map.get(&node).cloned().unwrap_or_default()
+        };
+        match direction {
+            Direction::Outgoing => edges.extend(added(&state.added_out)),
+            Direction::Incoming => edges.extend(added(&state.added_in)),
+            Direction::Both => {
+                edges.extend(added(&state.added_out));
+                edges.extend(added(&state.added_in));
+            }
+            _ => {}
+        }
+        edges.sort_unstable();
+        edges.dedup();
+        edges
+    }
+    fn out_degree(&self, node: NodeId) -> usize {
+        self.edges_from(node, Direction::Outgoing).len()
+    }
+    fn in_degree(&self, node: NodeId) -> usize {
+        self.edges_from(node, Direction::Incoming).len()
+    }
+    fn has_backward_adjacency(&self) -> bool {
+        true
+    }
+    fn node_ids(&self) -> Vec<NodeId> {
+        self.corrected(self.base.node_ids(), |_| true)
+    }
+    fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+        self.corrected(self.base.nodes_by_label(label), |node| {
+            node.has_label(label)
+        })
+    }
+    fn nodes_by_label_count(&self, label: &str) -> usize {
+        self.nodes_by_label(label).len()
+    }
+    fn node_count(&self) -> usize {
+        let state = self.read_state();
+        let removed = state
+            .original_nodes
+            .keys()
+            .filter(|id| matches!(state.nodes.get(id), Some(None)))
+            .count();
+        let created = state
+            .created_nodes
+            .iter()
+            .filter(|id| matches!(state.nodes.get(id), Some(Some(_))))
+            .count();
+        drop(state);
+        (self.base.node_count() + created).saturating_sub(removed)
+    }
+    fn edge_count(&self) -> usize {
+        let state = self.read_state();
+        let removed = state
+            .original_edges
+            .keys()
+            .filter(|id| matches!(state.edges.get(id), Some(None)))
+            .count();
+        let created = state
+            .created_edges
+            .iter()
+            .filter(|id| matches!(state.edges.get(id), Some(Some(_))))
+            .count();
+        drop(state);
+        (self.base.edge_count() + created).saturating_sub(removed)
+    }
+    fn edge_type(&self, id: EdgeId) -> Option<grafeo_common::types::ArcStr> {
+        self.current_edge(id).map(|edge| edge.edge_type)
+    }
+    fn edge_type_versioned(
+        &self,
+        id: EdgeId,
+        _: EpochId,
+        _: TransactionId,
+    ) -> Option<grafeo_common::types::ArcStr> {
+        self.edge_type(id)
+    }
+    fn has_property_index(&self, property: &str) -> bool {
+        self.base.has_property_index(property)
+    }
+    fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
+        self.find_nodes_by_properties(&[(property, value.clone())])
+    }
+    fn find_nodes_by_properties(&self, conditions: &[(&str, Value)]) -> Vec<NodeId> {
+        self.corrected(self.base.find_nodes_by_properties(conditions), |node| {
+            conditions_hold(node, conditions)
+        })
+    }
+    fn find_nodes_in_range(
+        &self,
+        property: &str,
+        min: Option<&Value>,
+        max: Option<&Value>,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) -> Vec<NodeId> {
+        self.corrected(
+            self.base
+                .find_nodes_in_range(property, min, max, min_inclusive, max_inclusive),
+            |node| {
+                node.get_property(property).is_some_and(|value| {
+                    LmpgGraphStore::property_matches_range(
+                        value,
+                        min,
+                        max,
+                        min_inclusive,
+                        max_inclusive,
+                    )
+                })
+            },
+        )
+    }
+    fn node_property_might_match(&self, _: &PropertyKey, _: CompareOp, _: &Value) -> bool {
+        true
+    }
+    fn edge_property_might_match(&self, _: &PropertyKey, _: CompareOp, _: &Value) -> bool {
+        true
+    }
+    fn statistics(&self) -> Arc<Statistics> {
+        self.base.statistics()
+    }
+    fn estimate_label_cardinality(&self, label: &str) -> f64 {
+        self.base.estimate_label_cardinality(label)
+    }
+    fn estimate_avg_degree(&self, edge_type: &str, outgoing: bool) -> f64 {
+        self.base.estimate_avg_degree(edge_type, outgoing)
+    }
+    fn current_epoch(&self) -> EpochId {
+        self.base.current_epoch()
+    }
+    fn all_labels(&self) -> Vec<String> {
+        let mut labels: BTreeSet<String> = self.base.all_labels().into_iter().collect();
+        for (_, node) in self.touched_nodes() {
+            labels.extend(node.iter().flat_map(labels_of));
+        }
+        labels.into_iter().collect()
+    }
+    fn all_edge_types(&self) -> Vec<String> {
+        let mut types: BTreeSet<String> = self.base.all_edge_types().into_iter().collect();
+        types.extend(
+            self.read_state()
+                .edges
+                .values()
+                .flatten()
+                .map(|edge| edge.edge_type.to_string()),
+        );
+        types.into_iter().collect()
+    }
+    fn all_property_keys(&self) -> Vec<String> {
+        let mut keys: BTreeSet<String> = self.base.all_property_keys().into_iter().collect();
+        let state = self.read_state();
+        for node in state.nodes.values().flatten() {
+            keys.extend(node.properties.iter().map(|(key, _)| key.to_string()));
+        }
+        for edge in state.edges.values().flatten() {
+            keys.extend(edge.properties.iter().map(|(key, _)| key.to_string()));
+        }
+        keys.into_iter().collect()
+    }
+}
+
+/// Text search reads the committed snapshot: what the statement itself
+/// writes is not searchable until it commits.
+impl GraphStoreSearch for OverlayStore {
+    fn has_text_index(&self, label: &str, property: &str) -> bool {
+        self.base.has_text_index(label, property)
+    }
+
+    fn score_text(&self, node_id: NodeId, label: &str, property: &str, query: &str) -> Option<f64> {
+        self.base.score_text(node_id, label, property, query)
+    }
+
+    fn text_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Vec<(NodeId, f64)> {
+        self.base.text_search(label, property, query, k)
+    }
+
+    fn text_search_with_threshold(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        threshold: f64,
+    ) -> Vec<(NodeId, f64)> {
+        self.base
+            .text_search_with_threshold(label, property, query, threshold)
+    }
+}
+
+/// Grafeo writes through these (failures surface after execution through
+/// [`OverlayStore::check`]: a refused creation returns an id that resolves
+/// to nothing).
+impl GraphStoreMut for OverlayStore {
+    fn create_node(&self, labels: &[&str]) -> NodeId {
+        let mut state = self.write_state();
+        if !self.admit_node(&mut state)
+            || !self
+                .budget
+                .admit(256usize.saturating_add(labels.iter().map(|label| label.len()).sum()))
+        {
+            return NodeId::new(u64::MAX);
+        }
+        let id = NodeId::new(Self::next_id(&mut state));
+        state
+            .nodes
+            .insert(id, Some(Node::with_labels(id, labels.iter().copied())));
+        state.created_nodes.push(id);
+        id
+    }
+    fn create_node_versioned(&self, labels: &[&str], _: EpochId, _: TransactionId) -> NodeId {
+        self.create_node(labels)
+    }
+    fn create_edge(&self, src: NodeId, dst: NodeId, edge_type: &str) -> EdgeId {
+        if self.current_node(src).is_none()
+            || self.current_node(dst).is_none()
+            || !self.budget.admit(256usize.saturating_add(edge_type.len()))
+        {
+            return EdgeId::new(u64::MAX);
+        }
+        let mut state = self.write_state();
+        let id = EdgeId::new(Self::next_id(&mut state));
+        state
+            .edges
+            .insert(id, Some(Edge::new(id, src, dst, edge_type)));
+        state.created_edges.push(id);
+        state.added_out.entry(src).or_default().push((dst, id));
+        state.added_in.entry(dst).or_default().push((src, id));
+        id
+    }
+    fn create_edge_versioned(
+        &self,
+        src: NodeId,
+        dst: NodeId,
+        edge_type: &str,
+        _: EpochId,
+        _: TransactionId,
+    ) -> EdgeId {
+        self.create_edge(src, dst, edge_type)
+    }
+    fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId> {
+        edges
+            .iter()
+            .map(|(src, dst, kind)| self.create_edge(*src, *dst, kind))
+            .collect()
+    }
+    fn delete_node(&self, id: NodeId) -> bool {
+        let mut state = self.write_state();
+        if !self.touch_node(&mut state, id) {
+            return false;
+        }
+        state.nodes.insert(id, None);
+        true
+    }
+    fn delete_node_versioned(&self, id: NodeId, _: EpochId, _: TransactionId) -> bool {
+        self.delete_node(id)
+    }
+    fn delete_node_edges(&self, node_id: NodeId) {
+        for (_, edge) in self.edges_from(node_id, Direction::Both) {
+            self.delete_edge(edge);
+        }
+    }
+    fn delete_edge(&self, id: EdgeId) -> bool {
+        let mut state = self.write_state();
+        if id.as_u64() >= CREATED_BASE {
+            let Some(Some(edge)) = state.edges.insert(id, None) else {
+                return false;
+            };
+            let state = &mut *state;
+            for (map, node) in [
+                (&mut state.added_out, edge.src),
+                (&mut state.added_in, edge.dst),
+            ] {
+                if let Some(list) = map.get_mut(&node) {
+                    list.retain(|(_, edge)| *edge != id);
+                }
+            }
+            return true;
+        }
+        if !self.touch_edge(&mut state, id) {
+            return false;
+        }
+        state.edges.insert(id, None);
+        true
+    }
+    fn delete_edge_versioned(&self, id: EdgeId, _: EpochId, _: TransactionId) -> bool {
+        self.delete_edge(id)
+    }
+    /// Setting a property to null removes it (Cypher and GQL semantics).
+    fn set_node_property(&self, id: NodeId, key: &str, value: Value) {
+        if !self.budget.admit(property_bytes(key, &value)) {
+            return;
+        }
+        let mut state = self.write_state();
+        if self.touch_node(&mut state, id) {
+            if let Some(Some(node)) = state.nodes.get_mut(&id) {
+                if value.is_null() {
+                    node.remove_property(key);
+                } else {
+                    node.set_property(key, value);
+                }
+            }
+        }
+    }
+    fn set_edge_property(&self, id: EdgeId, key: &str, value: Value) {
+        if !self.budget.admit(property_bytes(key, &value)) {
+            return;
+        }
+        let mut state = self.write_state();
+        if id.as_u64() >= CREATED_BASE || self.touch_edge(&mut state, id) {
+            if let Some(Some(edge)) = state.edges.get_mut(&id) {
+                if value.is_null() {
+                    edge.remove_property(key);
+                } else {
+                    edge.set_property(key, value);
+                }
+            }
+        }
+    }
+    fn remove_node_property(&self, id: NodeId, key: &str) -> Option<Value> {
+        let mut state = self.write_state();
+        if !self.touch_node(&mut state, id) {
+            return None;
+        }
+        state.nodes.get_mut(&id)?.as_mut()?.remove_property(key)
+    }
+    fn remove_edge_property(&self, id: EdgeId, key: &str) -> Option<Value> {
+        let mut state = self.write_state();
+        if id.as_u64() < CREATED_BASE && !self.touch_edge(&mut state, id) {
+            return None;
+        }
+        state.edges.get_mut(&id)?.as_mut()?.remove_property(key)
+    }
+    fn add_label(&self, node_id: NodeId, label: &str) -> bool {
+        if !self.budget.admit(64usize.saturating_add(label.len())) {
+            return false;
+        }
+        let mut state = self.write_state();
+        if !self.touch_node(&mut state, node_id) {
+            return false;
+        }
+        let Some(Some(node)) = state.nodes.get_mut(&node_id) else {
+            return false;
+        };
+        if node.has_label(label) {
+            return false;
+        }
+        node.add_label(label);
+        true
+    }
+    fn remove_label(&self, node_id: NodeId, label: &str) -> bool {
+        let mut state = self.write_state();
+        if !self.touch_node(&mut state, node_id) {
+            return false;
+        }
+        state
+            .nodes
+            .get_mut(&node_id)
+            .and_then(Option::as_mut)
+            .is_some_and(|node| node.remove_label(label))
+    }
+}

@@ -41,3 +41,47 @@ fn main() {
             }
             "--concurrent" => concurrent = args.next().expect("--concurrent W").parse().unwrap(),
             "--delay-ms" => delay_ms = args.next().expect("--delay-ms M").parse().unwrap(),
+            other => panic!("unknown crash_child argument `{other}`"),
+        }
+    }
+
+    let store = Arc::new(
+        rushdb_lmpg::open_store_with_resources(std::path::Path::new(&db), config)
+            .expect("open crash-child store"),
+    );
+
+    if concurrent <= 1 {
+        write_records(store, commits, 0);
+    } else {
+        let mut handles = Vec::new();
+        for writer in 0..concurrent {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                write_records(store, commits, writer);
+            }));
+        }
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            // Crash mid-burst: some writers are still committing.
+            std::process::abort();
+        }
+        for handle in handles {
+            handle.join().expect("crash-child writer");
+        }
+    }
+
+    // Every acknowledged commit is durable for `Local`; abort now.
+    std::process::abort();
+}
+
+fn write_records(store: Arc<Store>, commits: u64, writer: u64) {
+    let lmpg = Lmpg::new(store, TENANT);
+    for i in 0..commits {
+        lmpg.create_record(
+            "Doc",
+            None,
+            vec![("i".into(), FieldChange::Set(json!(writer * 1_000_000 + i)))],
+        )
+        .expect("crash-child write");
+    }
+}

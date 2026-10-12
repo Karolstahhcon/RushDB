@@ -33,3 +33,39 @@ impl TempPath {
         let dir = Self::fresh(prefix);
         Self {
             path: dir.clone(),
+            dir,
+        }
+    }
+
+    fn fresh(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rushdb-{prefix}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("create a temporary directory");
+        dir
+    }
+
+    /// The path itself.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempPath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
