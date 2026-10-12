@@ -117,3 +117,122 @@ fn datetime_component_corpus() {
         let document = json!({
             "labels": ["Event"],
             "where": { "at": { op: val } }
+        });
+        let records = run(&lmpg, &document);
+        assert_eq!(records.len(), 1, "{op}={val} must match the record");
+    }
+    // each component rejects its own complement
+    for (op, _) in cases {
+        let document = json!({
+            "labels": ["Event"],
+            "where": { "at": { op: 1_999_999_999 } }
+        });
+        assert_eq!(
+            run(&lmpg, &document).len(),
+            0,
+            "{op} must not match a 1999 value"
+        );
+    }
+}
+
+#[test]
+fn time_bucket_output_naming_honors_alias() {
+    let lmpg = setup();
+    // two events in the same 2-day bucket
+    lmpg.create_record(
+        "Event",
+        None,
+        vec![
+            ("at".into(), FieldChange::Set(json!(1_600_000_000_000i64))),
+            ("v".into(), FieldChange::Set(json!(1.0))),
+        ],
+    )
+    .unwrap();
+    lmpg.create_record(
+        "Event",
+        None,
+        vec![
+            ("at".into(), FieldChange::Set(json!(1_600_000_100_000i64))),
+            ("v".into(), FieldChange::Set(json!(2.0))),
+        ],
+    )
+    .unwrap();
+
+    // alias form: the output column carries the user's alias, not the
+    // internal `__bucket_<field>/<unit>` key
+    let buckets = aggregate(
+        &lmpg,
+        &AggregateRequest {
+            labels: vec!["Event".into()],
+            time_bucket: Some(TimeBucketSpec::fixed("at", TimeUnit::Days)),
+            time_bucket_alias: Some("day_bucket".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(buckets.len(), 1);
+    assert!(
+        buckets[0].keys.contains_key("day_bucket"),
+        "alias must be the output key, got {:?}",
+        buckets[0].keys.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !buckets[0].keys.keys().any(|k| k.starts_with("__bucket_")),
+        "internal bucket key must not leak, got {:?}",
+        buckets[0].keys.keys().collect::<Vec<_>>()
+    );
+
+    // default form: documented `__bucket_<field>/<unit>` key
+    let buckets = aggregate(
+        &lmpg,
+        &AggregateRequest {
+            labels: vec!["Event".into()],
+            time_bucket: Some(TimeBucketSpec::fixed("at", TimeUnit::Days)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let key = buckets[0]
+        .keys
+        .keys()
+        .find(|k| k.starts_with("__bucket_at/"))
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        buckets[0].keys.get(&key),
+        Some(&json!(1_599_955_200_000u64))
+    );
+}
+
+#[test]
+fn query_document_time_bucket_alias_propagates() {
+    let lmpg = setup();
+    lmpg.create_record(
+        "Event",
+        None,
+        vec![
+            ("at".into(), FieldChange::Set(json!(1_600_000_000_000i64))),
+            ("v".into(), FieldChange::Set(json!(1.0))),
+        ],
+    )
+    .unwrap();
+
+    let buckets = run(
+        &lmpg,
+        &json!({
+            "labels": ["Event"],
+            "select": {
+                "monthly": { "$timeBucket": { "field": "at", "unit": "month" } },
+                "total": { "$sum": "v" }
+            },
+            "groupBy": []
+        }),
+    );
+    assert_eq!(buckets.len(), 1);
+    assert!(
+        buckets[0].get("monthly").is_some(),
+        "alias must be the output key, got {:?}",
+        buckets[0]
+    );
+}
