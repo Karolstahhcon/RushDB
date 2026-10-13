@@ -34,3 +34,40 @@ impl TryRead for Map {
     }
 }
 
+#[test]
+fn last_key_matches_a_scan() {
+    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut pick = |n: usize| usize::try_from(next() % n as u64).expect("below n");
+    let alphabet = [0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF];
+    for round in 0..300 {
+        let mut map = BTreeMap::new();
+        for _ in 0..pick(12) {
+            let head = alphabet[pick(3)];
+            let mut key = vec![head];
+            for _ in 0..pick(5) {
+                key.push(alphabet[pick(alphabet.len())]);
+            }
+            map.insert(key, Vec::new());
+        }
+        let map = Map(map);
+        for prefix in [vec![], vec![0x00], vec![0x01], vec![0x7F], vec![0x00, 0xFF]] {
+            let want = map
+                .0
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .max()
+                .cloned();
+            assert_eq!(
+                last_key(&map, &prefix).unwrap(),
+                want,
+                "round {round} prefix {prefix:?}"
+            );
+        }
+    }
+}
