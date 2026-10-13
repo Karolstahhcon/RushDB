@@ -65,3 +65,139 @@ mod accounting {
             .fold(0, u64::saturating_add)
     }
 
+    // SAFETY: every method forwards to jemalloc with the caller's arguments
+    // unchanged; the counter has no effect on allocation behavior.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count(layout.size());
+            // SAFETY: forwarded contract.
+            unsafe { tikv_jemallocator::Jemalloc.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            count(layout.size());
+            // SAFETY: forwarded contract.
+            unsafe { tikv_jemallocator::Jemalloc.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: forwarded contract.
+            unsafe { tikv_jemallocator::Jemalloc.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            count(new_size);
+            // SAFETY: forwarded contract.
+            unsafe { tikv_jemallocator::Jemalloc.realloc(ptr, layout, new_size) }
+        }
+    }
+}
+
+/// Cumulative bytes requested from the allocator since start, when built
+/// with `alloc-accounting`; `None` otherwise.
+#[must_use]
+pub fn bytes_allocated_total() -> Option<u64> {
+    #[cfg(feature = "alloc-accounting")]
+    {
+        Some(accounting::total())
+    }
+    #[cfg(not(feature = "alloc-accounting"))]
+    {
+        None
+    }
+}
+
+/// Which allocator backs this build. Reported via metrics and startup logs.
+#[must_use]
+pub fn name() -> &'static str {
+    if cfg!(feature = "jemalloc") {
+        "jemalloc"
+    } else {
+        "system"
+    }
+}
+
+/// Apply the allocator policy. Must run early in `main`, before worker
+/// threads spawn. Never panics: mallctl failures are logged and the server
+/// keeps running with allocator defaults.
+pub fn configure() {
+    #[cfg(feature = "jemalloc")]
+    {
+        // Background purge threads return decayed pages to the OS off the
+        // request path. Decay itself stays at jemalloc's default (10 s): the
+        // 1 s override was plumbing for per-commit churn that the cloud-fit work
+        // removed (allocation per ingested record 858 KB → ~179 KB), so RSS
+        // now stays bounded without it.
+        if let Err(error) = tikv_jemalloc_ctl::background_thread::write(true) {
+            eprintln!("allocator: background_thread unavailable: {error}");
+        }
+    }
+}
+
+/// Allocator introspection snapshot for metrics. All values are bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllocatorStats {
+    /// Bytes allocated by the application (`stats.allocated`).
+    pub allocated: usize,
+    /// Bytes in active pages (`stats.active`).
+    pub active: usize,
+    /// Bytes used for allocator metadata (`stats.metadata`).
+    pub metadata: usize,
+    /// Bytes physically resident (`stats.resident`).
+    pub resident: usize,
+    /// Bytes retained in arenas but not active (`stats.retained`).
+    pub retained: usize,
+}
+
+/// Read current allocator counters. Returns `None` on the system allocator
+/// (no introspection API) or if the epoch cannot advance.
+#[must_use]
+pub fn stats() -> Option<AllocatorStats> {
+    #[cfg(feature = "jemalloc")]
+    {
+        if tikv_jemalloc_ctl::epoch::advance().is_err() {
+            return None;
+        }
+        let read = |value: Result<usize, _>| value.unwrap_or(0);
+        Some(AllocatorStats {
+            allocated: read(tikv_jemalloc_ctl::stats::allocated::read()),
+            active: read(tikv_jemalloc_ctl::stats::active::read()),
+            metadata: read(tikv_jemalloc_ctl::stats::metadata::read()),
+            resident: read(tikv_jemalloc_ctl::stats::resident::read()),
+            retained: read(tikv_jemalloc_ctl::stats::retained::read()),
+        })
+    }
+    #[cfg(not(feature = "jemalloc"))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn name_matches_feature_flag() {
+        assert_eq!(
+            super::name(),
+            if cfg!(feature = "jemalloc") {
+                "jemalloc"
+            } else {
+                "system"
+            }
+        );
+    }
+
+    #[test]
+    fn configure_never_panics_and_stats_are_consistent() {
+        super::configure();
+        if let Some(stats) = super::stats() {
+            assert!(stats.allocated > 0, "allocator reports no bytes");
+            assert!(
+                stats.resident >= stats.allocated,
+                "resident {} < allocated {}",
+                stats.resident,
+                stats.allocated
+            );
+        }
+    }
+}
