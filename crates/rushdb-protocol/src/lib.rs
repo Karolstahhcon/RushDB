@@ -1415,3 +1415,1420 @@ pub struct VectorIndexDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Owner kind the index covers: `"record"` (default) or `"relationship"`.
+    /// For a relationship index, `label` is the relationship type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+/// A vector to associate with a record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorItem {
+    /// Record the vector belongs to.
+    pub record_id: String,
+    /// The vector components.
+    pub vector: Vec<f32>,
+    /// Hash of the source property captured before an external embedding
+    /// provider ran. When present, the engine conditionally attaches the
+    /// vector and rejects stale completions after a source update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<u64>,
+    /// Opaque index-generation token captured when the embedding job started.
+    /// A completion from a dropped/recreated index is rejected when the token
+    /// no longer matches the durable index metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_generation: Option<String>,
+}
+
+/// A vector similarity query.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorQuery {
+    /// Labels the candidate records must carry.
+    pub labels: Vec<String>,
+    /// Property holding the indexed vector.
+    pub property: String,
+    /// The query vector.
+    pub vector: Vec<f32>,
+    /// Similarity metric name.
+    #[serde(default = "default_similarity")]
+    pub similarity: String,
+    /// Index/space name. Required while `resources.require-vector-index-name`
+    /// is on (the default): two models of the same shape are only told apart
+    /// by name. With the gate off, an absent name falls back to the alias
+    /// derived from `labels`/`property`/`similarity`/vector length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    /// Predicate document filtering candidates before the top-k search.
+    #[serde(default = "empty_object")]
+    pub predicate: serde_json::Value,
+    /// Number of top results to skip.
+    #[serde(default)]
+    pub offset: u64,
+    /// Number of top results to return.
+    pub limit: u64,
+    /// How the search ranks candidates; see [`VectorSearchMode`]. Absent
+    /// means `ann` when `ef` is positive, `auto` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<VectorSearchMode>,
+    /// ANN gather breadth whenever the search runs on the ANN graph (at
+    /// least `offset + limit` is gathered). Absent: the server's
+    /// `resources.vector-default-ef`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ef: Option<usize>,
+    /// Keep only hits scoring at least this much. Every metric scores
+    /// "higher is more similar", so one threshold fits all; a page may hold
+    /// fewer than `limit` records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_threshold: Option<f32>,
+}
+
+/// How a vector search ranks its candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VectorSearchMode {
+    /// The server chooses: exact search while the index holds at most
+    /// `resources.vector-exact-max-pool` vectors (or its metric has no ANN
+    /// graph), ANN above. A search never waits for the ANN graph to be
+    /// built: until it is resident, `auto` answers exactly and builds it in
+    /// the background.
+    Auto,
+    /// Score every candidate.
+    Exact,
+    /// Gather from the ANN graph and rerank exactly. Only cosine indexes
+    /// have one; a budget or confidence shortfall is still answered exactly
+    /// and reported.
+    Ann,
+}
+
+/// The path that answered a vector search, reported with its results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorSearchReport {
+    /// `exact` or `ann`: the path that produced the results.
+    pub mode: String,
+    /// The gather breadth, when the search ran on the ANN graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ef: Option<usize>,
+    /// Why a search that would use the ANN graph was answered exactly:
+    /// `metric` (no ANN graph for this metric), `budget` (the graph does not
+    /// fit the vector cache), `lowConfidence` (too few filtered candidates
+    /// gathered), or `annWarming` (`auto` only: the graph is being built in
+    /// the background; later searches use it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// Vectors in the index (its ready bindings), which `auto` decides on.
+    pub pool: u64,
+}
+
+/// The vector leg of a [`HybridQuery`]. Same shape as the similarity-search
+/// fields of [`VectorQuery`], minus the fields [`HybridQuery`] already
+/// carries once for both legs (`labels`, `predicate`, pagination).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HybridVectorLeg {
+    /// Property holding the indexed vector.
+    pub property: String,
+    /// The query vector.
+    pub vector: Vec<f32>,
+    /// Similarity metric name.
+    #[serde(default = "default_similarity")]
+    pub similarity: String,
+    /// Explicit index/space name; see [`VectorQuery::index`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    /// See [`VectorQuery::mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<VectorSearchMode>,
+    /// See [`VectorQuery::ef`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ef: Option<usize>,
+    /// Keep only vector hits scoring at least this much, before fusion; see
+    /// [`VectorQuery::score_threshold`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_threshold: Option<f32>,
+    /// This leg's share of a fused score (both legs set); default 1.
+    #[serde(default = "default_leg_weight")]
+    pub weight: f64,
+    /// Candidates this leg ranks before fusion (1..=10,000); default
+    /// `4 × (offset + limit)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch_limit: Option<u64>,
+}
+
+/// The lexical leg of a [`HybridQuery`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HybridTextLeg {
+    /// The text index name.
+    pub index: String,
+    /// The query string.
+    pub query: String,
+    /// See [`Query::Text`]'s `all_terms`.
+    #[serde(default)]
+    pub all_terms: bool,
+    /// See [`Query::Text`]'s `phrase`.
+    #[serde(default)]
+    pub phrase: bool,
+    /// This leg's share of a fused score (both legs set); default 1.
+    #[serde(default = "default_leg_weight")]
+    pub weight: f64,
+    /// Candidates this leg ranks before fusion (1..=10,000); default
+    /// `4 × (offset + limit)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch_limit: Option<u64>,
+}
+
+/// How the lexical leg of a hybrid search ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextSearchReport {
+    /// Records matching the query among the filtered candidates.
+    pub matches: u64,
+    /// Changes the index had not applied when the search ran.
+    pub pending: u64,
+}
+
+/// A combined graph + vector + lexical query.
+///
+/// `labels`/`predicate` are resolved exactly once, through the same
+/// cardinality-based access-path planner ordinary graph queries use
+/// (`matching_ordinals`), into one candidate owner-ordinal set. Both the
+/// vector leg and the lexical leg search only inside that set — ranking
+/// happens after filtering, never before, so a predicate cannot be
+/// circumvented by either retrieval channel. The two independently correct
+/// rankings are then combined by [`Fusion`]. At least one of `vector`/`text`
+/// must be set; both may be set for a true hybrid query.
+///
+/// Record-scoped only for v1: relationship vectors remain reachable through
+/// the plain [`VectorQuery`], and text indexes cover records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HybridQuery {
+    /// Labels a candidate record must carry; empty matches every label.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Predicate document filtering candidates before either leg ranks them.
+    #[serde(default = "empty_object")]
+    pub predicate: serde_json::Value,
+    /// The vector leg, when ranking by similarity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<HybridVectorLeg>,
+    /// The lexical leg, when ranking by BM25.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<HybridTextLeg>,
+    /// Fused results to skip before `limit` takes over; 0 = first page.
+    /// Each leg's own over-fetch is sized from `offset + limit`, not
+    /// `limit` alone, so a deep page is not silently under-filled by a
+    /// gather that only ever considered the first page's candidates.
+    #[serde(default)]
+    pub offset: u64,
+    /// Number of fused results to return.
+    pub limit: u64,
+    /// How the two legs' rankings combine.
+    #[serde(default)]
+    pub fusion: Fusion,
+    /// Reciprocal-rank-fusion smoothing constant ([`Fusion::Rrf`] only).
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f64,
+}
+
+/// How a hybrid query combines its legs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Fusion {
+    /// Reciprocal rank fusion: `Σ weight / (rrfK + rank + 1)`; only ranks
+    /// cross legs.
+    #[default]
+    Rrf,
+    /// Distribution-based score fusion: each leg's scores normalized by its
+    /// own mean ± 3 standard deviations to `[0, 1]`, then `Σ weight × score`.
+    Dbsf,
+}
+
+fn default_rrf_k() -> f64 {
+    60.0
+}
+
+fn default_leg_weight() -> f64 {
+    1.0
+}
+
+/// A pairwise join of two record sets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinPairsQuery {
+    /// Left-hand record set.
+    pub left: RecordSet,
+    /// Right-hand record set.
+    pub right: RecordSet,
+    /// How the two sets are joined.
+    pub predicate: JoinPredicate,
+    /// Exclude pairs whose endpoints are the same record.
+    #[serde(default)]
+    pub exclude_same_record: bool,
+    /// Output projection.
+    pub projection: JoinProjection,
+    /// Maximum number of pairs to return.
+    pub limit: u32,
+}
+
+/// One side of a pairwise join.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSet {
+    /// Label the records must carry.
+    pub label: String,
+    /// Native predicate document for this record set.
+    #[serde(default = "empty_object")]
+    pub filter: serde_json::Value,
+}
+
+/// Join condition between two record sets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JoinPredicate {
+    /// Join records whose given properties share values.
+    PropertyOverlap {
+        /// Property on the left record.
+        left_property: String,
+        /// Property on the right record.
+        right_property: String,
+    },
+}
+
+/// Output projection for a pairwise join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JoinProjection {
+    /// Return only the number of matching pairs.
+    Count,
+}
+
+/// Versioned response envelope returned for a [`RequestEnvelope`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseEnvelope {
+    /// Protocol version the server speaks.
+    pub protocol_version: u16,
+    /// Correlation id echoed from the request, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Server-side execution time in milliseconds, echoed by the executor on
+    /// success (E4 stall observability). Absent on envelopes built by older
+    /// servers; clients must treat it as informational, not a deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_timing_ms: Option<u64>,
+    /// The operation result.
+    pub response: Response,
+}
+
+/// The result of an [`Operation`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum Response {
+    /// Schema description.
+    Schema {
+        /// The schema description.
+        schema: SchemaDescription,
+    },
+    /// A count result.
+    Count {
+        /// The count.
+        value: u64,
+    },
+    /// A single record.
+    Record {
+        /// The record as a JSON object.
+        record: serde_json::Value,
+    },
+    /// A page of records.
+    Records {
+        /// The records as JSON objects.
+        records: Vec<serde_json::Value>,
+        /// Total number of matching records.
+        total: u64,
+        /// Present while a cursor has more records. Send it in
+        /// `query.cursor` with a new bounded page size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_id: Option<String>,
+        /// For a vector or hybrid query: the path that answered it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vector_search: Option<VectorSearchReport>,
+        /// For a hybrid query with a text leg: how that leg ran.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_search: Option<TextSearchReport>,
+        /// For a hybrid query with both legs: how they were combined.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fusion: Option<Fusion>,
+    },
+    /// Ranked hits of a text search.
+    TextHits {
+        /// One `{id, score}` object per hit, best first.
+        rows: Vec<serde_json::Value>,
+        /// Number of hits returned.
+        total: u64,
+        /// Changes to the index not yet applied when the search ran: an
+        /// `eventual` index may miss up to this many recent writes.
+        pending: u64,
+    },
+    /// Rows returned by a statement query.
+    Rows {
+        /// The rows as JSON objects.
+        rows: Vec<serde_json::Value>,
+        /// Total number of matching rows.
+        total: u64,
+    },
+    /// Label names.
+    Labels {
+        /// The labels.
+        labels: Vec<String>,
+    },
+    /// Property descriptions.
+    Properties {
+        /// The property descriptions.
+        properties: Vec<PropertyDescription>,
+    },
+    /// Statement-language capability profiles.
+    QueryLanguages {
+        /// The capabilities.
+        languages: Vec<QueryLanguageCapability>,
+    },
+    /// Feature-capability report for clients that must not infer support from a
+    /// version string (Core's Rust-mode negotiation). Flags describe protocol
+    /// features a client may rely on; an absent flag means unsupported.
+    Capabilities {
+        /// The capability flags.
+        capabilities: Vec<String>,
+    },
+    /// Build identity, transport bindings, and configured limits. Clients use
+    /// this with [`Response::QueryLanguages`] to negotiate a pinned contract
+    /// instead of guessing from a server version string.
+    BuildInfo {
+        /// The build info.
+        build: BuildInfo,
+    },
+    /// Query plan introspection (see [`Describe::Explain`]).
+    Explain {
+        /// The query plan.
+        plan: ExplainPlan,
+    },
+    /// Vector query plan introspection (see [`Describe::ExplainVector`]).
+    ExplainVector {
+        /// The vector query plan.
+        plan: ExplainVectorPlan,
+    },
+    /// Relationships as JSON objects.
+    Relationships {
+        /// The relationships.
+        relationships: Vec<serde_json::Value>,
+        /// Total number of matching relationships.
+        total: u64,
+    },
+    /// Distinct property values for a property.
+    PropertyValues {
+        /// The property the values belong to.
+        property: String,
+        /// The returned distinct values.
+        values: Vec<serde_json::Value>,
+        /// Exact distinct total, always reported. Equals `values.len()`
+        /// when untruncated; the untruncated total when `truncated`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        distinct_count: Option<u64>,
+        /// Minimum distinct value (`Range` mode; numeric order for numbers,
+        /// lexical order otherwise). Absent when no comparable scalars.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<serde_json::Value>,
+        /// Maximum distinct value (`Range` mode).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<serde_json::Value>,
+        /// True when `limit` truncated the shipped `values`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        /// Owner counts aligned with `values` (`TopK` mode); empty otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        counts: Vec<u64>,
+        /// True when a value search matched nothing and `values`/`counts`
+        /// hold the property's whole domain instead (`domainOnMiss`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        search_missed: bool,
+    },
+    /// Number of records affected by a mutation.
+    Mutation {
+        /// Number of records affected.
+        affected: u64,
+    },
+    /// Result of a link operation: relationships created, and requested
+    /// pairs already linked by the same type (links are idempotent per pair).
+    Linked {
+        /// Relationships created.
+        created: u64,
+        /// Requested pairs that were already linked.
+        skipped_existing: u64,
+    },
+    /// Result of a graph-language mutation.
+    StatementMutation {
+        /// Rows returned by the statement.
+        rows: Vec<serde_json::Value>,
+        /// Total number of rows returned.
+        total: u64,
+        /// Number of records affected.
+        affected: u64,
+        /// Commit index the mutation landed at.
+        commit_index: u64,
+        /// Optional statement status string.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// Result of ingesting documents.
+    Ingested {
+        /// Number of records ingested.
+        count: u64,
+        /// Number of relationships ingested.
+        #[serde(default)]
+        relationships: u64,
+        /// The ingested records as JSON objects.
+        records: Vec<serde_json::Value>,
+    },
+    /// Records rendered as CSV text.
+    Csv {
+        /// The CSV text: a header row, then one row per record, joined by
+        /// `\r\n`. Empty when no record matched.
+        content: String,
+        /// Number of records rendered.
+        count: u64,
+    },
+    /// A vector index as a JSON object.
+    VectorIndex {
+        /// The index.
+        index: serde_json::Value,
+    },
+    /// A declared index as a JSON object.
+    Index {
+        /// The index.
+        index: serde_json::Value,
+    },
+    /// Declared indexes as JSON objects.
+    Indexes {
+        /// The indexes.
+        indexes: Vec<serde_json::Value>,
+    },
+    /// Vector indexes as JSON objects.
+    VectorIndexes {
+        /// The indexes.
+        indexes: Vec<serde_json::Value>,
+    },
+    /// Statistics for a vector index.
+    VectorIndexStats {
+        /// The statistics.
+        stats: serde_json::Value,
+    },
+    /// Result of upserting vectors.
+    VectorsUpserted {
+        /// Number of vectors updated.
+        updated: u64,
+        /// Number of vectors requested.
+        requested: u64,
+    },
+    /// Records not yet bound to a vector index.
+    VectorIndexCandidates {
+        /// The candidate records.
+        records: Vec<serde_json::Value>,
+        /// Total number of matching candidates.
+        total: u64,
+    },
+    /// A transaction was begun.
+    TransactionBegun {
+        /// The transaction id.
+        transaction_id: String,
+    },
+    /// A mutation was staged in a transaction.
+    TransactionStaged {
+        /// The transaction id.
+        transaction_id: String,
+    },
+    /// An import was staged in a transaction.
+    TransactionIngested {
+        /// The transaction id.
+        transaction_id: String,
+        /// Records staged.
+        count: u64,
+        /// Relationships staged.
+        relationships: u64,
+    },
+    /// A record read inside a transaction.
+    TransactionGet {
+        /// The transaction id.
+        transaction_id: String,
+        /// The record as a JSON object.
+        record: serde_json::Value,
+    },
+    /// The outcome of committing or rolling back a transaction.
+    TransactionOutcome {
+        /// The transaction id.
+        transaction_id: String,
+        /// The final status.
+        status: TransactionStatus,
+        /// Commit index when committed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_index: Option<u64>,
+        /// Human-readable reason for a non-committed outcome.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Whether the client may retry.
+        retryable: bool,
+    },
+    /// A tenant's keys were purged.
+    PurgedTenant {
+        /// Commit index the purge landed at.
+        commit_index: u64,
+    },
+    /// A tenant's data-access policy.
+    Policy {
+        /// The policy, or `None` when the tenant has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<serde_json::Value>,
+        /// Whether the policy is enforced.
+        enforced: bool,
+        /// The policy generation (the commit index that installed it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
+    },
+    /// A logical backup.
+    Backup {
+        /// Commit index the backup was pinned at.
+        commit_index: u64,
+        /// One backup per scope.
+        tenants: Vec<TenantBackup>,
+    },
+    /// Matches of a value search across properties (`query.searchValues`).
+    ValueMatches {
+        /// Matches by descending owner count (ties by label, property, value).
+        matches: Vec<ValueMatchRow>,
+        /// Number of matches before `limit`.
+        total: u64,
+        /// Properties that could not be searched (e.g. over a resource limit),
+        /// as `label.property`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<String>,
+    },
+    /// Name suggestions (`describe.names`), best first.
+    Names {
+        /// The suggestions.
+        names: Vec<NameSuggestion>,
+    },
+    /// A compact schema (`describe.schemaSummary`).
+    SchemaSummary {
+        /// One entry per label, by name.
+        labels: Vec<LabelSummary>,
+    },
+    /// Value overlap per requested pair (`describe.valueOverlap`), in
+    /// request order.
+    ValueOverlap {
+        /// One entry per pair.
+        pairs: Vec<ValueOverlap>,
+    },
+}
+
+/// One stored value matching a cross-property value search.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValueMatchRow {
+    /// The label holding the value.
+    pub label: String,
+    /// The property holding the value.
+    pub property: String,
+    /// The value, as the records response renders it.
+    pub value: serde_json::Value,
+    /// Records of `label` holding it.
+    pub count: u64,
+}
+
+/// A label or property spelled like a requested name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NameSuggestion {
+    /// The label (the suggestion itself, or the property's label).
+    pub label: String,
+    /// The property, when the suggestion is a property.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>,
+    /// Spelling similarity, from 0 to 1 (1: equal ignoring case, separators
+    /// and plural endings).
+    pub score: f64,
+}
+
+/// One label of a compact schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelSummary {
+    /// The label.
+    pub name: String,
+    /// Records with the label.
+    pub records_count: u64,
+    /// Its properties, by name.
+    pub properties: Vec<PropertySummary>,
+    /// Relationship shapes touching the label.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipSummary>,
+}
+
+/// One property of a [`LabelSummary`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PropertySummary {
+    /// The property name.
+    pub name: String,
+    /// Display type (`string`, `number`, `boolean`, `datetime`, `null`).
+    #[serde(rename = "type")]
+    pub value_type: String,
+    /// Records of the label carrying it.
+    pub records_count: u64,
+    /// True when any occurrence is an array.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_array: bool,
+    /// The other stored types of a type-split property, as
+    /// `describe.properties` lists them (e.g. `["float64"]` on an `int64`
+    /// entry).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sibling_types: Vec<String>,
+    /// Exact distinct values under the label (absent for arrays, whose
+    /// values are whole arrays). Values too long for the value dictionary
+    /// are counted from the occurrences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct_count: Option<u64>,
+    /// Smallest value (numbers and datetimes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<serde_json::Value>,
+    /// Largest value (numbers and datetimes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<serde_json::Value>,
+    /// Every value, by descending count, when there are at most
+    /// `fewValues` of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<serde_json::Value>,
+}
+
+/// A relationship shape of a [`LabelSummary`], seen from that label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipSummary {
+    /// The relationship type.
+    #[serde(rename = "type")]
+    pub relationship_type: String,
+    /// The label at the other end.
+    pub label: String,
+    /// `out` when this label is the source, `in` when it is the target.
+    pub direction: String,
+    /// Relationships of this shape.
+    pub count: u64,
+}
+
+/// How much of a source property's values a target property holds, from
+/// the exact value dictionaries (`describe.valueOverlap`). Values compare as
+/// text, so a numeric id matches the same id stored as a string.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValueOverlap {
+    /// The source property.
+    pub source: JoinEnd,
+    /// The target property.
+    pub target: JoinEnd,
+    /// Distinct source values (absent when not compared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_distinct: Option<u64>,
+    /// Distinct target values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_distinct: Option<u64>,
+    /// Distinct source values the target also holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_distinct: Option<u64>,
+    /// Source records whose value the target holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_records: Option<u64>,
+    /// `matchedDistinct / sourceDistinct`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<f64>,
+    /// Source distinct values per source record carrying the property (1:
+    /// every record has its own value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_uniqueness: Option<f64>,
+    /// Target distinct values per target record carrying the property (1:
+    /// a key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_uniqueness: Option<f64>,
+    /// When (nearly) all values of both are numbers: the source's value span
+    /// as a share of the target's (codes 1..9 inside ids 1..11,060 score
+    /// about 0.001).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numeric_span: Option<f64>,
+    /// Why the values were not compared (no such property, arrays, long
+    /// values, too many values, or withheld under a policy's `minCount`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_compared: Option<String>,
+}
+
+/// Query plan introspection for a `QueryDocument`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplainPlan {
+    /// Access path selected by the planner: `index:<name>` for a declared
+    /// ordered index, `property_walk:<property>` when an unindexed predicate
+    /// leaf narrows the candidates (see `unindexedWalk`), else `label_scan`
+    /// or `full_scan`.
+    pub access_path: String,
+    /// The unindexed walk the access path starts with: the property, the
+    /// owners carrying it that are visited, and the ordered indexes that
+    /// would answer the leaf instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unindexed_walk: Option<UnindexedWalk>,
+    /// Labels the scan is constrained to (empty = all labels).
+    pub labels: Vec<String>,
+    /// Residual filter applied after the access path (the predicate).
+    pub predicate: serde_json::Value,
+    /// Bounded estimate of rows the scan would visit (sum of label members).
+    pub scan_estimate: u64,
+    /// Exact cardinality of the most selective index-eligible predicate leaf
+    ///, or `None` when the predicate is not index-eligible. Derived
+    /// from the maintained posting cardinality; never an approximation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cardinality: Option<u64>,
+    /// Selectivity fraction (`0.0`-`1.0`) for the first range leaf
+    /// (`$gt`/`$gte`/`$lt`/`$lte`) in the predicate, from the maintained
+    /// value-distribution histogram, or `None` when the predicate has no
+    /// range leaf or no usable histogram exists yet. A genuinely separate
+    /// field from `estimated_cardinality`: this one is always approximate,
+    /// by design, and must never be read as if it were exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_selectivity_estimate: Option<f64>,
+    /// Page bound applied by the query.
+    pub limit: Option<u64>,
+    /// Offset applied by the query.
+    pub offset: u64,
+}
+
+/// An unindexed predicate walk reported by `EXPLAIN`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnindexedWalk {
+    /// The (normalized) property the walk reads.
+    pub property: String,
+    /// Owners carrying the property that the walk visits, one point read
+    /// each.
+    pub owners: u64,
+    /// One ordered index per walked label that would answer the leaf.
+    pub suggested_indexes: Vec<IndexSuggestion>,
+}
+
+/// An ordered index `EXPLAIN` suggests declaring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexSuggestion {
+    /// The label the index belongs to.
+    pub label: String,
+    /// The indexed property.
+    pub property: String,
+}
+
+/// Vector query plan introspection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplainVectorPlan {
+    /// Access path (`vector_index`).
+    pub access_path: String,
+    /// The canonical index alias the query resolves to.
+    pub alias: String,
+    /// Label the query is scoped to.
+    pub label: String,
+    /// Number of records matching the predicate (the candidate set the vector
+    /// search is filtered to — filter-before-top-k).
+    pub candidate_count: u64,
+    /// Top-k requested (offset + limit).
+    pub k: usize,
+    /// Residual predicate applied as the candidate filter.
+    pub predicate: serde_json::Value,
+}
+
+/// A bound transport listener on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransportBinding {
+    /// Transport name: `http`, `pgwire`, `grpc`, or `bolt`.
+    pub transport: String,
+    /// Bound port (0 when the transport is disabled).
+    pub port: u16,
+    /// Whether the listener serves TLS.
+    pub tls: bool,
+}
+
+/// Version/build identity, transport bindings, and configured limits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildInfo {
+    /// Engine identifier.
+    pub engine: String,
+    /// Engine semantic version (`CARGO_PKG_VERSION`).
+    pub version: String,
+    /// Optional build revision (git commit) embedded at compile time.
+    pub build_revision: Option<String>,
+    /// The wire protocol version this build speaks.
+    pub protocol_version: u16,
+    /// Listeners bound at startup.
+    pub transports: Vec<TransportBinding>,
+    /// Configured limits as a flat map of numeric values
+    /// (`maxRequestBytes`, `storageBudgetBytes`, `transactionBudgetBytes`,
+    /// `transactionTimeoutMs`).
+    pub limits: std::collections::BTreeMap<String, u64>,
+    /// Address clients should use to reach this node, when it differs from the
+    /// bind address (multi-host / NAT deployments).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_address: Option<String>,
+}
+
+/// Honest delivery status for a statement-language profile. The engine
+/// advertises what it already does (`Stable`) and labels the rest explicitly
+/// (`ReleaseCandidate` / `ComingSoon`) instead of implying full support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageStatus {
+    /// The documented profile is delivered and exercised by the test suite.
+    Stable,
+    /// Read+write implemented via the community planner, but the standard's
+    /// conformance gate (TCK / public corpus) is not yet green.
+    ReleaseCandidate,
+    /// Not implemented; clients can plan against the advertised shape.
+    ComingSoon,
+}
+
+/// Capability advertisement for a single statement language.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryLanguageCapability {
+    /// The language this profile describes.
+    pub language: StatementLanguage,
+    /// Honest delivery status: Stable (already done for the documented
+    /// profile), `ReleaseCandidate` (implemented but conformance gates not yet
+    /// green), or `ComingSoon` (advertised but not implemented).
+    pub status: LanguageStatus,
+    /// Versioned standards/dialect profile implemented by the frontend.
+    pub profile: String,
+    /// Community planner/executor that owns parsing and semantics.
+    pub implementation: String,
+    /// Read/write access supported by the profile.
+    pub access: StatementAccess,
+    /// Parameter styles the profile accepts.
+    #[serde(default)]
+    pub parameter_styles: Vec<ParameterStyle>,
+    /// Transports exposing the read-authorized statement operation.
+    #[serde(default)]
+    pub transports: Vec<StatementTransport>,
+    /// Transports that expose the write-authorized statement operation. This
+    /// is empty for read-only profiles and can be narrower than `transports`.
+    #[serde(default)]
+    pub mutation_transports: Vec<StatementTransport>,
+    /// Stable feature identifiers implemented by this profile.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Explicit boundaries clients must not mistake for full-standard support.
+    #[serde(default)]
+    pub limitations: Vec<String>,
+}
+
+/// Read/write access supported by a statement-language profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StatementAccess {
+    /// Only read statements are permitted.
+    ReadOnly,
+    /// Read and write statements are permitted.
+    ReadWrite,
+}
+
+/// Parameter binding style accepted by a statement-language profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ParameterStyle {
+    /// Positional placeholders.
+    Positional,
+    /// Named placeholders.
+    Named,
+}
+
+/// Transport exposing a statement-language profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StatementTransport {
+    /// The JSON protocol itself.
+    ProtocolJson,
+    /// The PostgreSQL wire protocol.
+    Pgwire,
+}
+
+/// A single tenant's portion of a logical backup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantBackup {
+    /// Scope value, or `None` in single-tenant mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// JSONL payload: one logical line per record/relationship as of the
+    /// pinned commit index. Restorable via `rushdb-backup::restore_backup`.
+    pub jsonl: String,
+    /// Number of records in the payload.
+    pub records: u64,
+    /// Number of relationships in the payload.
+    pub relationships: u64,
+}
+
+/// Schema summary for a scoped graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaDescription {
+    /// Label summaries.
+    pub labels: Vec<LabelDescription>,
+    /// Property summaries.
+    pub properties: Vec<PropertyDescription>,
+    /// Relationship summaries.
+    pub relationships: Vec<RelationshipDescription>,
+}
+
+/// Summary of a label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelDescription {
+    /// Label name.
+    pub name: String,
+    /// Number of records carrying the label.
+    pub records_count: u64,
+}
+
+/// Summary of a property.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PropertyDescription {
+    /// Stable property id.
+    pub id: String,
+    /// Normalized property name.
+    pub name: String,
+    /// Display type name.
+    #[serde(rename = "type")]
+    pub value_type: String,
+    /// Number of records carrying the property.
+    pub records_count: u64,
+    /// The label this property occurrence was observed on (present when the
+    /// describe scan attributed occurrences per label; the Core schema cache
+    /// groups properties by label without per-label record scans).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// True when any occurrence of this property is stored as an array
+    /// (`OrderedMany` cardinality); schema consumers render it as e.g. `string[]`.
+    #[serde(default)]
+    pub is_array: bool,
+    /// Other canonical types sharing this normalized property name (E8
+    /// type-split siblings, e.g. `["float64"]` on the `(X,int64)` entry when
+    /// X also exists as float with partitioned support). Empty when the name
+    /// has a single type; a non-empty marker tells clients not to trust a
+    /// cached single-type definition. Logical names (`int64`/`float64`) are
+    /// used deliberately: the display `type` collapses both to `number`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sibling_types: Vec<String>,
+    /// Bounded distinct scalar values observed during the describe scan
+    /// (cap `SCHEMA_SAMPLE_CAP`), so schema consumers do not need to sample
+    /// records themselves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_values: Vec<serde_json::Value>,
+    /// Minimum scalar value observed (numeric order for numbers, lexical
+    /// order for strings/ISO datetimes). `None` when the scan saw no
+    /// comparable scalars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<serde_json::Value>,
+    /// Maximum scalar value observed (numeric order for numbers, lexical
+    /// order for strings/ISO datetimes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<serde_json::Value>,
+}
+
+/// One directed relationship shape present in the scoped graph.
+///
+/// Schema descriptions aggregate concrete edges by `(source label, type,
+/// target label)`. Tenant scope is enforced before aggregation and its
+/// differentiator property is never exposed as relationship metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipDescription {
+    /// Label of the source endpoint.
+    pub source_label: String,
+    /// Label of the target endpoint.
+    pub target_label: String,
+    /// Relationship type.
+    #[serde(rename = "type")]
+    pub relationship_type: String,
+    /// Number of edges with this shape.
+    pub count: u64,
+    /// Properties observed on these edges.
+    pub properties: Vec<RelationshipPropertyDescription>,
+}
+
+/// Summary of a property on a relationship shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipPropertyDescription {
+    /// Normalized property name.
+    pub name: String,
+    /// Display type name.
+    #[serde(rename = "type")]
+    pub value_type: String,
+    /// Number of relationships carrying the property.
+    pub relationships_count: u64,
+}
+
+/// Final status of a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionStatus {
+    /// Committed successfully.
+    Committed,
+    /// Rolled back explicitly by the client.
+    RolledBack,
+    /// Aborted due to a conflict or error.
+    Aborted,
+    /// Expired before completion.
+    Expired,
+    /// Outcome could not be determined.
+    Unknown,
+}
+
+/// Machine-readable error taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// The request's protocol version is not supported.
+    UnsupportedVersion,
+    /// The request violated the protocol contract.
+    ProtocolViolation,
+    /// The request was malformed.
+    InvalidRequest,
+    /// The caller is not authorized.
+    Unauthorized,
+    /// A required scope was missing.
+    MissingScope,
+    /// The request scope did not match the authorized scope.
+    ScopeMismatch,
+    /// The target does not exist.
+    NotFound,
+    /// The request conflicts with current state.
+    Conflict,
+    /// The operation was cancelled.
+    Cancelled,
+    /// A server resource budget was exhausted.
+    ResourceExhausted,
+    /// The service is temporarily unavailable.
+    Unavailable,
+    /// Execution failed.
+    ExecutionFailed,
+    /// A query language is not enabled at startup (config.yml / --languages).
+    LanguageDisabled,
+    /// The requested form is recognized but not implemented by this engine
+    /// (e.g. Mongo `$lookup`/`$text`/`$geoNear`/full `$unwind`). Append-only.
+    Unsupported,
+    /// A write conflict under snapshot isolation (first-committer-wins). The
+    /// transaction was aborted at commit and may be retried. Distinct from
+    /// [`ErrorCode::Conflict`], which is a non-retryable constraint/state
+    /// conflict. Append-only.
+    WriteConflict,
+}
+
+/// A structured protocol error with a stable [`ErrorCode`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{message}")]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolError {
+    /// Machine-readable error code.
+    pub code: ErrorCode,
+    /// Human-readable error message.
+    pub message: String,
+    /// Whether the caller may safely retry.
+    pub retryable: bool,
+}
+
+/// Executes a canonical envelope under an optional tenant scope. Implemented
+/// by the engine side (the server crate); gRPC and Bolt transports consume it
+/// so neither depends on the server crate (no dependency cycle).
+pub trait EnvelopeHandler: Send + Sync + 'static {
+    /// Execute one request envelope under an optional tenant scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] when the envelope is rejected or the
+    /// operation fails.
+    fn execute(
+        &self,
+        envelope: RequestEnvelope,
+        scope: Option<String>,
+    ) -> Result<ResponseEnvelope, ProtocolError>;
+
+    /// Whether the owning service has begun shutdown and new transport work
+    /// should stop. Transports use this optional lifecycle hook to drain
+    /// active requests without coupling the protocol crate to storage.
+    fn shutdown_requested(&self) -> bool {
+        false
+    }
+}
+
+impl ProtocolError {
+    /// Create an error, deriving `retryable` from the error code.
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        let retryable = matches!(
+            code,
+            ErrorCode::ResourceExhausted | ErrorCode::Unavailable | ErrorCode::WriteConflict
+        );
+        Self {
+            code,
+            message: message.into(),
+            retryable,
+        }
+    }
+
+    /// Override the derived `retryable` flag.
+    #[must_use]
+    pub fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
+    }
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+fn default_similarity() -> String {
+    "cosine".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_secrets() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secrez"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn join_query_roundtrips_with_stable_camel_case_shape() {
+        let envelope = RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Some("request-1".into()),
+            context: RequestContext {
+                scope: Some("scope-a".into()),
+                deadline_ms: Some(250),
+                ..Default::default()
+            },
+            operation: Operation::Query {
+                query: Query::JoinPairs(JoinPairsQuery {
+                    left: RecordSet {
+                        label: "CHARACTER".into(),
+                        filter: serde_json::json!({ "active": true }),
+                    },
+                    right: RecordSet {
+                        label: "PLANET".into(),
+                        filter: serde_json::json!({}),
+                    },
+                    predicate: JoinPredicate::PropertyOverlap {
+                        left_property: "homePlanetId".into(),
+                        right_property: "id".into(),
+                    },
+                    exclude_same_record: true,
+                    projection: JoinProjection::Count,
+                    limit: 100,
+                }),
+            },
+        };
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["protocolVersion"], 1);
+        assert_eq!(json["operation"]["kind"], "query");
+        assert_eq!(json["operation"]["query"]["kind"], "joinPairs");
+        assert_eq!(json["operation"]["query"]["excludeSameRecord"], true);
+        assert_eq!(json["context"]["deadlineMs"], 250);
+        assert_eq!(
+            json["operation"]["query"]["predicate"]["leftProperty"],
+            "homePlanetId"
+        );
+        assert_eq!(
+            serde_json::from_value::<RequestEnvelope>(json).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn statement_languages_share_one_versioned_wire_shape() {
+        for language in [
+            StatementLanguage::Sql,
+            StatementLanguage::Gql,
+            StatementLanguage::Cypher,
+            StatementLanguage::Gremlin,
+            StatementLanguage::SqlPgq,
+        ] {
+            let envelope = RequestEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Some(format!("language-{language:?}")),
+                context: RequestContext::default(),
+                operation: Operation::Query {
+                    query: Query::Statement {
+                        language,
+                        statement: "MATCH (n) RETURN n".into(),
+                        parameters: Some(serde_json::json!({"limit": 10})),
+                    },
+                },
+            };
+            let encoded = serde_json::to_value(&envelope).unwrap();
+            assert_eq!(encoded["operation"]["query"]["kind"], "statement");
+            assert!(encoded["operation"]["query"]["language"].is_string());
+            assert_eq!(
+                serde_json::from_value::<RequestEnvelope>(encoded).unwrap(),
+                envelope
+            );
+        }
+    }
+
+    #[test]
+    fn query_language_capabilities_are_versioned_protocol_data() {
+        let response = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Some("languages".into()),
+            server_timing_ms: None,
+            response: Response::QueryLanguages {
+                languages: vec![QueryLanguageCapability {
+                    language: StatementLanguage::Sql,
+                    status: LanguageStatus::Stable,
+                    profile: "PostgreSQL-dialect relational SQL".into(),
+                    implementation: "Apache DataFusion".into(),
+                    access: StatementAccess::ReadWrite,
+                    parameter_styles: vec![ParameterStyle::Positional, ParameterStyle::Named],
+                    transports: vec![StatementTransport::ProtocolJson, StatementTransport::Pgwire],
+                    mutation_transports: vec![StatementTransport::ProtocolJson],
+                    features: vec!["select".into(), "preparedStatements".into()],
+                    limitations: vec!["pgwireReadOnly".into()],
+                }],
+            },
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["response"]["kind"], "queryLanguages");
+        assert_eq!(encoded["response"]["languages"][0]["access"], "readWrite");
+        assert_eq!(
+            encoded["response"]["languages"][0]["transports"][1],
+            "pgwire"
+        );
+        assert_eq!(
+            encoded["response"]["languages"][0]["mutationTransports"][0],
+            "protocolJson"
+        );
+        assert_eq!(
+            serde_json::from_value::<ResponseEnvelope>(encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn writable_statements_have_a_distinct_write_authorized_wire_shape() {
+        let envelope = RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Some("cypher-write".into()),
+            context: RequestContext::default(),
+            operation: Operation::Mutate {
+                mutation: Mutation::Statement {
+                    language: StatementLanguage::Cypher,
+                    statement: "CREATE (:Person {name: $name})".into(),
+                    parameters: Some(serde_json::json!({"name": "Ada"})),
+                },
+            },
+        };
+        let encoded = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(encoded["operation"]["kind"], "mutate");
+        assert_eq!(encoded["operation"]["mutation"]["kind"], "statement");
+        assert_eq!(
+            serde_json::from_value::<RequestEnvelope>(encoded).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn typed_transaction_roundtrips_without_an_embedded_json_command_language() {
+        let request = RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Some("tx-stage-1".into()),
+            context: RequestContext::default(),
+            operation: Operation::Transaction {
+                transaction: TransactionOperation::Stage {
+                    transaction_id: "tx-1".into(),
+                    mutation: TransactionMutation::CreateRecord {
+                        label: "Person".into(),
+                        id: None,
+                        properties: serde_json::json!({ "name": "Ada" }),
+                        options: serde_json::json!({}),
+                    },
+                },
+            },
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["operation"]["kind"], "transaction");
+        assert_eq!(encoded["operation"]["transaction"]["kind"], "stage");
+        assert_eq!(
+            encoded["operation"]["transaction"]["mutation"]["kind"],
+            "createRecord"
+        );
+        assert_eq!(
+            serde_json::from_value::<RequestEnvelope>(encoded).unwrap(),
+            request
+        );
+    }
+}
+
+#[cfg(test)]
+mod compatibility {
+    /// A protocol compatibility test that rejects accidental breaking changes:
+    /// pins the wire version and the discriminant order of the error taxonomy.
+    /// Adding a variant to `ErrorCode` must go at the END; reordering or
+    /// removing a variant is a breaking change and must bump `PROTOCOL_VERSION`.
+    #[test]
+    fn protocol_version_is_one_and_error_code_order_is_stable() {
+        assert_eq!(super::PROTOCOL_VERSION, 1);
+        let codes = [
+            super::ErrorCode::UnsupportedVersion,
+            super::ErrorCode::ProtocolViolation,
+            super::ErrorCode::InvalidRequest,
+            super::ErrorCode::Unauthorized,
+            super::ErrorCode::MissingScope,
+            super::ErrorCode::ScopeMismatch,
+            super::ErrorCode::NotFound,
+            super::ErrorCode::Conflict,
+            super::ErrorCode::Cancelled,
+            super::ErrorCode::ResourceExhausted,
+            super::ErrorCode::Unavailable,
+            super::ErrorCode::ExecutionFailed,
+            super::ErrorCode::LanguageDisabled,
+            super::ErrorCode::Unsupported,
+            super::ErrorCode::WriteConflict,
+        ];
+        for (i, code) in codes.iter().enumerate() {
+            // Discriminant order is the wire contract; assert it explicitly.
+            assert_eq!(
+                *code as u8,
+                u8::try_from(i).expect("ErrorCode count fits in u8"),
+                "ErrorCode discriminant {i} moved"
+            );
+        }
+    }
+}
