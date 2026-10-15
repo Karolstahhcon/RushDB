@@ -475,3 +475,481 @@ fn read_segment(
 
     let mut header = [0u8; LOG_SEGMENT_HEADER_LEN];
     if !matches!(read_full(&mut file, &mut header)?, ReadFull::Full) {
+        return Err(corrupt("segment shorter than its header".into()));
+    }
+    if header[0..8] != LOG_SEGMENT_MAGIC {
+        return Err(corrupt("invalid segment magic".into()));
+    }
+    let version = u32::from_le_bytes(header[8..12].try_into().expect("slice"));
+    if version != WAL_FORMAT_VERSION {
+        return Err(corrupt(format!("unsupported segment version {version}")));
+    }
+    let segment_shard = u32::from_le_bytes(header[12..16].try_into().expect("slice"));
+    if segment_shard != shard_id {
+        return Err(corrupt(format!(
+            "segment shard {segment_shard} does not match {shard_id}"
+        )));
+    }
+
+    let mut offset = LOG_SEGMENT_HEADER_LEN as u64;
+    let mut records = Vec::new();
+    let mut record_offsets = Vec::new();
+    loop {
+        let record_start = offset;
+        let mut record_header = [0u8; LOG_RECORD_HEADER_LEN];
+        match read_full(&mut file, &mut record_header)? {
+            ReadFull::Full => {}
+            ReadFull::CleanEof => break,
+            ReadFull::Partial => {
+                if allow_tail {
+                    break;
+                }
+                return Err(corrupt("torn record header".into()));
+            }
+        }
+        let payload_len =
+            u32::from_le_bytes(record_header[24..28].try_into().expect("slice")) as usize;
+        if payload_len > MAX_RECORD_BYTES {
+            if allow_tail {
+                break;
+            }
+            return Err(corrupt("record payload exceeds 64 MiB".into()));
+        }
+        let mut raw = Vec::with_capacity(LOG_RECORD_HEADER_LEN + payload_len);
+        raw.extend_from_slice(&record_header);
+        raw.resize(LOG_RECORD_HEADER_LEN + payload_len, 0);
+        if !matches!(
+            read_full(&mut file, &mut raw[LOG_RECORD_HEADER_LEN..])?,
+            ReadFull::Full
+        ) {
+            if allow_tail {
+                break;
+            }
+            return Err(corrupt("torn record payload".into()));
+        }
+        match decode_wal_record(&raw) {
+            Ok((record, _)) => {
+                records.push((record.lsn, raw));
+                record_offsets.push(record_start);
+                offset += (LOG_RECORD_HEADER_LEN + payload_len) as u64;
+            }
+            Err(error) => {
+                if allow_tail {
+                    break;
+                }
+                return Err(corrupt(format!("record checksum/format: {error}")));
+            }
+        }
+    }
+
+    // Chain completeness: every physically well-formed record read above
+    // must also form logically complete chains. `valid_count` shrinks from
+    // `records.len()` only if a chain-structure error is found (treated
+    // exactly like a torn physical record) or the scan ends with a chain
+    // still open (a crash mid-chain) — see this function's doc comment.
+    let mut assembler = crate::wal::ChainAssembler::default();
+    let mut valid_count = records.len();
+    for (i, (_, raw)) in records.iter().enumerate() {
+        if let Err(detail) = assembler.feed(raw, record_offsets[i]) {
+            if !allow_tail {
+                return Err(corrupt(detail));
+            }
+            valid_count = i;
+            break;
+        }
+    }
+    if valid_count == records.len() {
+        if let Some(open_start) = assembler.open_start_offset() {
+            if !allow_tail {
+                return Err(corrupt(
+                    "sealed segment ends with an incomplete chained commit".into(),
+                ));
+            }
+            valid_count = record_offsets.partition_point(|&o| o < open_start);
+        }
+    }
+    let valid_bytes = record_offsets.get(valid_count).copied().unwrap_or(offset);
+    records.truncate(valid_count);
+
+    Ok((records, valid_bytes, file_len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wal::{encode_chained_ops_record, encode_wal_record};
+
+    fn temp_dir() -> crate::TempPath {
+        crate::TempPath::dir("logstore")
+    }
+
+    /// Fragments of one chained commit at `lsn`, as `append_batch` expects
+    /// them: several entries sharing one LSN.
+    fn chained_records(
+        lsn: u64,
+        ops: &[crate::Op],
+        max_record_bytes: usize,
+    ) -> Vec<(u64, Vec<u8>)> {
+        encode_chained_ops_record(0, lsn, ops, None, max_record_bytes)
+            .into_iter()
+            .map(|framed| (lsn, framed))
+            .collect()
+    }
+
+    fn big_ops(n: usize, value_len: usize) -> Vec<crate::Op> {
+        (0..n)
+            .map(|i| crate::Op::Put(format!("k{i}").into_bytes(), vec![b'x'; value_len]))
+            .collect()
+    }
+
+    #[test]
+    fn chained_commit_advances_next_lsn_once_not_per_fragment() {
+        let dir = temp_dir();
+        let mut log = LogStore::open(&dir, 0, 1 << 30).unwrap();
+        let ops = big_ops(20, 200);
+        let fragments = chained_records(1, &ops, 1024);
+        assert!(fragments.len() > 1, "expected this commit to need chaining");
+        log.append_batch(&fragments).unwrap();
+        assert_eq!(
+            log.next_lsn(),
+            2,
+            "a multi-fragment commit must advance next_lsn exactly once"
+        );
+        log.sync().unwrap();
+        let all = log.read_from(1).unwrap();
+        assert_eq!(
+            all.len(),
+            fragments.len(),
+            "every physical fragment is durable"
+        );
+
+        // The next commit continues at lsn 2, unaffected by how many physical
+        // records the chained commit took.
+        log.append_batch(&[record(2, b"small")]).unwrap();
+        assert_eq!(log.next_lsn(), 3);
+    }
+
+    #[test]
+    fn chained_commit_never_splits_across_a_segment_boundary() {
+        let dir = temp_dir();
+        // A small rotation threshold that a chained commit's total size will
+        // comfortably exceed on its own, to prove rotation happens *before*
+        // the chain starts, not partway through it.
+        let mut log = LogStore::open(&dir, 0, 512).unwrap();
+        let ops = big_ops(30, 100);
+        let fragments = chained_records(1, &ops, 1024);
+        assert!(fragments.len() > 1);
+        log.append_batch(&fragments).unwrap();
+        log.sync().unwrap();
+
+        // Every one of the chain's fragments must land in exactly one
+        // segment (the active one at the time the chain started).
+        let owning_segments: std::collections::HashSet<u64> = log
+            .segments()
+            .iter()
+            .filter(|s| s.first_lsn <= 1 && s.last_lsn >= 1)
+            .map(|s| s.first_lsn)
+            .collect();
+        assert_eq!(
+            owning_segments.len(),
+            1,
+            "a chained commit must not be split across segment files"
+        );
+    }
+
+    #[test]
+    fn reopen_discards_an_incomplete_trailing_chain_and_retry_at_the_same_lsn_succeeds() {
+        let dir = temp_dir();
+        {
+            let mut log = LogStore::open(&dir, 0, 1 << 30).unwrap();
+            log.append_batch(&[record(1, b"first")]).unwrap();
+            log.sync().unwrap();
+        }
+        // Simulate a crash mid-chain: append only the non-final fragments of
+        // a chained commit at lsn 2 (drop the final fragment, as if the
+        // process died before writing it).
+        let ops = big_ops(10, 200);
+        let fragments = encode_chained_ops_record(0, 2, &ops, None, 512);
+        assert!(
+            fragments.len() > 2,
+            "need at least one continue + the final"
+        );
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(dir.join(segment_file_name(1)))
+                .unwrap();
+            for framed in &fragments[..fragments.len() - 1] {
+                file.write_all(framed).unwrap();
+            }
+            file.sync_all().unwrap();
+        }
+        let before_len = std::fs::metadata(dir.join(segment_file_name(1)))
+            .unwrap()
+            .len();
+
+        let mut log = LogStore::open(&dir, 0, 1 << 30).unwrap();
+        assert_eq!(
+            log.next_lsn(),
+            2,
+            "the incomplete chain must not advance past its own lsn"
+        );
+        assert_eq!(
+            log.read_from(1).unwrap().len(),
+            1,
+            "only the first, complete commit survives"
+        );
+        let after_len = std::fs::metadata(dir.join(segment_file_name(1)))
+            .unwrap()
+            .len();
+        assert!(
+            after_len < before_len,
+            "the incomplete chain's bytes must be truncated away"
+        );
+
+        // A retry at the same, abandoned lsn must succeed cleanly — proving
+        // the stale fragments were truly removed, not just ignored (which
+        // would otherwise corrupt a later replay by gluing new fragments
+        // onto old garbage sharing the same lsn).
+        log.append_batch(&[record(2, b"retry")]).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.next_lsn(), 3);
+        let all = log.read_from(1).unwrap();
+        assert_eq!(all.len(), 2);
+        let (_, ops, _) = crate::wal::decode_ops_record(&all[1].1).unwrap();
+        assert_eq!(ops, vec![crate::Op::Put(Vec::new(), b"retry".to_vec())]);
+    }
+
+    /// Regression: a record whose *content* is corrupt (an embedded
+    /// command that fails to parse as JSON) is structurally complete — a
+    /// well-formed, checksummed, non-chained `WITH_COMMAND` frame — and
+    /// must survive reopen untouched. The chain-completeness recovery pass
+    /// must never fully decode a record's content just to decide whether a
+    /// trailing chain is open; doing so would misclassify this as "looks
+    /// like a torn write" and silently truncate a perfectly durable record
+    /// whose only problem is a corrupt payload one layer up.
+    #[test]
+    fn reopen_never_truncates_a_structurally_complete_record_with_corrupt_content() {
+        let dir = temp_dir();
+        {
+            let mut log = LogStore::open(&dir, 0, 1 << 30).unwrap();
+            let framed = crate::wal::encode_ops_record(0, 1, &[], Some(b"not-json"));
+            log.append_batch(&[(1, framed)]).unwrap();
+            log.sync().unwrap();
+        }
+        let log = LogStore::open(&dir, 0, 1 << 30).unwrap();
+        assert_eq!(
+            log.next_lsn(),
+            2,
+            "a structurally complete record must not be discarded"
+        );
+        let all = log.read_from(1).unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "the corrupt-content record must survive reopen"
+        );
+        // Decoding it explicitly (as a real caller needing its content
+        // would) still correctly surfaces the content error — it is simply
+        // never used as a signal to truncate during recovery.
+        assert!(crate::wal::decode_ops_record(&all[0].1).is_err());
+    }
+
+    /// A real, decodable wal.rs-formatted record (one `Op::Put` carrying
+    /// `payload` as its value) — not raw bytes — since `read_segment`'s
+    /// chain-completeness pass now interprets every record's kind byte, the
+    /// same as production (`Store::append_log` never writes anything else).
+    fn record(lsn: u64, payload: &[u8]) -> (u64, Vec<u8>) {
+        let ops = vec![crate::Op::Put(Vec::new(), payload.to_vec())];
+        (lsn, crate::wal::encode_ops_record(0, lsn, &ops, None))
+    }
+
+    #[test]
+    fn append_sync_read_round_trip() {
+        let dir = temp_dir();
+        let mut log = LogStore::open(&dir, 0, 1 << 20).unwrap();
+        assert_eq!(log.next_lsn(), 1);
+        assert_eq!(log.durable_lsn(), 0);
+        log.append_batch(&[record(1, b"a"), record(2, b"bb"), record(3, b"ccc")])
+            .unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.durable_lsn(), 3);
+        assert_eq!(log.next_lsn(), 4);
+
+        let all = log.read_from(1).unwrap();
+        assert_eq!(
+            all.iter().map(|(lsn, _)| *lsn).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let tail = log.read_from(2).unwrap();
+        assert_eq!(tail.iter().map(|(lsn, _)| *lsn).collect::<Vec<_>>(), [2, 3]);
+        assert!(log.read_from(4).unwrap().is_empty());
+    }
+
+    /// A fresh WAL (no segments) opened beside a
+    /// materialization whose checkpoint is already ahead of it — e.g. a
+    /// store opened from a restored base backup with no accompanying WAL
+    /// directory — must continue the commit sequence from that checkpoint,
+    /// not restart at LSN 1 and collide with LSNs the materialization
+    /// already has.
+    #[test]
+    fn seed_next_lsn_if_empty_continues_past_a_restored_checkpoint() {
+        let dir = temp_dir();
+        let mut log = LogStore::open(&dir, 0, 1 << 20).unwrap();
+        assert_eq!(log.next_lsn(), 1);
+
+        log.seed_next_lsn_if_empty(51);
+        assert_eq!(
+            log.next_lsn(),
+            51,
+            "an empty log must adopt the materialization's checkpoint + 1"
+        );
+        log.append_batch(&[record(51, b"a")]).unwrap();
+        assert_eq!(log.next_lsn(), 52);
+
+        // Never seeds backwards past 1 for a genuinely fresh store (no
+        // prior checkpoint at all).
+        let fresh_dir = temp_dir();
+        let mut fresh = LogStore::open(&fresh_dir, 0, 1 << 20).unwrap();
+        fresh.seed_next_lsn_if_empty(1);
+        assert_eq!(fresh.next_lsn(), 1);
+
+        // A no-op once the log has real, recovered history — that `next_lsn`
+        // is authoritative and must never be overridden by a floor.
+        log.seed_next_lsn_if_empty(1_000);
+        assert_eq!(
+            log.next_lsn(),
+            52,
+            "seeding must not touch a log with real segments"
+        );
+    }
+
+    #[test]
+    fn rotates_segments_and_reads_across_them() {
+        let dir = temp_dir();
+        let mut log = LogStore::open(&dir, 0, 120).unwrap();
+        for lsn in 1..=6 {
+            log.append_batch(&[record(lsn, &[0xABu8; 40])]).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(
+            log.segments().len() > 1,
+            "expected rotation, got {} segment(s)",
+            log.segments().len()
+        );
+        let all = log.read_from(1).unwrap();
+        assert_eq!(
+            all.iter().map(|(lsn, _)| *lsn).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn reopen_recovers_state() {
+        let dir = temp_dir();
+        {
+            let mut log = LogStore::open(&dir, 0, 1 << 20).unwrap();
+            log.append_batch(&[record(1, b"x"), record(2, b"y")])
+                .unwrap();
+            log.sync().unwrap();
+        }
+        let log = LogStore::open(&dir, 0, 1 << 20).unwrap();
+        assert_eq!(log.next_lsn(), 3);
+        assert_eq!(log.durable_lsn(), 2);
+        assert_eq!(log.read_from(1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_on_open() {
+        let dir = temp_dir();
+        {
+            let mut log = LogStore::open(&dir, 0, 1 << 20).unwrap();
+            log.append_batch(&[record(1, b"x"), record(2, b"y")])
+                .unwrap();
+            log.sync().unwrap();
+        }
+        // Simulate a crash mid-append: append a partial record to the active
+        // segment (a full 32-byte header claiming a payload that is not there).
+        let segment = dir.join(segment_file_name(1));
+        {
+            let mut file = OpenOptions::new().append(true).open(&segment).unwrap();
+            let framed = encode_wal_record(0, 3, b"a much longer payload");
+            file.write_all(&framed[..framed.len() - 5]).unwrap();
+        }
+        let before = std::fs::metadata(&segment).unwrap().len();
+        let log = LogStore::open(&dir, 0, 1 << 20).unwrap();
+        assert_eq!(log.next_lsn(), 3, "torn record must not advance the LSN");
+        assert_eq!(log.read_from(1).unwrap().len(), 2);
+        let after = std::fs::metadata(&segment).unwrap().len();
+        assert!(after < before, "torn tail must be truncated");
+    }
+
+    #[test]
+    fn sealed_torn_tail_is_corruption() {
+        let dir = temp_dir();
+        {
+            let mut log = LogStore::open(&dir, 0, 120).unwrap();
+            for lsn in 1..=4 {
+                log.append_batch(&[record(lsn, &[0xABu8; 40])]).unwrap();
+            }
+            log.sync().unwrap();
+        }
+        // Damage the first (sealed) segment's last record.
+        let first = dir.join(segment_file_name(1));
+        let mut bytes = std::fs::read(&first).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&first, &bytes).unwrap();
+        let error = LogStore::open(&dir, 0, 120).unwrap_err();
+        assert!(matches!(error, LogError::Corrupt { .. }), "got: {error}");
+    }
+
+    #[test]
+    fn out_of_order_append_is_rejected() {
+        let dir = temp_dir();
+        let mut log = LogStore::open(&dir, 0, 1 << 20).unwrap();
+        log.append_batch(&[record(1, b"a")]).unwrap();
+        let error = log.append_batch(&[record(3, b"c")]).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                LogError::OutOfOrder {
+                    expected: 2,
+                    actual: 3
+                }
+            ),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn truncate_before_removes_only_sealed_segments() {
+        let dir = temp_dir();
+        let mut log = LogStore::open(&dir, 0, 120).unwrap();
+        for lsn in 1..=6 {
+            log.append_batch(&[record(lsn, &[0xABu8; 40])]).unwrap();
+        }
+        log.sync().unwrap();
+        let before = log.segments().len();
+        assert!(before > 1);
+        let active_first = log.segments().last().unwrap().first_lsn;
+        let removed = log.truncate_before(u64::MAX).unwrap();
+        assert_eq!(removed, before - 1, "all sealed segments must go");
+        assert_eq!(log.segments().len(), 1);
+        assert_eq!(log.segments()[0].first_lsn, active_first);
+        // The active segment and its records survive.
+        assert!(!log.read_from(active_first).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_foreign_shard_segment() {
+        let dir = temp_dir();
+        {
+            let mut log = LogStore::open(&dir, 7, 1 << 20).unwrap();
+            log.append_batch(&[record(1, b"a")]).unwrap();
+            log.sync().unwrap();
+        }
+        let error = LogStore::open(&dir, 0, 1 << 20).unwrap_err();
+        assert!(matches!(error, LogError::Corrupt { .. }), "got: {error}");
+    }
+}

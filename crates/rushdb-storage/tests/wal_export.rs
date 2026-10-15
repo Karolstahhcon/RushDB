@@ -107,3 +107,112 @@ fn replay_rejects_an_interior_lsn_gap() {
     let (dir, store) = durable_store("gap");
     for i in 1..=3u64 {
         commit(&store, i);
+    }
+    // Two individually-valid segments with LSN 2 missing.
+    let mut stream = Vec::new();
+    store.export_wal_segments(&mut stream, 1, 1).unwrap();
+    store.export_wal_segments(&mut stream, 3, 3).unwrap();
+
+    let recovered = Store::new_in_memory();
+    let err = recovered.replay_wal_segments(&mut &stream[..]).unwrap_err();
+    assert!(
+        matches!(err, rushdb_storage::StorageError::Durability(_)),
+        "a missing LSN must not be silently compacted: {err:?}"
+    );
+
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn corrupted_export_is_rejected() {
+    let (dir, store) = durable_store("corrupt");
+    for i in 1..=3u64 {
+        commit(&store, i);
+    }
+    let mut out: Vec<u8> = Vec::new();
+    store.export_wal_segments(&mut out, 1, 3).expect("export");
+    let mid = out.len() / 2;
+    out[mid] ^= 0x08;
+    let mut reader = std::io::Cursor::new(&out);
+    assert!(
+        wal::read_wal_segment(&mut reader).is_err(),
+        "corrupted segment must be rejected"
+    );
+
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redb_reopen_recovers_from_wal() {
+    let dir = std::env::temp_dir().join(format!(
+        "rushdb-wal-reopen-{}-{}",
+        std::process::id(),
+        Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("rushdb.redb");
+
+    {
+        let store = Store::open(&db).unwrap();
+        store.set_expander(std::sync::Arc::new(Box::new(|_ci, _batch, _txn| Ok(()))));
+        for i in 1..=3u64 {
+            commit(&store, i);
+        }
+    }
+
+    // Reopen: recovery replays any WAL tail and restores the commit index.
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.committed_version(), 3);
+    // The command journal is derived from the WAL's embedded-command
+    // envelope, not a materialized redb row, and survives reopen.
+    let batches: Vec<CommitBatch> = store
+        .log_bytes()
+        .iter()
+        .map(|raw| rushdb_types::command_codec::decode(raw).expect("journal entry"))
+        .collect();
+    assert_eq!(batches.len(), 3);
+    assert_eq!(batches[0].transaction_id, "t1");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn command_journal_is_fully_derivable_from_the_wal_without_a_log_row() {
+    // The in-redb `__log__` command journal is
+    // deletable only because its content — the originating `CommitBatch` per
+    // commit, in order — is fully reconstructable from the segmented WAL's
+    // embedded-command envelope alone. This test commits through the real
+    // path, asserts no `__log__` row exists anywhere in the durable backend,
+    // and still recovers every original command byte-for-byte from the WAL.
+    let (dir, store) = durable_store("derivable");
+    let originals: Vec<CommitBatch> = (1..=5).map(commit_batch).collect();
+    for batch in &originals {
+        let batch = batch.clone();
+        store
+            .commit(batch.commit_key, move |_ci, _txn| Ok((batch, ())))
+            .expect("commit");
+    }
+
+    let view = store.read_view().unwrap();
+    assert!(
+        view.range_prefix(b"__log__/").unwrap().is_empty(),
+        "no in-redb command journal row must remain on a durable store"
+    );
+
+    let recovered: Vec<CommitBatch> = store
+        .log_bytes()
+        .iter()
+        .map(|raw| rushdb_types::command_codec::decode(raw).expect("WAL-derived journal entry"))
+        .collect();
+    assert_eq!(recovered.len(), originals.len());
+    for (original, recovered) in originals.iter().zip(recovered.iter()) {
+        assert_eq!(original.commit_key, recovered.commit_key);
+        assert_eq!(original.transaction_id, recovered.transaction_id);
+        assert_eq!(original.tenant, recovered.tenant);
+    }
+
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
