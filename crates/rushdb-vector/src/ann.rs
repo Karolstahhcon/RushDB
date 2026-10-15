@@ -894,3 +894,900 @@ impl VectorEngine {
     /// the cache lock; it is published only if the cache entry is still the
     /// one it started from (`Arc::ptr_eq`), otherwise it is discarded and the
     /// next tick retries. Returns the number of spaces changed.
+    ///
+    /// # Errors
+    /// Returns [`VectorError`] when the cache lock is poisoned or a snapshot
+    /// cannot be opened; a failed build for one space is skipped.
+    pub fn maintain_segments(&self) -> Result<usize, VectorError> {
+        let spaces: Vec<(u64, Arc<CachedAnn>)> = self
+            .ann_cache
+            .lock()
+            .map_err(|_| VectorError::Engine("ANN cache mutex poisoned".into()))?
+            .iter()
+            .map(|(id, cached)| (*id, Arc::clone(cached)))
+            .collect();
+        let mut changed = 0;
+        for (space_id, cached) in spaces {
+            #[allow(
+                irrefutable_let_patterns,
+                reason = "refutable only with --features turbovec, which adds AnnBacking::Provider"
+            )]
+            let AnnBacking::Segments(set) = &cached.backing
+            else {
+                continue;
+            };
+            let dims = u32::try_from(cached.dims).unwrap_or(u32::MAX);
+            // ANN is only built for cosine spaces (others answer exactly).
+            let similarity = rushdb_types::occurrence::Similarity::Cosine;
+            let fork = set.fork();
+            let started = std::time::Instant::now();
+            let mut touched = fork
+                .freeze_hot_at_least(
+                    HOT_SEGMENT_FREEZE_THRESHOLD,
+                    dims,
+                    similarity,
+                    self.space_segment_path(space_id).as_deref(),
+                )
+                .unwrap_or_else(|error| {
+                    tracing::warn!(space_id, %error, "freezing the hot ANN segment failed");
+                    false
+                });
+            let froze = touched;
+            // What this pass froze, before it merges: a segment frozen and
+            // merged away in the same pass is in neither `set` nor `fork`.
+            let frozen = fork.fork();
+            let mut merged = 0;
+            let mergeable = self.store.vector_cache_budget().map_or(0, |budget| {
+                budget.available() / build_estimate(1, cached.dims).max(1)
+            });
+            if let Some(ids) = fork.merge_candidates(HOT_SEGMENT_FREEZE_THRESHOLD, mergeable) {
+                let ok = self.merge_into(&fork, space_id, &ids, dims, similarity)?;
+                merged = if ok { ids.len() } else { 0 };
+                touched |= ok;
+            }
+            if !touched {
+                continue;
+            }
+            let backing = AnnBacking::Segments(Arc::new(fork));
+            let reserved =
+                reserve_generation(&self.store, &backing, &cached.generation, cached.dims);
+            // One event per maintenance outcome.
+            tracing::debug!(
+                target: "rushdb_vector::maintain",
+                space_id,
+                froze,
+                merged,
+                elapsed_ms = started.elapsed().as_millis(),
+                bytes = measured_backing_bytes(&backing, &cached.generation, cached.dims),
+                reserved = reserved.is_ok(),
+                "segment maintenance"
+            );
+            let discard = |backing: &AnnBacking| {
+                // Only the segments this pass built, never ones `set` holds.
+                frozen.supersede_absent_from(set);
+                fork_set(backing).supersede_absent_from(set);
+            };
+            let Ok(reservation) = reserved else {
+                discard(&backing);
+                continue;
+            };
+            let mut cache = self
+                .ann_cache
+                .lock()
+                .map_err(|_| VectorError::Engine("ANN cache mutex poisoned".into()))?;
+            if cache
+                .get(&space_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &cached))
+            {
+                // Merged-away segments go once their last reader drops.
+                set.supersede_absent_from(fork_set(&backing));
+                frozen.supersede_absent_from(fork_set(&backing));
+                cache.insert(
+                    space_id,
+                    Arc::new(CachedAnn {
+                        space_version: cached.space_version,
+                        dims: cached.dims,
+                        generation: cached.generation.clone(),
+                        backing,
+                        _reservation: reservation,
+                    }),
+                );
+                changed += 1;
+            } else {
+                // An absorb or rebuild won the race; drop this work (only
+                // the segments it built, never ones the winner shares).
+                drop(cache);
+                discard(&backing);
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Merge the segments `ids` of `set` into one frozen segment of their
+    /// live entries. `Ok(false)` when a live entry's vector is no longer
+    /// readable (its slot was reclaimed) or the build fails: the merge waits
+    /// for a rebuild instead.
+    fn merge_into(
+        &self,
+        set: &crate::segment::SegmentSet,
+        space_id: u64,
+        ids: &[u64],
+        dims: u32,
+        similarity: rushdb_types::occurrence::Similarity,
+    ) -> Result<bool, VectorError> {
+        let entries = set.live_entries_in(ids);
+        if entries.is_empty() {
+            return Ok(set.replace_merged(ids, None));
+        }
+        // Reserved before decoding; released once the merged
+        // segment is built (its retained size is charged with the set).
+        let Some(_building) = self.store.vector_cache_budget().and_then(|budget| {
+            budget
+                .try_reserve(build_estimate(entries.len(), dims as usize))
+                .ok()
+        }) else {
+            return Ok(false);
+        };
+        let view = self.store.read_view()?;
+        let tenant = self.tenant();
+        // A reclaimed slot fails the build: the merge waits for a rebuild.
+        #[expect(
+            clippy::needless_collect,
+            reason = "the build takes `entries` by value while the vectors stream"
+        )]
+        let slots: Vec<u64> = entries.iter().map(|entry| entry.slot).collect();
+        let vectors = slots.into_iter().map(|slot| {
+            match view.get(&emb_vector_key(tenant, space_id, slot))? {
+                Some(raw) => crate::decode_vector(Some(raw), dims),
+                None => Err(VectorError::Engine("merged vector slot reclaimed".into())),
+            }
+        });
+        let merged = match self.space_segment_path(space_id) {
+            Some(path) => {
+                crate::segment::FrozenSegment::build(entries, vectors, dims, similarity, &path)
+            }
+            None => {
+                crate::segment::FrozenSegment::build_in_memory(entries, vectors, dims, similarity)
+            }
+        };
+        drop(view);
+        let Ok(merged) = merged else {
+            return Ok(false);
+        };
+        Ok(set.replace_merged(ids, Some(crate::segment::Segment::Frozen(merged))))
+    }
+
+    /// Rebuilds one generation from canonical segments in slot order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when the snapshot, alias lookup, provider
+    /// build, manifest commit, or ANN cache lock fails.
+    pub fn build_ann(&self, space_alias: &str) -> Result<AnnGeneration, String> {
+        let snap = self.snapshot().map_err(|e| e.to_string())?;
+        let space = self
+            .lookup_space_in_view(&snap, space_alias)
+            .map_err(|e| e.to_string())?
+            .ok_or("unknown alias")?;
+        let source_commit_index = snap.commit_index();
+        let (_, version) =
+            space_version(&snap, self.tenant(), space.space_id).map_err(|e| e.to_string())?;
+        let (generation, backing, reservation) =
+            self.assemble(&snap, &space, false)
+                .map_err(|error| match error {
+                    VectorError::AnnBudget(reason) => format!("ANN build memory budget: {reason}"),
+                    other => other.to_string(),
+                })?;
+        let manifest = AnnManifest {
+            format_version: 1,
+            source_commit_index,
+            input_fingerprint: Self::generation_fingerprint(&generation),
+            entries: generation.entries.len(),
+            provider: backing.name().to_string(),
+        };
+        drop(snap);
+        let manifest_key = self.ann_manifest_key(space.space_id);
+        let manifest_bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+        let tenant = self.tenant();
+        let store = self.store.clone();
+        match store
+            .commit_for_tenant(&tenant, uuid::Uuid::now_v7(), move |_ci, _txn| {
+                let mut batch = crate::empty_batch(tenant);
+                batch
+                    .mutations
+                    .push(rushdb_types::command::Mutation::SetMetaBlob {
+                        key: manifest_key,
+                        value: manifest_bytes,
+                    });
+                Ok((batch, ()))
+            })
+            .map_err(|e| e.to_string())?
+        {
+            rushdb_storage::CommitOutcome::Committed { .. } => {}
+            rushdb_storage::CommitOutcome::Conflicted(error) => return Err(error),
+        }
+        let mut cache = self
+            .ann_cache
+            .lock()
+            .map_err(|_| "ANN cache mutex poisoned".to_string())?;
+        replace_cached(
+            &mut cache,
+            space.space_id,
+            Arc::new(CachedAnn {
+                space_version: version,
+                dims: space.dims as usize,
+                generation: generation.clone(),
+                backing,
+                _reservation: reservation,
+            }),
+            true,
+        );
+        Ok(generation)
+    }
+
+    /// Filter-aware approximate search with exact rerank; falls back to
+    /// exhaustive scan whenever the generation cannot answer confidently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Conflict`] for an unknown alias,
+    /// [`VectorError::DimMismatch`] or [`VectorError::InvalidVector`] for a
+    /// bad query, and [`VectorError::Storage`] when a cached generation's
+    /// segments are corrupt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_ann(
+        &self,
+        space_alias: &str,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+    ) -> Result<Vec<ScoredSource>, VectorError> {
+        let snap = self.snapshot()?;
+        let Some(space) = self.lookup_space_in_view(&snap, space_alias)? else {
+            return Err(VectorError::Conflict("unknown alias".into()));
+        };
+        self.search_ann_in_view(&snap, &space, query, k, ef, candidate)
+    }
+
+    /// Approximate top-`k` search within a caller-owned view, with optional
+    /// filtering. The view must belong to this engine's store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::Storage`] when `snap` belongs to another store
+    /// or a cached generation's segments are corrupt,
+    /// [`VectorError::DimMismatch`] or [`VectorError::InvalidVector`] for a
+    /// bad query, and [`VectorError::Engine`] when the ANN cache mutex is
+    /// poisoned.
+    pub fn search_ann_in_view(
+        &self,
+        snap: &ReadView,
+        space: &crate::EmbeddingSpace,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+    ) -> Result<Vec<ScoredSource>, VectorError> {
+        Ok(self
+            .ann_in_view(snap, space, query, k, ef, candidate, None)?
+            .0)
+    }
+
+    /// [`Self::search_ann_in_view`] keeping only hits scoring at least
+    /// `min_score`, and reporting which path answered: ANN, or exact search
+    /// after one of the fallbacks below.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ann_in_view(
+        &self,
+        snap: &ReadView,
+        space: &crate::EmbeddingSpace,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        candidate: Option<&dyn Fn(SourceRef) -> bool>,
+        min_score: Option<f32>,
+    ) -> Result<(Vec<ScoredSource>, SearchPath), VectorError> {
+        let exact =
+            |reason: FallbackReason| -> Result<(Vec<ScoredSource>, SearchPath), VectorError> {
+                Ok((
+                    self.exact_in_view(snap, space, query, k, candidate, min_score)?,
+                    SearchPath::ExactFallback(reason),
+                ))
+            };
+        self.validate_view(snap)?;
+        let tenant = self.tenant();
+        if query.len() != space.dims as usize {
+            return Err(VectorError::DimMismatch(space.dims, query.len()));
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(VectorError::InvalidVector(
+                "query components must be finite".into(),
+            ));
+        }
+        if k == 0 {
+            return Ok((Vec::new(), SearchPath::Ann));
+        }
+        // The built-in providers gather by cosine. Exact reranking cannot
+        // recover candidates absent from that cosine neighborhood for
+        // dot-product or Euclidean spaces, so qualify those metrics by using
+        // the exact path until a metric-aware provider is available.
+        if space.similarity != rushdb_types::occurrence::Similarity::Cosine {
+            return exact(FallbackReason::Metric);
+        }
+        let mut profile = SearchProfile::start();
+        // The ANN is a cache over the canonical vectors: when the budget
+        // cannot admit a build, answer exactly instead of failing the query
+        // (C9, cloud-capacity F10).
+        let cached = match self.current_ann(snap, space) {
+            Ok(cached) => cached,
+            Err(VectorError::AnnBudget(_)) => {
+                ANN_EXACT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return exact(FallbackReason::Budget);
+            }
+            Err(error) => return Err(error),
+        };
+        profile.cache_resolved();
+        let gen = &cached.generation;
+        if gen.entries.is_empty() {
+            return Ok((Vec::new(), SearchPath::Ann));
+        }
+        let requested = ef.max(k).min(gen.entries.len());
+
+        // Filtered ANN (benchmark-grounded, Slice 27 / 11-filter-aware-ann.md):
+        // a fixed gather of `requested` wastes its budget on filtered-out
+        // points, so the measured recall drops for selective filters (small ef
+        // returns only the query-local neighborhood) unless the beam is large
+        // enough to also reach the allowed set. For filtered queries we
+        // estimate filter selectivity from a cheap sample of the entries, then
+        // do ONE gather sized so the allowed set is well represented
+        // (gather ~ survivor_target / selectivity), bounded by a cap. A filter
+        // whose allowed set cannot be reached (e.g. spatially-correlated and
+        // selective) simply falls through to the exact scan below, preserving
+        // correctness with bounded wasted gather. Unfiltered queries keep the
+        // exact previous single-gather behavior.
+        let gather_size = filtered_gather_size(&gen.entries, candidate, k, requested);
+
+        let rerank =
+            |source: SourceRef, slot: u64, value_hash: u64| -> Result<ScoredSource, VectorError> {
+                let raw =
+                    profile.time_get(|| snap.get(&emb_vector_key(tenant, space.space_id, slot)))?;
+                let vec = crate::decode_vector(raw, space.dims)?;
+                Ok(ScoredSource {
+                    source,
+                    score: crate::score(query, &vec, space.similarity),
+                    value_hash,
+                })
+            };
+
+        let (candidate_count, mut out) = match &cached.backing {
+            AnnBacking::Segments(set) => set.search(
+                query,
+                k,
+                gather_size,
+                space.similarity,
+                candidate,
+                |entry| rerank(entry.source, entry.slot, entry.value_hash),
+            )?,
+            #[cfg(feature = "turbovec")]
+            AnnBacking::Provider(provider) => {
+                let gathered: Vec<AnnEntry> = if let Some(filter) = candidate {
+                    provider
+                        .gather(query, gather_size, gather_size.max(ef))
+                        .into_iter()
+                        .filter_map(|idx| gen.entries.get(idx).cloned())
+                        .filter(|entry| filter(entry.source))
+                        .collect()
+                } else {
+                    provider
+                        .gather(query, requested, ef.max(requested))
+                        .into_iter()
+                        .filter_map(|idx| gen.entries.get(idx).cloned())
+                        .collect()
+                };
+                let count = gathered.len();
+                let scored: Vec<ScoredSource> = gathered
+                    .iter()
+                    .map(|e| rerank(e.source, e.slot, e.value_hash))
+                    .collect::<Result<_, VectorError>>()?;
+                (count, scored)
+            }
+        };
+
+        if candidate_count < k.min(ef) {
+            // degradation contract: not enough confidence -> exact scan
+            return exact(FallbackReason::LowConfidence);
+        }
+
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(k);
+        if let Some(min) = min_score {
+            out.retain(|hit| hit.score >= min);
+        }
+        profile.emit(candidate_count);
+        Ok((out, SearchPath::Ann))
+    }
+}
+
+/// Whole-search timings (cache lookup, storage reads
+/// during rerank, total), emitted as one `rushdb_vector::search` debug event
+/// only when that target is enabled; otherwise every method is a no-op.
+struct SearchProfile {
+    started: Option<std::time::Instant>,
+    cache: std::time::Duration,
+    get: std::cell::Cell<std::time::Duration>,
+}
+
+impl SearchProfile {
+    fn start() -> Self {
+        Self {
+            started: tracing::enabled!(target: "rushdb_vector::search", tracing::Level::DEBUG)
+                .then(std::time::Instant::now),
+            cache: std::time::Duration::ZERO,
+            get: std::cell::Cell::new(std::time::Duration::ZERO),
+        }
+    }
+
+    fn cache_resolved(&mut self) {
+        if let Some(started) = self.started {
+            self.cache = started.elapsed();
+        }
+    }
+
+    fn time_get<T>(&self, read: impl FnOnce() -> T) -> T {
+        let Some(_) = self.started else {
+            return read();
+        };
+        let began = std::time::Instant::now();
+        let value = read();
+        self.get.set(self.get.get() + began.elapsed());
+        value
+    }
+
+    fn emit(&self, gathered: usize) {
+        if let Some(started) = self.started {
+            tracing::debug!(
+                target: "rushdb_vector::search",
+                cache_us = self.cache.as_micros(),
+                rerank_get_us = self.get.get().as_micros(),
+                total_us = started.elapsed().as_micros(),
+                gathered,
+                "ann search"
+            );
+        }
+    }
+}
+
+/// Load the `Ready` bindings for one space in stable slot order. Metadata and
+/// generation builders share this so both agree on the fingerprint input.
+fn load_ready_bindings<R: TryRead>(
+    r: &R,
+    t: TenantId,
+    space_id: u64,
+) -> Result<Vec<rushdb_types::occurrence::EmbeddingBinding>, VectorError> {
+    let mut bindings = Vec::new();
+    crate::for_each_binding(r, t, space_id, &mut |binding| {
+        if binding.status == BindingStatus::Ready {
+            bindings.push(binding);
+        }
+        true
+    })?;
+    bindings.sort_by_key(|b| b.vector_slot);
+    Ok(bindings)
+}
+
+/// `load_ready_bindings`, projected straight into `segment::SegmentEntry`s
+/// with **no vector decode at all** — metadata only, same cost as the
+/// fingerprint check. A cache miss reconciles reopened segments against it
+/// and decodes only what they do not cover.
+fn load_ready_segment_entries<R: TryRead>(
+    r: &R,
+    t: TenantId,
+    space_id: u64,
+) -> Result<Vec<crate::segment::SegmentEntry>, VectorError> {
+    Ok(load_ready_bindings(r, t, space_id)?
+        .into_iter()
+        .map(|b| crate::segment::SegmentEntry {
+            slot: b.vector_slot,
+            source: SourceRef {
+                kind: b.owner_kind,
+                owner_ord: b.owner_ord,
+                pid: b.pid,
+                elem: b.elem,
+            },
+            value_hash: b.source_hash,
+        })
+        .collect())
+}
+
+/// The heuristic entry list of a generation over `bindings` (slot order):
+/// emptiness, the `requested` bound and the selectivity sample read it.
+fn generation_of(space_id: u64, bindings: &[crate::segment::SegmentEntry]) -> AnnGeneration {
+    let entries: Vec<AnnEntry> = bindings
+        .iter()
+        .map(|entry| AnnEntry {
+            slot: entry.slot,
+            source: entry.source,
+            pivot: 0,
+            value_hash: entry.value_hash,
+        })
+        .collect();
+    let assignments = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.slot, i))
+        .collect();
+    AnnGeneration {
+        space_id,
+        pivots: vec![],
+        assignments,
+        entries,
+    }
+}
+
+/// The segment set of a backing this module just built (always segments).
+fn fork_set(backing: &AnnBacking) -> &crate::segment::SegmentSet {
+    #[allow(
+        irrefutable_let_patterns,
+        reason = "refutable only with --features turbovec, which adds AnnBacking::Provider"
+    )]
+    let AnnBacking::Segments(set) = backing
+    else {
+        unreachable!("maintenance only forks segment backings")
+    };
+    set
+}
+
+/// How many candidates to gather. Unfiltered: `requested`. Filtered: enough
+/// that the allowed set is represented ~4x over `k`, from a cheap sample of
+/// the filter's selectivity, bounded by the entry count.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "selectivity is a bounded ratio over at most the entry count and is clamped back to that count, so f64 rounding cannot change the gather size"
+)]
+fn filtered_gather_size(
+    entries: &[AnnEntry],
+    candidate: Option<&dyn Fn(SourceRef) -> bool>,
+    k: usize,
+    requested: usize,
+) -> usize {
+    let Some(filter) = candidate else {
+        return requested;
+    };
+    // Cheap selectivity estimate: how many sampled entries pass the
+    // predicate? Slot order is arbitrary, so a small fixed sample is a
+    // stable estimator and costs ~nothing vs the gather itself.
+    let sample_len = FILTERED_SELECTIVITY_SAMPLE.min(entries.len());
+    let passed = (0..sample_len)
+        .map(|sample| sample * entries.len() / sample_len)
+        .filter_map(|index| entries.get(index))
+        .filter(|entry| filter(entry.source))
+        .count();
+    let selectivity = (passed as f64 / sample_len.max(1) as f64).max(1e-6);
+    // One gather sized so the allowed set is represented ~4x over k.
+    let target = k.saturating_mul(4);
+    let wanted = (target as f64 / selectivity) as usize;
+    wanted.max(requested).min(entries.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic synthetic vectors: `n` vectors of `dims` dims with a
+    /// seeded offset so consecutive vectors are meaningfully distinct.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "synthetic test data maps small integers into unit-scale f32 jitter where full precision is irrelevant"
+    )]
+    fn synth(n: usize, dims: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        (0..n)
+            .map(|i| (0..dims).map(|_| next() + ((i % 3) as f32) * 0.1).collect())
+            .collect()
+    }
+
+    /// Synthetic `segment::SegmentEntry`s matching `vectors`' length, for
+    /// tests that build a `FrozenSegment` directly.
+    fn synth_segment_entries(vectors: &[Vec<f32>]) -> Vec<crate::segment::SegmentEntry> {
+        (0..vectors.len())
+            .map(|i| crate::segment::SegmentEntry {
+                slot: i as u64,
+                source: SourceRef {
+                    kind: rushdb_types::ids::OwnerKind::Record,
+                    owner_ord: i as u64,
+                    pid: 1,
+                    elem: 0,
+                },
+                value_hash: i as u64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn low_dim_spaces_never_use_the_provider() {
+        // < 256 dims, or not a multiple of 8: always segments.
+        for dims in [2, 128, 200, 255, 300] {
+            assert!(!wants_provider(dims), "dims={dims}");
+        }
+    }
+
+    /// Repeated-build regression (P15, carried over from the former
+    /// `hnsw_rs` provider): many independent builds over the same clustered
+    /// corpus must keep top-8 recall at or above 7/8. `hnsw_rs`'s internal
+    /// topology invariant (no disconnected base-layer point) was specific to
+    /// that library's own graph representation and had no `usearch`
+    /// equivalent exposed through this crate's API; recall is the
+    /// provider-agnostic property that actually matters, and is what this
+    /// keeps testing.
+    #[test]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "synthetic cluster labels and grid jitter are tiny integers mapped into f32 coordinates"
+    )]
+    fn repeated_builds_keep_recall_high() {
+        // Two well-separated clusters so exact top-8 is well-defined.
+        let n = 64usize;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let cluster = (i % 2) as f32;
+                let jitter = ((i * 37) % 100) as f32 / 100.0 - 0.5;
+                if cluster == 0.0 {
+                    vec![0.9 + jitter * 0.05, 0.1 + jitter * 0.05]
+                } else {
+                    vec![0.1 + jitter * 0.05, 0.9 + jitter * 0.05]
+                }
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = vec![
+            vec![0.92, 0.08],
+            vec![0.05, 0.95],
+            vec![0.88, 0.12],
+            vec![0.12, 0.88],
+            vec![0.91, 0.09],
+            vec![0.09, 0.91],
+            vec![0.93, 0.07],
+            vec![0.07, 0.93],
+        ];
+
+        let entries = synth_segment_entries(&vectors);
+        let mut recall_failures = 0usize;
+        let mut trials = 0usize;
+        for _ in 0..600 {
+            let provider = crate::segment::FrozenSegment::build_in_memory(
+                entries.clone(),
+                vectors.iter().map(Ok),
+                2,
+                rushdb_types::occurrence::Similarity::Cosine,
+            )
+            .unwrap();
+
+            for query in &queries {
+                let exact = {
+                    let mut scored: Vec<(f32, usize)> = vectors
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (crate::cosine(query, v), i))
+                        .collect();
+                    scored
+                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    scored
+                        .into_iter()
+                        .take(8)
+                        .map(|(_, i)| i)
+                        .collect::<Vec<_>>()
+                };
+                let gathered: Vec<usize> = provider
+                    .gather(query, 24, 24)
+                    .into_iter()
+                    .take(24)
+                    .collect();
+                let mut reranked: Vec<usize> = gathered.clone();
+                reranked.sort_by(|a, b| {
+                    crate::cosine(query, &vectors[*b])
+                        .partial_cmp(&crate::cosine(query, &vectors[*a]))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                reranked.truncate(8);
+                let overlap = reranked.iter().filter(|idx| exact.contains(idx)).count();
+                trials += 1;
+                if overlap < 7 {
+                    recall_failures += 1;
+                }
+            }
+        }
+        assert_eq!(
+            recall_failures, 0,
+            "usearch top-8 recall dropped below 7/8 in {recall_failures}/{trials} trials"
+        );
+    }
+
+    #[test]
+    fn high_dim_spaces_use_the_provider_only_with_the_feature() {
+        assert_eq!(wants_provider(512), cfg!(feature = "turbovec"));
+    }
+
+    /// The pre-build charge of a segment build must cover what the built
+    /// segment really holds (the budget gates the build before any
+    /// vector is decoded).
+    #[test]
+    fn build_bytes_estimate_covers_real_segments() {
+        for (n, dims) in [(300usize, 16usize), (2_000, 128), (1_000, 768)] {
+            let vectors = synth(n, dims, 5);
+            let dims32 = u32::try_from(dims).unwrap();
+            let built = crate::segment::FrozenSegment::build_in_memory(
+                synth_segment_entries(&vectors),
+                vectors.iter().map(Ok),
+                dims32,
+                rushdb_types::occurrence::Similarity::Cosine,
+            )
+            .unwrap();
+            let real = built.measured_bytes();
+            let estimate = n * crate::segment::build_bytes_per_vector(dims32);
+            assert!(
+                real <= estimate,
+                "{n}x{dims}: built segment holds {real} B, estimate {estimate} B"
+            );
+            assert!(
+                estimate <= real * 2,
+                "{n}x{dims}: estimate {estimate} B is far above the real {real} B"
+            );
+        }
+    }
+
+    #[cfg(feature = "turbovec")]
+    #[test]
+    fn turbovec_recall_matches_exact_on_high_dim() {
+        let dims = 512;
+        let vectors = synth(64, dims, 42);
+        let query = vectors[3].clone();
+        let exact = {
+            let mut scored: Vec<(f32, usize)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (crate::cosine(&query, v), i))
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored
+        };
+
+        let entries = synth_segment_entries(&vectors);
+        let usearch_provider = crate::segment::FrozenSegment::build_in_memory(
+            entries,
+            vectors.iter().map(Ok),
+            u32::try_from(dims).unwrap(),
+            rushdb_types::occurrence::Similarity::Cosine,
+        )
+        .unwrap();
+        let turbo = TurboProvider::build(&vectors).unwrap();
+
+        let h = usearch_provider.gather(&query, 8, 24);
+        let t = turbo.gather(&query, 8, 24);
+
+        // top-1 must agree between providers and exact scan
+        assert_eq!(h[0], exact[0].1);
+        assert_eq!(t[0], exact[0].1, "turbovec top-1 mismatch");
+
+        // top-8 set overlap: turbovec should keep at least 6/8 of exact
+        let overlap = t
+            .iter()
+            .filter(|idx| exact.iter().take(8).any(|(_, e)| e == *idx))
+            .count();
+        assert!(overlap >= 6, "turbovec top-8 recall too low: {overlap}/8");
+    }
+
+    /// The selectivity-scaled gather (Slice 27 / 11-filter-aware-ann.md): with
+    /// a filter that only a small fraction of points pass, a fixed small beam
+    /// gathers the query-local neighborhood and under-fills, so recall drops
+    /// (measured cliff). The adaptive path estimates selectivity and gathers
+    /// enough to represent the allowed set. This test fixes that behavior with
+    /// a cheap fixture: build the provider directly and check that the
+    /// selectivity estimate scales the gather up.
+    #[test]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "quadrant labels and grid jitter are tiny non-negative integers, and the gather size is a small bounded count"
+    )]
+    fn filtered_selectivity_estimate_scales_the_gather() {
+        // 400 vectors in 4 well-separated quadrants; filter keeps one quadrant
+        // (25%). A beam of k=4 returns the query-local cluster, which the
+        // filtered-out quadrants dominate; the estimate must push the gather
+        // to ~4k/0.25 = 64.
+        let mut vectors = Vec::new();
+        for i in 0..400usize {
+            let q = (i % 4) as f32;
+            let x = if q == 0.0 { 0.9 } else { 0.1 };
+            let y = if q == 0.0 { 0.1 } else { 0.9 };
+            let jx = ((i * 37) % 100) as f32 / 1000.0 - 0.05;
+            let jy = ((i * 53) % 100) as f32 / 1000.0 - 0.05;
+            vectors.push(vec![x + jx, y + jy]);
+        }
+        // Building the segment is not needed for the estimate math, but keeps
+        // this test faithful to the real path (it must not panic on build).
+        let entries = synth_segment_entries(&vectors);
+        let _segment = crate::segment::FrozenSegment::build_in_memory(
+            entries,
+            vectors.iter().map(Ok),
+            2,
+            rushdb_types::occurrence::Similarity::Cosine,
+        )
+        .unwrap();
+        let gen_len = vectors.len();
+
+        // Estimate: entries in slot order are 25% allowed (every 4th).
+        let filter = |src: crate::SourceRef| src.owner_ord.is_multiple_of(4);
+        let sample_len = FILTERED_SELECTIVITY_SAMPLE.min(gen_len);
+        let passed = (0..sample_len)
+            .filter(|&i| {
+                filter(crate::SourceRef {
+                    kind: crate::OwnerKind::Record,
+                    owner_ord: i as u64,
+                    pid: 0,
+                    elem: 0,
+                })
+            })
+            .count();
+        let selectivity = passed as f64 / sample_len as f64;
+        assert!(
+            (0.2..0.3).contains(&selectivity),
+            "expected ~25% selectivity, got {selectivity:.3}"
+        );
+        let k = 4usize;
+        let wanted = (k.saturating_mul(4) as f64 / selectivity) as usize;
+        assert!(
+            wanted >= 48,
+            "selectivity-scaled gather must be > 4k, got {wanted}"
+        );
+        // It must not exceed the index.
+        assert!(wanted <= gen_len);
+    }
+
+    /// Calibration (2026-10-06): `MAX_CACHED_ANN_GENERATIONS` and
+    /// `MAX_CACHED_ANN_BYTES` must stay consistent with each other against
+    /// the *measured* per-generation allocator floor (~16-17 MiB, see
+    /// `crate::MAX_CACHED_ANN_GENERATIONS`'s doc comment for the
+    /// measurements this derives from), not the old formula estimate.
+    /// Guards against a future change to either constant silently making
+    /// the other one dead code again (one bound always binding many
+    /// generations before the other is ever reached).
+    #[test]
+    fn cache_ceilings_stay_consistent_with_the_measured_per_generation_floor() {
+        // A conservative floor estimate (above every measurement taken: ~16.0,
+        // 16.0, and 16.3 MiB across 1/2, 300/16, and 5,000/128 vector-count/dim
+        // combinations) — the margin absorbs usearch build-to-build variance.
+        const MEASURED_FLOOR_BYTES: usize = 20 * 1024 * 1024;
+        assert!(
+            crate::MAX_CACHED_ANN_GENERATIONS.saturating_mul(MEASURED_FLOOR_BYTES)
+                <= MAX_CACHED_ANN_BYTES,
+            "MAX_CACHED_ANN_GENERATIONS ({}) at the measured per-generation floor exceeds \
+             MAX_CACHED_ANN_BYTES ({MAX_CACHED_ANN_BYTES}); the byte ceiling would always bind \
+             first, making the generation count dead code again",
+            crate::MAX_CACHED_ANN_GENERATIONS
+        );
+        // And not wildly under it either: the generation count should be the
+        // ceiling that actually binds, not an order of magnitude below what
+        // the byte budget could hold.
+        assert!(
+            crate::MAX_CACHED_ANN_GENERATIONS.saturating_mul(MEASURED_FLOOR_BYTES)
+                > MAX_CACHED_ANN_BYTES / 2,
+            "MAX_CACHED_ANN_GENERATIONS ({}) leaves most of MAX_CACHED_ANN_BYTES \
+             ({MAX_CACHED_ANN_BYTES}) unreachable; reconsider whether either constant still \
+             reflects the measured floor",
+            crate::MAX_CACHED_ANN_GENERATIONS
+        );
+    }
+}

@@ -42,3 +42,92 @@ impl ProtocolExecutor<'_> {
         let (kind, consistency) = match kind {
             DdlKind::Ordered => ("ordered", None),
             DdlKind::Fulltext { immediate: true } => ("text", Some("immediate".to_string())),
+            DdlKind::Fulltext { immediate: false } => ("text", Some("eventual".to_string())),
+        };
+        let index = self
+            .node
+            .create_index(&rushdb_protocol::IndexDefinition {
+                name: name.to_owned(),
+                label: label.to_owned(),
+                property: property.to_owned(),
+                kind: kind.into(),
+                consistency,
+                dimensions: None,
+            })
+            .map_err(execution_failed)?;
+        Ok(Response::StatementMutation {
+            total: 0,
+            rows: vec![],
+            affected: 1,
+            commit_index: self.node.lmpg().store.committed_version(),
+            status: index.get("name").and_then(|v| v.as_str()).map(String::from),
+        })
+    }
+
+    /// Execute parsed Neo4j-style index DDL.
+    pub(super) fn index_ddl(
+        &self,
+        ddl: Result<IndexDdl, String>,
+        execution_context: &mut rushdb_engine::ExecutionContext,
+    ) -> Result<Response, ProtocolError> {
+        let ddl = ddl.map_err(|message| ProtocolError::new(ErrorCode::InvalidRequest, message))?;
+        let exists = |name: &str| {
+            rushdb_lmpg::index::by_name(
+                execution_context.read_view().as_ref(),
+                execution_context.tenant(),
+                name,
+            )
+            .map(|def| def.is_some())
+            .map_err(|e| execution_failed(e.to_string()))
+        };
+        match ddl {
+            IndexDdl::Create {
+                name,
+                label,
+                property,
+                kind,
+                if_not_exists,
+            } => {
+                if if_not_exists && exists(&name)? {
+                    return Ok(Response::StatementMutation {
+                        total: 0,
+                        rows: vec![],
+                        affected: 0,
+                        commit_index: self.node.lmpg().store.committed_version(),
+                        status: Some(name),
+                    });
+                }
+                self.create_declared_index(&name, &label, &property, kind)
+            }
+            IndexDdl::Drop { name, if_exists } => {
+                if if_exists && !exists(&name)? {
+                    return Ok(Response::StatementMutation {
+                        total: 0,
+                        rows: vec![],
+                        affected: 0,
+                        commit_index: self.node.lmpg().store.committed_version(),
+                        status: None,
+                    });
+                }
+                self.drop_any_index(&name, execution_context)?;
+                Ok(Response::StatementMutation {
+                    total: 0,
+                    rows: vec![],
+                    affected: 1,
+                    commit_index: self.node.lmpg().store.committed_version(),
+                    status: None,
+                })
+            }
+            IndexDdl::Show => {
+                let rows = self
+                    .node
+                    .list_indexes_in_view(execution_context.read_view())
+                    .map_err(execution_failed)?;
+                Ok(Response::Rows {
+                    total: rows.len() as u64,
+                    rows,
+                })
+            }
+        }
+    }
+}

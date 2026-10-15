@@ -54,3 +54,59 @@ fn fixture() -> Lmpg {
     }
     graph
 }
+
+fn profile() -> Value {
+    serde_json::from_str(PROFILE).expect("valid profile JSON")
+}
+
+fn rows(graph: &Lmpg, traversal: &str) -> usize {
+    execute(graph, QueryLanguage::Gremlin, traversal, None)
+        .unwrap_or_else(|error| panic!("{traversal}: {error}"))
+        .rows
+        .len()
+}
+
+#[test]
+fn every_profile_read_runs_with_its_row_count() {
+    let graph = fixture();
+    for case in profile()["reads"].as_array().unwrap() {
+        let traversal = case["traversal"].as_str().unwrap();
+        assert_eq!(
+            rows(&graph, traversal) as u64,
+            case["rows"].as_u64().unwrap(),
+            "{traversal}"
+        );
+    }
+}
+
+#[test]
+fn every_profile_write_commits_its_effect() {
+    for case in profile()["writes"].as_array().unwrap() {
+        let graph = fixture();
+        let traversal = case["traversal"].as_str().unwrap();
+        let result = execute_mutation(&graph, QueryLanguage::Gremlin, traversal, None)
+            .unwrap_or_else(|error| panic!("{traversal}: {error}"));
+        assert_eq!(
+            result.affected,
+            case["affected"].as_u64().unwrap(),
+            "{traversal}"
+        );
+    }
+}
+
+#[test]
+fn every_profile_bytecode_translates_to_its_traversal_and_runs() {
+    let graph = fixture();
+    for case in profile()["bytecode"].as_array().unwrap() {
+        let traversal = case["traversal"].as_str().unwrap();
+        assert_eq!(
+            gremlin_bytecode::bytecode_to_gremlin(&case["bytecode"]).unwrap(),
+            traversal
+        );
+        assert_eq!(
+            rows(&graph, traversal) as u64,
+            case["rows"].as_u64().unwrap(),
+            "{traversal}"
+        );
+    }
+}
