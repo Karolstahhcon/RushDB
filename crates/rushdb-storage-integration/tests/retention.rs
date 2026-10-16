@@ -67,3 +67,72 @@ fn read_pin_protects_history_through_gc_then_releases() {
     assert_eq!(store.retention_summary().1, 0, "pin released on drop");
     store.retire_before(head).unwrap();
     let err = store.read_at(pinned_ci);
+    assert!(err.is_err(), "read at a reclaimed CI must fail");
+}
+
+#[test]
+fn expire_read_pins_reclaims_leaked_readers() {
+    let (lmpg, store) = setup();
+    let rec = lmpg
+        .create_record("Doc", None, vec![("v".into(), FieldChange::Set(json!(1)))])
+        .unwrap();
+    let _ = rec;
+    let ci = store.committed_version();
+
+    // A reader handle that is never dropped (leaked) still registers a pin.
+    let _leaked = store.read_at(ci).unwrap();
+    assert!(store.retention_summary().1 >= 1);
+
+    // Explicit expiry reclaims it (ensure the lease is at least 1ms old).
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let released = store.expire_read_pins(0);
+    assert_eq!(released, 1, "one expired pin reclaimed");
+    assert_eq!(store.retention_summary().1, 0);
+}
+
+#[test]
+fn retention_sweep_prunes_below_floor_then_stops_without_rescanning() {
+    // Regression for the write-stall wedge: the sweep must stop at the
+    // LSN-ordered floor instead of re-scanning the whole retained log and
+    // payload window every tick (which held publish_lock and starved writes).
+    let dir = rushdb_storage::TempPath::dir("retention");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("rushdb.redb");
+    let store = Arc::new(Store::open(&db).unwrap());
+    let lmpg = Lmpg::new(store.clone(), TenantId::from_ordinal(7));
+    for i in 0..300 {
+        lmpg.create_record("Doc", None, vec![("v".into(), FieldChange::Set(json!(i)))])
+            .unwrap();
+    }
+    assert_eq!(store.committed_version(), 300);
+
+    // Prune commit metadata below CI 100 in bounded batches.
+    let mut pruned = 0usize;
+    loop {
+        let n = store.retire_commit_metadata_before(100, 32).unwrap();
+        if n == 0 {
+            break;
+        }
+        assert!(
+            n <= 64,
+            "each call must stay within the batch bound, got {n}"
+        );
+        pruned += n;
+    }
+    // Exactly the outcome payloads of commits 1..=99 (the journal is the WAL;
+    // conflict summaries are in memory since C4).
+    assert_eq!(
+        pruned, 99,
+        "expected to prune the payload rows below the floor"
+    );
+
+    // Steady state: nothing below the floor remains, so the sweep is a cheap
+    // no-op (ordered early-break), not a full-window re-scan.
+    let start = std::time::Instant::now();
+    assert_eq!(store.retire_commit_metadata_before(100, 32).unwrap(), 0);
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(200),
+        "steady-state retention must not re-scan the retained window"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

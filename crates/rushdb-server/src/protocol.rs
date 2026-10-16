@@ -599,3 +599,604 @@ impl<'a> ProtocolExecutor<'a> {
                     if query.left.label.trim().is_empty()
                         || query.right.label.trim().is_empty()
                         || left_property.trim().is_empty()
+                        || right_property.trim().is_empty()
+                        || !query.left.filter.is_object()
+                        || !query.right.filter.is_object()
+                        || query.limit == 0
+                        || query.limit > 10_000
+                    {
+                        return Err(ProtocolError::new(
+                            ErrorCode::InvalidRequest,
+                            "join labels must be non-empty and limit must be between 1 and 10000",
+                        ));
+                    }
+                    match query.projection {
+                        JoinProjection::Count => {
+                            let value = self
+                                .node
+                                .query_join_pairs_with_execution_context(
+                                    &mut execution_context,
+                                    &query,
+                                    is_cancelled,
+                                )
+                                .map_err(execution_failed)?;
+                            Response::Count { value }
+                        }
+                    }
+                }
+                Query::Records { query } => self.query_records_with_context(
+                    &query,
+                    is_cancelled,
+                    Some(&mut execution_context),
+                )?,
+                Query::ExportCsv { query } => {
+                    self.export_csv(&query, is_cancelled, &mut execution_context)?
+                }
+                Query::Cursor { cursor_id, limit } => self.query_cursor_with_context(
+                    &cursor_id,
+                    limit,
+                    is_cancelled,
+                    &mut execution_context,
+                )?,
+                Query::Record { id } => Response::Record {
+                    record: self
+                        .node
+                        .get_record_with_execution_context(&mut execution_context, &id)
+                        .map_err(|error| {
+                            if error == "record denied by policy" {
+                                ProtocolError::new(ErrorCode::Unauthorized, error)
+                            } else {
+                                execution_failed(error)
+                            }
+                        })?,
+                },
+                Query::Relationships { query } => {
+                    self.query_relationships(&query, &mut execution_context)?
+                }
+                Query::PropertyValues {
+                    property,
+                    query,
+                    mode,
+                    limit,
+                    search,
+                } => self.query_property_values(
+                    &property,
+                    &query,
+                    mode,
+                    limit,
+                    search.as_ref(),
+                    is_cancelled,
+                    &mut execution_context,
+                    &catalog_access,
+                )?,
+                Query::SearchValues {
+                    search,
+                    labels,
+                    limit,
+                } => self.query_search_values(
+                    &search,
+                    &labels,
+                    limit,
+                    is_cancelled,
+                    &mut execution_context,
+                    &catalog_access,
+                )?,
+                Query::Vector { query } => {
+                    self.query_vector_with_context(&mut execution_context, &query)?
+                }
+                Query::VectorIndexCandidates { query } => {
+                    self.query_vector_index_candidates_with_context(&mut execution_context, &query)?
+                }
+                Query::Text {
+                    index,
+                    query,
+                    limit,
+                    all_terms,
+                    phrase,
+                } => self.query_text_with_context(
+                    &index,
+                    &query,
+                    limit,
+                    rushdb_textsearch::LexicalOptions { all_terms, phrase },
+                    is_cancelled,
+                    &execution_context,
+                )?,
+                Query::Hybrid { query } => {
+                    self.query_hybrid_with_context(&mut execution_context, &query)?
+                }
+            },
+            Operation::Mutate { mutation } => {
+                if self.node.maintenance() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Unavailable,
+                        "maintenance mode: writes are rejected until maintenance is cleared",
+                    ));
+                }
+                self.mutate(mutation, is_cancelled, &mut execution_context)?
+            }
+            Operation::Describe { describe } => self.describe_with_access(
+                describe,
+                &catalog_access,
+                is_cancelled,
+                &mut execution_context,
+            )?,
+            Operation::Ingest { ingest } => {
+                if self.node.maintenance() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Unavailable,
+                        "maintenance mode: writes are rejected until maintenance is cleared",
+                    ));
+                }
+                self.ingest(ingest, &mut execution_context, is_cancelled)?
+            }
+            Operation::Index { .. } | Operation::PurgeTenant if self.node.maintenance() => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unavailable,
+                    "maintenance mode: writes are rejected until maintenance is cleared",
+                ));
+            }
+            Operation::Index { index } => {
+                self.index(index, &mut execution_context, is_cancelled)?
+            }
+            Operation::Transaction { transaction } => {
+                if self.node.maintenance()
+                    && !matches!(
+                        transaction,
+                        TransactionOperation::Begin { .. } | TransactionOperation::Rollback { .. }
+                    )
+                {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Unavailable,
+                        "maintenance mode: writes are rejected until maintenance is cleared",
+                    ));
+                }
+                self.transaction(transaction, &mut execution_context, is_cancelled)?
+            }
+            Operation::PurgeTenant => Response::PurgedTenant {
+                commit_index: self
+                    .node
+                    .purge_tenant_with_execution_context(&mut execution_context, is_cancelled)
+                    .map_err(execution_failed)?,
+            },
+            Operation::Policy { policy } => self.policy(policy, &execution_context)?,
+            Operation::Backup { request } => {
+                self.validate_backup_scopes(&request)?;
+                let (commit_index, tenants) = self
+                    .node
+                    .backup_in_view(&request, execution_context.read_view())
+                    .map_err(execution_failed)?;
+                Response::Backup {
+                    commit_index,
+                    tenants,
+                }
+            }
+        };
+        if cancellable && is_cancelled() {
+            return Err(ProtocolError::new(
+                ErrorCode::Cancelled,
+                "operation cancelled",
+            ));
+        }
+        // Re-check the shared execution context after the transport-specific
+        // executor returns. A query may have spent its whole budget inside a
+        // storage or language adapter; do not publish a late result after the
+        // context deadline has elapsed.
+        let terminal_mutation = matches!(
+            &response,
+            Response::Record { .. }
+                | Response::Mutation { .. }
+                | Response::StatementMutation { .. }
+                | Response::Ingested { .. }
+                | Response::VectorsUpserted { .. }
+                | Response::PurgedTenant { .. }
+                | Response::TransactionOutcome {
+                    status: TransactionStatus::Committed
+                        | TransactionStatus::Aborted
+                        | TransactionStatus::Expired
+                        | TransactionStatus::RolledBack,
+                    ..
+                }
+        );
+        if !deadline_exempt && !terminal_mutation {
+            execution_context
+                .check_deadline()
+                .map_err(|error| execution_failed(error.to_string()))?;
+        }
+        let mut encoded_bytes = serde_json::to_vec(&response).map_err(|error| {
+            ProtocolError::new(
+                ErrorCode::ExecutionFailed,
+                format!("encode response for size check: {error}"),
+            )
+        })?;
+        if encoded_bytes.len() > self.node.max_response_bytes() {
+            // The record itself is already durably committed. Fall back to a
+            // compact terminal acknowledgement rather than reporting a
+            // retryable failure that could duplicate the write. Reads and
+            // other large responses still fail before transport encoding.
+            if matches!(response, Response::Record { .. }) {
+                response = Response::Mutation { affected: 1 };
+                encoded_bytes = serde_json::to_vec(&response).map_err(|error| {
+                    ProtocolError::new(
+                        ErrorCode::ExecutionFailed,
+                        format!("encode compact mutation response: {error}"),
+                    )
+                })?;
+            }
+        }
+        if encoded_bytes.len() > self.node.max_response_bytes() {
+            let error = ProtocolError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "response exceeds configured byte limit ({} > {})",
+                    encoded_bytes.len(),
+                    self.node.max_response_bytes()
+                ),
+            );
+            // A terminal mutation is already durably committed. Reporting a
+            // retryable error would invite a client retry that duplicates the
+            // write, so mark it non-retryable: the caller must discover the
+            // outcome, not re-execute.
+            return Err(if terminal_mutation {
+                error.with_retryable(false)
+            } else {
+                error
+            });
+        }
+        // `charge_bytes` also checks the request deadline. Once a mutation
+        // has published a terminal outcome, preserve that outcome even when
+        // the response budget accounting happens after the deadline. The
+        // explicit response-size check above still enforces the hard limit.
+        if !terminal_mutation {
+            execution_context
+                .charge_bytes(encoded_bytes.len())
+                .map_err(|error| execution_failed(error.to_string()))?;
+        }
+        observe_response_work(&self.node, operation, &response);
+        Ok(ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            server_timing_ms: Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            response,
+        })
+    }
+
+    fn validate_scope(&self, requested: Option<&str>) -> Result<(), ProtocolError> {
+        match (self.node.multitenant(), requested) {
+            (false, None) => Ok(()),
+            (false, Some(_)) => Err(ProtocolError::new(
+                ErrorCode::ScopeMismatch,
+                "scope must be omitted in single-tenant mode",
+            )),
+            (true, None) => Err(ProtocolError::new(
+                ErrorCode::MissingScope,
+                "scope is required in multitenant mode",
+            )),
+            (true, Some(requested)) => {
+                if self.node.scope_value() == Some(requested) {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::new(
+                        ErrorCode::ScopeMismatch,
+                        "protocol scope does not match the authenticated transport scope",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// A tenant-scoped request may back up only its own keyspace. `scopes` is
+    /// an operator-facing selector in offline tooling; accepting it unchecked
+    /// on the public multitenant protocol would let tenant A export tenant B.
+    /// An empty list therefore means the current request scope, never "all".
+    fn validate_backup_scopes(
+        &self,
+        request: &rushdb_protocol::BackupRequest,
+    ) -> Result<(), ProtocolError> {
+        if !self.node.multitenant() {
+            return Ok(());
+        }
+        let current = self.node.scope_value().map(str::to_string).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::MissingScope,
+                "scope is required in multitenant mode",
+            )
+        })?;
+        if request.scopes.iter().all(|scope| scope == &current) {
+            Ok(())
+        } else {
+            Err(ProtocolError::new(
+                ErrorCode::ScopeMismatch,
+                "backup scopes must match the authenticated tenant scope",
+            ))
+        }
+    }
+}
+
+fn is_label_less_container(documents: &serde_json::Value) -> bool {
+    let Some(container) = documents.as_object() else {
+        return false;
+    };
+    !container.is_empty()
+        && container.values().all(|value| {
+            value.is_object()
+                || value.as_array().is_some_and(|items| {
+                    !items.is_empty()
+                        && items.iter().any(|item| item.is_object() || item.is_array())
+                })
+        })
+}
+
+fn query_document_to_parser_input(query: &QueryDocument) -> serde_json::Value {
+    let mut document = serde_json::json!({
+        "labels": query.labels,
+        "where": query.predicate,
+        "skip": query.offset,
+        "limit": query.limit,
+    });
+    if let Some(select) = &query.select {
+        document["select"] = select.clone();
+    }
+    if !query.group_by.is_empty() {
+        document["groupBy"] = serde_json::Value::Array(
+            query
+                .group_by
+                .iter()
+                .map(|g| serde_json::Value::String(g.clone()))
+                .collect(),
+        );
+    }
+    if let Some(order) = &query.order {
+        document["orderBy"] = order.clone();
+    }
+    document
+}
+
+mod bytecode;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod facet_tests;
+
+#[cfg(test)]
+mod contract_tests;
+
+#[cfg(test)]
+mod atomic_write_tests;
+
+#[cfg(test)]
+mod csv_ingest_tests;
+#[cfg(test)]
+mod merge_key_tests;
+mod request_bounds;
+pub(crate) use request_bounds::effective_deadline_ms;
+use request_bounds::request_limits;
+#[cfg(test)]
+mod request_bounds_tests;
+#[cfg(test)]
+mod statement_text_search_tests;
+#[cfg(test)]
+mod text_search_tests;
+#[cfg(test)]
+mod transaction_ingest_tests;
+#[cfg(test)]
+mod transaction_reference_tests;
+#[cfg(test)]
+mod unlink_tests;
+
+#[cfg(test)]
+mod structural_index_tests;
+
+#[cfg(test)]
+mod gremlin_bytecode_tests;
+
+#[cfg(test)]
+mod value_domain_index_tests {
+    use super::*;
+    use rushdb_lmpg::plan::FieldChange;
+
+    #[test]
+    fn value_domain_index_matches_scan_and_falls_back_for_arrays() {
+        use rushdb_protocol::PropertyValuesMode;
+        let mut cfg = crate::ServerConfig::default();
+        let node = Node::bootstrap(&mut cfg).unwrap();
+        let lmpg = node.scope().lmpg();
+        let set = |k: &str, v: serde_json::Value| (k.to_string(), FieldChange::Set(v));
+        lmpg.create_record(
+            "P",
+            None,
+            vec![
+                set("n", serde_json::json!(1)),
+                set("s", serde_json::json!("a")),
+                set("arr", serde_json::json!([1, 2])),
+            ],
+        )
+        .unwrap();
+        lmpg.create_record(
+            "P",
+            None,
+            vec![
+                set("n", serde_json::json!(2)),
+                set("s", serde_json::json!("b")),
+            ],
+        )
+        .unwrap();
+        lmpg.create_record(
+            "P",
+            None,
+            vec![
+                set("n", serde_json::json!(2.5)),
+                set("s", serde_json::json!("a")),
+            ],
+        )
+        .unwrap();
+        lmpg.create_record(
+            "P",
+            None,
+            vec![("nv".to_string(), FieldChange::ExplicitNull)],
+        )
+        .unwrap();
+
+        let call = |property: &str, mode: PropertyValuesMode, labels: Vec<String>| {
+            let Response::PropertyValues {
+                distinct_count,
+                min,
+                max,
+                ..
+            } = ProtocolExecutor::new(&node, None)
+                .execute(RequestEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: None,
+                    context: rushdb_protocol::RequestContext::default(),
+                    operation: Operation::Query {
+                        query: Query::PropertyValues {
+                            property: property.to_string(),
+                            query: QueryDocument {
+                                labels,
+                                ..Default::default()
+                            },
+                            mode: Some(mode),
+                            limit: None,
+                            search: None,
+                        },
+                    },
+                })
+                .unwrap()
+                .response
+            else {
+                panic!("expected propertyValues response")
+            };
+            (
+                distinct_count.unwrap_or(0),
+                min.and_then(|v| v.as_f64()),
+                max.and_then(|v| v.as_f64()),
+            )
+        };
+        for property in ["n", "s", "arr", "nv"] {
+            for mode in [PropertyValuesMode::Count, PropertyValuesMode::Range] {
+                let indexed = call(property, mode, Vec::new());
+                let scanned = call(property, mode, vec!["P".to_string()]);
+                assert_eq!(indexed, scanned, "{property} {mode:?}");
+            }
+        }
+        assert_eq!(call("n", PropertyValuesMode::Count, Vec::new()).0, 3);
+        assert_eq!(
+            call("n", PropertyValuesMode::Range, Vec::new()),
+            (3, Some(1.0), Some(2.5))
+        );
+        assert_eq!(call("nv", PropertyValuesMode::Count, Vec::new()).0, 1);
+        assert_eq!(call("arr", PropertyValuesMode::Count, Vec::new()).0, 1);
+    }
+
+    #[test]
+    fn values_mode_returns_values_of_a_mixed_case_property() {
+        use rushdb_protocol::PropertyValuesMode;
+        let mut cfg = crate::ServerConfig::default();
+        let node = Node::bootstrap(&mut cfg).unwrap();
+        let lmpg = node.scope().lmpg();
+        for grade in ["K", "9", "K"] {
+            lmpg.create_record(
+                "School",
+                None,
+                vec![(
+                    "Low Grade".to_string(),
+                    FieldChange::Set(serde_json::json!(grade)),
+                )],
+            )
+            .unwrap();
+        }
+        let values = |property: &str, labels: Vec<String>| {
+            let Response::PropertyValues {
+                values,
+                distinct_count,
+                ..
+            } = ProtocolExecutor::new(&node, None)
+                .execute(RequestEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: None,
+                    context: rushdb_protocol::RequestContext::default(),
+                    operation: Operation::Query {
+                        query: Query::PropertyValues {
+                            property: property.to_string(),
+                            query: QueryDocument {
+                                labels,
+                                ..Default::default()
+                            },
+                            mode: Some(PropertyValuesMode::Values),
+                            limit: None,
+                            search: None,
+                        },
+                    },
+                })
+                .unwrap()
+                .response
+            else {
+                panic!("expected propertyValues response")
+            };
+            let mut values: Vec<String> = values
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            values.sort();
+            (values, distinct_count)
+        };
+        let expected = (vec!["9".to_string(), "K".to_string()], Some(2));
+        assert_eq!(values("Low Grade", Vec::new()), expected);
+        assert_eq!(values("Low Grade", vec!["School".to_string()]), expected);
+        assert_eq!(values("low_grade", vec!["School".to_string()]), expected);
+    }
+
+    #[test]
+    fn values_mode_renders_datetimes_by_their_own_definition() {
+        use rushdb_protocol::PropertyValuesMode;
+        let mut cfg = crate::ServerConfig::default();
+        let node = Node::bootstrap(&mut cfg).unwrap();
+        let run = |operation: Operation| {
+            ProtocolExecutor::new(&node, None)
+                .execute(RequestEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: None,
+                    context: rushdb_protocol::RequestContext::default(),
+                    operation,
+                })
+                .unwrap()
+                .response
+        };
+        // The same name is a string on one label (not a parseable datetime)
+        // and a datetime on another, the first definition being the string.
+        for (label, created) in [("Comment", "2010-07-19 19:15:52.0"), ("Vote", "2010-07-19")] {
+            run(Operation::Ingest {
+                ingest: rushdb_protocol::Ingest::Documents {
+                    label: Some(label.to_string()),
+                    documents: serde_json::json!([{ "CreationDate": created }]),
+                    options: serde_json::json!({ "suggestTypes": true }),
+                },
+            });
+        }
+        let Response::PropertyValues { values, .. } = run(Operation::Query {
+            query: Query::PropertyValues {
+                property: "CreationDate".to_string(),
+                query: QueryDocument {
+                    labels: vec!["Vote".to_string()],
+                    ..Default::default()
+                },
+                mode: Some(PropertyValuesMode::Values),
+                limit: None,
+                search: None,
+            },
+        }) else {
+            panic!("expected propertyValues response")
+        };
+        assert_eq!(values, vec![serde_json::json!("2010-07-19")]);
+    }
+
+    #[test]
+    fn values_range_preserves_large_integer_ordering() {
+        let low = serde_json::Value::Number(9_007_199_254_740_992i64.into());
+        let high = serde_json::Value::Number(9_007_199_254_740_993i64.into());
+        let (min, max) = values_range(&[high.clone(), low.clone()]);
+        assert_eq!(min, Some(low));
+        assert_eq!(max, Some(high));
+    }
+}

@@ -26,3 +26,61 @@ pub(crate) struct FairGate {
 
 /// Holding a [`Turn`] means every earlier ticket holder has passed the gate;
 /// dropping it admits the next ticket.
+pub(crate) struct Turn<'a>(&'a FairGate);
+
+impl FairGate {
+    /// Wait for this caller's turn.
+    pub(crate) fn enter(&self) -> Turn<'_> {
+        let ticket = self.next.fetch_add(1, Ordering::AcqRel);
+        let mut serving = self.serving.lock().unwrap_or_else(PoisonError::into_inner);
+        while *serving != ticket {
+            serving = self
+                .turn
+                .wait(serving)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        Turn(self)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .serving
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        self.0.turn.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn turns_are_served_in_ticket_order() {
+        let gate = Arc::new(FairGate::default());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        // Hold the first turn so every other ticket queues behind it.
+        let first = gate.enter();
+        let mut workers = Vec::new();
+        for id in 0..8u64 {
+            let (worker_gate, worker_order) = (Arc::clone(&gate), Arc::clone(&order));
+            workers.push(std::thread::spawn(move || {
+                let _turn = worker_gate.enter();
+                worker_order.lock().unwrap().push(id);
+            }));
+            // Take tickets in a known order.
+            while gate.next.load(Ordering::Acquire) != id + 2 {
+                std::thread::yield_now();
+            }
+        }
+        drop(first);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), (0..8).collect::<Vec<_>>());
+    }
+}
