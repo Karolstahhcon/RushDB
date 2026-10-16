@@ -96,3 +96,102 @@ impl<'a> Transaction<'a> {
     ) -> Self {
         self.ops.push(BatchOp::UpdateFields {
             owner: rushdb_types::ids::OwnerKind::Record,
+            owner_ord,
+            owner_public_id,
+            fields,
+        });
+        self
+    }
+
+    /// Stage a label change from `from_label` to `to_label` for a record.
+    #[must_use]
+    pub fn retype_record(
+        mut self,
+        record: rushdb_lmpg::RecordRef,
+        from_label: impl Into<String>,
+        to_label: impl Into<String>,
+    ) -> Self {
+        self.ops.push(BatchOp::RetypeRecord {
+            record,
+            from_label: from_label.into(),
+            to_label: to_label.into(),
+        });
+        self
+    }
+
+    /// Stage a relationship creation between two record references.
+    #[must_use]
+    pub fn create_relationship(
+        mut self,
+        rel_type: impl Into<String>,
+        source: rushdb_lmpg::RecordRef,
+        target: rushdb_lmpg::RecordRef,
+        fields: Vec<(String, rushdb_lmpg::FieldChange)>,
+    ) -> Self {
+        self.ops.push(BatchOp::CreateRelationship {
+            rel_type: rel_type.into(),
+            source,
+            target,
+            fields,
+        });
+        self
+    }
+
+    /// Stage a record deletion.
+    #[must_use]
+    pub fn delete_record(mut self, record: rushdb_lmpg::RecordRef) -> Self {
+        self.ops.push(BatchOp::DeleteRecord { record });
+        self
+    }
+
+    /// Append a raw [`BatchOp`] to the staged operation list.
+    #[must_use]
+    pub fn stage(mut self, op: BatchOp) -> Self {
+        self.ops.push(op);
+        self
+    }
+
+    /// Returns `true` when no operations have been staged yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Publish every staged operation as one atomic LMPG batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`TxError::Engine`] when the engine rejects the
+    /// batch, for example on a transaction conflict.
+    pub fn commit(self) -> Result<CommittedBatch, TxError> {
+        let mut batch = self.lmpg.begin_batch();
+        batch.ops = self.ops;
+        self.lmpg.run_batch(batch).map_err(Into::into)
+    }
+}
+
+/// Idempotency surface documented in the plan: transaction/commit tokens
+/// never carry authority; outcomes are discovered by commit key.
+pub enum KnownOutcome {
+    /// The commit key is durably recorded at the given commit index.
+    Committed(u64),
+    /// The commit key has no durable outcome and the request is retryable.
+    NeverProposed,
+}
+
+/// Look up the durable outcome for `commit_key` without consuming any
+/// coordinator state or staging quota.
+#[must_use]
+pub fn discover_outcome(
+    store: &std::sync::Arc<rushdb_storage::Store>,
+    commit_key: Uuid,
+) -> KnownOutcome {
+    match store.committed_index_for(commit_key) {
+        Some(ci) => KnownOutcome::Committed(ci),
+        None => KnownOutcome::NeverProposed,
+    }
+}
+
+mod coordinator;
+mod staging;
+pub use coordinator::{TransactionLimits, TxCoordinator, TxOutcome, TxStatus};
