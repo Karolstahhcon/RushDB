@@ -270,3 +270,275 @@ fn compact_encoding_discards_input_spare_capacity_and_checks_depth() {
         fields: vec![("deep".into(), FieldChange::Set(nested))],
     };
     assert!(coordinator
+        .stage(&tx, too_deep)
+        .unwrap_err()
+        .contains("depth"));
+    assert_eq!(coordinator.state.lock().unwrap().active[&tx].ops.len(), 1);
+}
+
+#[test]
+fn coordinator_metadata_admission_is_fallible_and_released_on_drop() {
+    let store = store(1024);
+    let tiny = TransactionLimits {
+        max_expired_ids: 0,
+        ..limits()
+    };
+    let coordinator = coord(&store, 1, tiny);
+    assert!(coordinator.begin().is_err());
+    assert!(TxCoordinator::with_limits(
+        store.clone(),
+        TenantId::from_ordinal(2),
+        Duration::from_secs(1),
+        None,
+        tiny
+    )
+    .is_err());
+    assert_eq!(store.transaction_budget().snapshot().used, 1024);
+    drop(coordinator);
+    assert_eq!(store.transaction_budget().snapshot().used, 0);
+}
+
+#[test]
+fn encoded_payload_charge_survives_until_replicated_acknowledgement() {
+    struct ObserveAck {
+        store: std::sync::Weak<Store>,
+        observed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl rushdb_storage::Replicator for ObserveAck {
+        fn replicate(
+            &self,
+            batch: &rushdb_types::command::CommitBatch,
+            payload: &[u8],
+        ) -> Result<(), String> {
+            let store = self.store.upgrade().unwrap();
+            store
+                .apply_replicated_batch_with_payload(batch, Some(payload))
+                .map_err(|e| e.to_string())?;
+            self.observed.store(
+                store.transaction_budget().snapshot().used,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }
+    }
+    let store = store(64 * 1024);
+    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    store.set_replicator(Some(Arc::new(ObserveAck {
+        store: Arc::downgrade(&store),
+        observed: observed.clone(),
+    })));
+    let coordinator = coord(&store, 1, limits());
+    let baseline = store.transaction_budget().snapshot().used;
+    let tx = coordinator.begin().unwrap();
+    coordinator.stage(&tx, op(1024)).unwrap();
+    let staged = store.transaction_budget().snapshot().used;
+    let outcome = coordinator.commit(&tx);
+    assert!(matches!(outcome, TxOutcome::Committed(_)), "{outcome:?}");
+    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), staged);
+    assert_eq!(store.transaction_budget().snapshot().used, baseline);
+}
+
+#[test]
+fn durable_retry_discovery_does_not_require_free_staging_capacity() {
+    let store = store(64 * 1024);
+    let coordinator = coord(&store, 1, limits());
+    let tx = coordinator.begin().unwrap();
+    coordinator.stage(&tx, op(10)).unwrap();
+    let outcome = coordinator.commit(&tx);
+    assert!(matches!(outcome, TxOutcome::Committed(_)));
+    drop(coordinator);
+    let pool = store.transaction_budget();
+    let _full = pool.try_reserve(pool.snapshot().limit).unwrap();
+    assert_eq!(TxCoordinator::discover(&store, &tx).unwrap(), Some(outcome));
+}
+
+#[test]
+fn immediate_expiry_is_reported_even_without_expiry_id_retention() {
+    let store = store(64 * 1024);
+    let coordinator = coord(
+        &store,
+        1,
+        TransactionLimits {
+            max_expired_ids: 0,
+            ..limits()
+        },
+    );
+    let baseline = store.transaction_budget().snapshot().used;
+    let tx = coordinator.begin().unwrap();
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .active
+        .get_mut(&tx)
+        .unwrap()
+        .expires_at = Instant::now();
+    assert_eq!(coordinator.commit(&tx), TxOutcome::Expired);
+    assert_eq!(store.transaction_budget().snapshot().used, baseline);
+    let tx = coordinator.begin().unwrap();
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .active
+        .get_mut(&tx)
+        .unwrap()
+        .expires_at = Instant::now();
+    assert!(coordinator
+        .stage(&tx, op(1))
+        .unwrap_err()
+        .contains("expired"));
+    assert_eq!(store.transaction_budget().snapshot().used, baseline);
+}
+
+#[test]
+fn invalid_limits_and_ttl_do_not_reserve_metadata() {
+    let store = store(64 * 1024);
+    for invalid in [
+        TransactionLimits {
+            max_active: 0,
+            ..limits()
+        },
+        TransactionLimits {
+            max_operations: 0,
+            ..limits()
+        },
+        TransactionLimits {
+            max_staged_bytes: 0,
+            ..limits()
+        },
+        TransactionLimits {
+            max_expired_ids: usize::MAX,
+            ..limits()
+        },
+    ] {
+        assert!(TxCoordinator::with_limits(
+            store.clone(),
+            TenantId::from_ordinal(1),
+            Duration::from_secs(30),
+            None,
+            invalid
+        )
+        .is_err());
+    }
+    assert!(TxCoordinator::with_limits(
+        store.clone(),
+        TenantId::from_ordinal(1),
+        Duration::ZERO,
+        None,
+        limits()
+    )
+    .is_err());
+    assert!(TxCoordinator::with_limits(
+        store.clone(),
+        TenantId::from_ordinal(1),
+        Duration::MAX,
+        None,
+        limits()
+    )
+    .is_err());
+    assert_eq!(store.transaction_budget().snapshot().used, 0);
+}
+
+/// Autocommit semantics: an expired transaction with `autocommit: true` is
+/// COMMITTED (best effort) by the reaper instead of rolled back.
+#[test]
+fn expired_autocommit_transaction_is_committed_by_reaper() {
+    let store = store(64 * 1024);
+    let coordinator = coord(&store, 1, limits());
+    let tx = coordinator.begin_with(None, true).unwrap();
+    coordinator.stage(&tx, op(10)).unwrap();
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .active
+        .get_mut(&tx)
+        .unwrap()
+        .expires_at = Instant::now();
+    assert_eq!(
+        coordinator.reap_expired(),
+        1,
+        "reaper settles the expired tx"
+    );
+    assert_eq!(
+        coordinator.commit(&tx),
+        TxOutcome::Committed(1),
+        "an autocommit tx is committed on expiry (discover returns the outcome)"
+    );
+
+    let view = store.read_view().unwrap();
+    assert!(
+        rushdb_lmpg::reader::try_access::record_by_ord(&view, TenantId::from_ordinal(1), 0)
+            .unwrap()
+            .is_some(),
+        "the autocommitted staged write is durable after expiry"
+    );
+}
+
+/// When the client's own `commit` is what settles an expired autocommit
+/// transaction, that call reports the commit, and a repeat reports it again.
+#[test]
+fn commit_after_autocommit_expiry_reports_the_commit_at_once() {
+    let store = store(64 * 1024);
+    let coordinator = coord(&store, 1, limits());
+    let tx = coordinator.begin_with(None, true).unwrap();
+    coordinator.stage(&tx, op(10)).unwrap();
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .active
+        .get_mut(&tx)
+        .unwrap()
+        .expires_at = Instant::now();
+    assert_eq!(coordinator.commit(&tx), TxOutcome::Committed(1));
+    assert_eq!(coordinator.commit(&tx), TxOutcome::Committed(1));
+}
+
+#[test]
+fn maintenance_expiry_releases_autocommit_without_publishing() {
+    let store = store(64 * 1024);
+    let coordinator = coord(&store, 1, limits());
+    let tx = coordinator.begin_with(None, true).unwrap();
+    coordinator.stage(&tx, op(10)).unwrap();
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .active
+        .get_mut(&tx)
+        .unwrap()
+        .expires_at = Instant::now();
+
+    assert_eq!(coordinator.reap_expired_without_autocommit(), 1);
+    assert_eq!(store.committed_version(), 0);
+    assert_eq!(coordinator.active_count(), 0);
+}
+
+/// The default remains rollback: an expired tx WITHOUT autocommit is discarded.
+#[test]
+fn expired_non_autocommit_transaction_is_discarded() {
+    let store = store(64 * 1024);
+    let coordinator = coord(&store, 1, limits());
+    let tx = coordinator.begin().unwrap(); // autocommit = false (default)
+    coordinator.stage(&tx, op(10)).unwrap();
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .active
+        .get_mut(&tx)
+        .unwrap()
+        .expires_at = Instant::now();
+    coordinator.reap_expired();
+    assert_eq!(coordinator.commit(&tx), TxOutcome::Expired);
+
+    let view = store.read_view().unwrap();
+    assert!(
+        rushdb_lmpg::reader::try_access::record_by_ord(&view, TenantId::from_ordinal(1), 0)
+            .unwrap()
+            .is_none(),
+        "a non-autocommit tx is rolled back on expiry"
+    );
+}

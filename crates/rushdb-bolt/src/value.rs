@@ -183,3 +183,373 @@ fn encode_int(i: i64, out: &mut Vec<u8>) {
         out.extend_from_slice(&value.to_be_bytes());
     } else {
         out.push(MARKER_INT64);
+        out.extend_from_slice(&i.to_be_bytes());
+    }
+}
+
+/// Encode a single JSON value into `out` using Bolt packed-stream markers.
+pub fn encode_value(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Null => out.push(MARKER_NULL),
+        Value::Bool(b) => out.push(if *b { MARKER_TRUE } else { MARKER_FALSE }),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                encode_int(i, out);
+            } else if let Some(f) = n.as_f64() {
+                out.push(MARKER_FLOAT64);
+                out.extend_from_slice(&f.to_be_bytes());
+            } else {
+                out.push(MARKER_NULL);
+            }
+        }
+        Value::String(s) => encode_string(s, out),
+        Value::Array(list) => encode_list(list, out),
+        Value::Object(map) => encode_map(map, out),
+    }
+}
+
+// ---- decoding -------------------------------------------------------------
+
+/// Decode a full Bolt packed-stream value from `buf`.
+///
+/// # Errors
+///
+/// Returns an error if the buffer is truncated or contains an unsupported
+/// marker or invalid UTF-8.
+pub fn decode(buf: &[u8]) -> Result<Value, String> {
+    let mut cursor = 0;
+    let value = decode_at(buf, &mut cursor)?;
+    if cursor != buf.len() {
+        return Err(format!(
+            "bolt: trailing bytes after value ({} bytes)",
+            buf.len() - cursor
+        ));
+    }
+    Ok(value)
+}
+
+fn read_exact<'a>(buf: &'a [u8], cursor: &mut usize, n: usize) -> Result<&'a [u8], String> {
+    let end = cursor
+        .checked_add(n)
+        .ok_or_else(|| "bolt: value length overflow".to_string())?;
+    if end > buf.len() {
+        return Err(format!(
+            "bolt: truncated value (need {n} bytes at {})",
+            *cursor
+        ));
+    }
+    let slice = &buf[*cursor..end];
+    *cursor = end;
+    Ok(slice)
+}
+
+fn read_u8(buf: &[u8], cursor: &mut usize) -> Result<u8, String> {
+    Ok(read_exact(buf, cursor, 1)?[0])
+}
+
+fn read_array<const N: usize>(buf: &[u8], cursor: &mut usize) -> Result<[u8; N], String> {
+    let slice = read_exact(buf, cursor, N)?;
+    let mut bytes = [0u8; N];
+    bytes.copy_from_slice(slice);
+    Ok(bytes)
+}
+
+fn read_u16(buf: &[u8], cursor: &mut usize) -> Result<u16, String> {
+    Ok(u16::from_be_bytes(read_array(buf, cursor)?))
+}
+
+fn read_u32(buf: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    Ok(u32::from_be_bytes(read_array(buf, cursor)?))
+}
+
+fn read_len32(buf: &[u8], cursor: &mut usize) -> Result<usize, String> {
+    usize::try_from(read_u32(buf, cursor)?)
+        .map_err(|_| "bolt: declared length exceeds address space".to_string())
+}
+
+fn decode_string(buf: &[u8], cursor: &mut usize, len: usize) -> Result<Value, String> {
+    let bytes = read_exact(buf, cursor, len)?;
+    String::from_utf8(bytes.to_vec())
+        .map(Value::String)
+        .map_err(|e| format!("bolt: invalid UTF-8 string: {e}"))
+}
+
+/// Decode one Bolt packed-stream value starting at `cursor`, advancing it.
+///
+/// # Errors
+///
+/// Returns an error if the value is truncated or uses an unsupported marker.
+pub fn decode_at(buf: &[u8], cursor: &mut usize) -> Result<Value, String> {
+    decode_at_depth(buf, cursor, 0)
+}
+
+fn decode_at_depth(buf: &[u8], cursor: &mut usize, depth: usize) -> Result<Value, String> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err("bolt: value nesting depth exceeds limit".into());
+    }
+    let marker = read_u8(buf, cursor)?;
+    decode_marker(marker, buf, cursor, depth)
+}
+
+fn decode_marker(
+    marker: u8,
+    buf: &[u8],
+    cursor: &mut usize,
+    depth: usize,
+) -> Result<Value, String> {
+    match marker {
+        0x00..=0x7F => Ok(Value::Number(Number::from(i64::from(marker)))),
+        0xF0..=0xFF => Ok(Value::Number(Number::from(i64::from(marker) - 256))),
+        0x80..=0x8F => decode_string(buf, cursor, usize::from(marker & 0x0F)),
+        MARKER_NULL => Ok(Value::Null),
+        MARKER_FALSE => Ok(Value::Bool(false)),
+        MARKER_TRUE => Ok(Value::Bool(true)),
+        MARKER_FLOAT64 => {
+            let float = f64::from_be_bytes(read_array(buf, cursor)?);
+            Ok(Number::from_f64(float).map_or(Value::Null, Value::Number))
+        }
+        MARKER_INT8 => {
+            let value = i8::from_be_bytes(read_array(buf, cursor)?);
+            Ok(Value::Number(Number::from(i64::from(value))))
+        }
+        MARKER_INT16 => {
+            let value = i16::from_be_bytes(read_array(buf, cursor)?);
+            Ok(Value::Number(Number::from(i64::from(value))))
+        }
+        MARKER_INT32 => {
+            let value = i32::from_be_bytes(read_array(buf, cursor)?);
+            Ok(Value::Number(Number::from(i64::from(value))))
+        }
+        MARKER_INT64 => {
+            let value = i64::from_be_bytes(read_array(buf, cursor)?);
+            Ok(Value::Number(Number::from(value)))
+        }
+        MARKER_STRING8 => {
+            let len = usize::from(read_u8(buf, cursor)?);
+            decode_string(buf, cursor, len)
+        }
+        MARKER_STRING16 => {
+            let len = usize::from(read_u16(buf, cursor)?);
+            decode_string(buf, cursor, len)
+        }
+        MARKER_STRING32 => {
+            let len = read_len32(buf, cursor)?;
+            decode_string(buf, cursor, len)
+        }
+        0x90..=0x9F => decode_list(buf, cursor, usize::from(marker & 0x0F), depth),
+        MARKER_LIST8 => {
+            let len = usize::from(read_u8(buf, cursor)?);
+            decode_list(buf, cursor, len, depth)
+        }
+        MARKER_LIST16 => {
+            let len = usize::from(read_u16(buf, cursor)?);
+            decode_list(buf, cursor, len, depth)
+        }
+        MARKER_LIST32 => {
+            let len = read_len32(buf, cursor)?;
+            decode_list(buf, cursor, len, depth)
+        }
+        0xA0..=0xAF => decode_map(buf, cursor, usize::from(marker & 0x0F), depth),
+        MARKER_MAP8 => {
+            let len = usize::from(read_u8(buf, cursor)?);
+            decode_map(buf, cursor, len, depth)
+        }
+        MARKER_MAP16 => {
+            let len = usize::from(read_u16(buf, cursor)?);
+            decode_map(buf, cursor, len, depth)
+        }
+        MARKER_MAP32 => {
+            let len = read_len32(buf, cursor)?;
+            decode_map(buf, cursor, len, depth)
+        }
+        0xB0..=0xBF => decode_struct(buf, cursor, usize::from(marker & 0x0F), depth),
+        other => Err(format!("bolt: unsupported marker 0x{other:02x}")),
+    }
+}
+
+fn decode_struct(
+    buf: &[u8],
+    cursor: &mut usize,
+    size: usize,
+    depth: usize,
+) -> Result<Value, String> {
+    check_container_size(size)?;
+    let tag = read_u8(buf, cursor)?;
+    let mut fields = Vec::with_capacity(size);
+    for _ in 0..size {
+        fields.push(decode_at_depth(buf, cursor, depth + 1)?);
+    }
+    // Represent structs as a tagged object so callers can dispatch.
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "__bolt_tag".into(),
+        Value::Number(Number::from(i64::from(tag))),
+    );
+    map.insert("__bolt_fields".into(), Value::Array(fields));
+    Ok(Value::Object(map))
+}
+
+fn decode_list(buf: &[u8], cursor: &mut usize, len: usize, depth: usize) -> Result<Value, String> {
+    check_container_size(len)?;
+    let mut list = Vec::with_capacity(len);
+    for _ in 0..len {
+        list.push(decode_at_depth(buf, cursor, depth + 1)?);
+    }
+    Ok(Value::Array(list))
+}
+
+fn decode_map(buf: &[u8], cursor: &mut usize, len: usize, depth: usize) -> Result<Value, String> {
+    check_container_size(len)?;
+    let mut map = serde_json::Map::new();
+    for _ in 0..len {
+        let key = decode_at_depth(buf, cursor, depth + 1)?;
+        let key = match key {
+            Value::String(s) => s,
+            other => format!("{other}"),
+        };
+        let value = decode_at_depth(buf, cursor, depth + 1)?;
+        map.insert(key, value);
+    }
+    Ok(Value::Object(map))
+}
+
+fn check_container_size(size: usize) -> Result<(), String> {
+    if size > MAX_CONTAINER_ITEMS {
+        return Err("bolt: container item count exceeds limit".into());
+    }
+    Ok(())
+}
+
+/// Extract the struct tag from a decoded struct-object.
+#[must_use]
+pub fn struct_tag(value: &Value) -> Option<u8> {
+    value
+        .get("__bolt_tag")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|tag| u8::try_from(tag).ok())
+}
+
+/// Extract the struct fields from a decoded struct-object.
+#[must_use]
+pub fn struct_fields(value: &Value) -> Vec<Value> {
+    value
+        .get("__bolt_fields")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(value: &Value) {
+        let mut out = Vec::new();
+        encode_value(value, &mut out);
+        let decoded = decode(&out).unwrap();
+        assert_eq!(&decoded, value, "roundtrip failed for {value}");
+    }
+
+    #[test]
+    fn roundtrips_scalars_and_containers() {
+        roundtrip(&serde_json::json!(null));
+        roundtrip(&serde_json::json!(true));
+        roundtrip(&serde_json::json!(false));
+        roundtrip(&serde_json::json!(0));
+        roundtrip(&serde_json::json!(127));
+        roundtrip(&serde_json::json!(-16));
+        roundtrip(&serde_json::json!(-17));
+        roundtrip(&serde_json::json!(300));
+        roundtrip(&serde_json::json!(70_000));
+        roundtrip(&serde_json::json!(-4_000_000_000_i64));
+        roundtrip(&serde_json::json!(9_000_000_000_000_000_000_i64));
+        roundtrip(&serde_json::json!(3.25));
+        roundtrip(&serde_json::json!("hello"));
+        roundtrip(&serde_json::json!("a".repeat(40)));
+        roundtrip(&serde_json::json!("a".repeat(300)));
+        roundtrip(&serde_json::json!([1, "two", 3.0, null, true]));
+        roundtrip(&serde_json::json!({ "name": "ada", "age": 36, "tags": ["x", "y"] }));
+    }
+
+    #[test]
+    fn encodes_tiny_markers() {
+        let mut out = Vec::new();
+        encode_string("hi", &mut out);
+        assert_eq!(out[0], 0x82);
+        let mut out = Vec::new();
+        encode_int(5, &mut out);
+        assert_eq!(out[0], 5);
+        let mut out = Vec::new();
+        encode_int(-5, &mut out);
+        assert_eq!(out[0], 0xFB);
+    }
+
+    /// The byte values are `PackStream`'s, as Neo4j drivers read them; a codec
+    /// that only round-trips through itself cannot catch a shifted marker.
+    #[test]
+    fn encodes_scalars_with_packstream_markers() {
+        let encoded = |value: Value| {
+            let mut out = Vec::new();
+            encode_value(&value, &mut out);
+            out
+        };
+        assert_eq!(encoded(Value::Null), [0xC0]);
+        assert_eq!(encoded(Value::Bool(false)), [0xC2]);
+        assert_eq!(encoded(Value::Bool(true)), [0xC3]);
+        assert_eq!(
+            encoded(serde_json::json!(1.5)),
+            [0xC1, 0x3F, 0xF8, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(decode(&[0xC3]).unwrap(), Value::Bool(true));
+        assert_eq!(decode(&[0xC2]).unwrap(), Value::Bool(false));
+        assert_eq!(
+            decode(&[0xC1, 0x3F, 0xF8, 0, 0, 0, 0, 0, 0]).unwrap(),
+            serde_json::json!(1.5)
+        );
+    }
+
+    #[test]
+    fn decodes_struct() {
+        let mut out = Vec::new();
+        encode_struct(0x01, vec![serde_json::json!({"a": 1})], &mut out);
+        let value = decode(&out).unwrap();
+        assert_eq!(struct_tag(&value), Some(0x01));
+        let fields = struct_fields(&value);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["a"], 1);
+    }
+
+    #[test]
+    fn rejects_declared_huge_containers_and_deep_nesting() {
+        let mut huge = vec![MARKER_LIST32];
+        huge.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode(&huge).unwrap_err().contains("item count"));
+
+        let mut nested = vec![0x91; MAX_NESTING_DEPTH + 2];
+        nested.push(MARKER_NULL);
+        assert!(decode(&nested).unwrap_err().contains("nesting depth"));
+    }
+
+    #[test]
+    fn uses_wide_markers_at_length_boundaries_and_rejects_trailing_bytes() {
+        let string_255 = "x".repeat(255);
+        let string_256 = "x".repeat(256);
+        let string_65536 = "x".repeat(65_536);
+        let mut encoded = Vec::new();
+        encode_value(&Value::String(string_255), &mut encoded);
+        assert_eq!(encoded[0], MARKER_STRING8);
+        encoded.clear();
+        encode_value(&Value::String(string_256), &mut encoded);
+        assert_eq!(encoded[0], MARKER_STRING16);
+        encoded.clear();
+        encode_value(&Value::String(string_65536), &mut encoded);
+        assert_eq!(encoded[0], MARKER_STRING32);
+        assert!(decode(&[MARKER_NULL, MARKER_NULL]).is_err());
+
+        let list = vec![Value::Null; 256];
+        encoded.clear();
+        encode_list(&list, &mut encoded);
+        assert_eq!(encoded[0], MARKER_LIST16);
+        assert_eq!(decode(&encoded).unwrap().as_array().unwrap().len(), 256);
+    }
+}
