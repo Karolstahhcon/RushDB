@@ -8,3 +8,23 @@
 # machines, put TLS in front (see compose.https.yaml) rather than publishing
 # the plaintext ports on a public interface.
 services:
+  rushdb:
+    image: rushdb/rushdb:${RUSHDB_IMAGE_TAG:-3}
+    restart: unless-stopped
+    environment:
+      RUSHDB_TOKEN: ${RUSHDB_TOKEN:?set RUSHDB_TOKEN, e.g. openssl rand -hex 32}
+    # Server options go here; the image's entrypoint is `rushdb serve`.
+    # Listing --languages replaces the default set (sql,gremlin,sql-pgq,mongodb).
+    # To add Cypher over Bolt, uncomment and publish 7687 below:
+    # command: ['--languages', 'sql,gremlin,sql-pgq,mongodb,cypher', '--bolt-port', '7687']
+    ports:
+      - '127.0.0.1:${RUSHDB_HTTP_PORT:-3000}:3000'
+      - '127.0.0.1:${RUSHDB_PGWIRE_PORT:-5432}:5432'
+      # - '127.0.0.1:7687:7687'
+    volumes:
+      - rushdb-data:/data
+    # A clean stop drains requests and maintenance and writes a checkpoint.
+    stop_grace_period: 90s
+
+volumes:
+  rushdb-data:
