@@ -493,3 +493,499 @@ impl TxCoordinator {
                 _read_view: read_view,
                 policy_generation,
                 ops: Vec::new(),
+                acc,
+                autocommit,
+                _metadata: Some(metadata),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Stage one operation into an active transaction, byte-charging the
+    /// encoded payload and applying it to the transaction's read-your-writes
+    /// overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `tx_id` is unknown or expired, when the
+    /// operation or byte limits are exceeded, when staging cannot reserve
+    /// memory, or when the operation cannot be planned on the overlay.
+    ///
+    /// A poisoned state mutex is recovered, not propagated.
+    pub fn stage(&self, tx_id: &str, op: BatchOp) -> Result<(), String> {
+        let mut state = self.lock_state();
+        let now = Instant::now();
+        let expired = state
+            .active
+            .get(tx_id)
+            .is_some_and(|tx| now >= tx.expires_at);
+        let settled = state.expire(now, self.limits.max_expired_ids);
+        drop(state);
+        self.settle(settled);
+        let mut state = self.lock_state();
+        if expired || state.was_expired(tx_id) {
+            return Err("transaction expired".into());
+        }
+        let tx = state
+            .active
+            .get_mut(tx_id)
+            .ok_or("unknown transaction id")?;
+        if tx.ops.len() >= self.limits.max_operations {
+            return Err("resource exhausted: transaction operation limit".into());
+        }
+        let staged = StagedOp::encode(
+            &op,
+            self.limits.max_staged_bytes - tx.staged_bytes,
+            &self.budget,
+        )?;
+        if Instant::now() >= tx.expires_at {
+            state.expire(Instant::now(), self.limits.max_expired_ids);
+            return Err("transaction expired".into());
+        }
+        tx.ops
+            .try_reserve(1)
+            .map_err(|e| format!("resource exhausted: {e}"))?;
+        tx.staged_bytes += staged.len();
+        tx.ops.push(staged);
+        // Read-your-writes: apply the operation to the transaction overlay now
+        // (planning reads committed state merged with earlier staged writes),
+        // so later stages and commits see this operation's effects.
+        let lmpg = self.lmpg();
+        Self::apply_batch_op(&lmpg, op, &mut tx.acc).map_err(|e| e.to_reason())?;
+        Ok(())
+    }
+
+    /// Stage every operation of a pre-built batch (e.g. a statement-language
+    /// mutation delta) into the transaction, byte-charging each op.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error reported by [`stage`](Self::stage); operations
+    /// staged before the failure remain staged.
+    pub fn stage_batch(&self, tx_id: &str, batch: rushdb_lmpg::BatchTx) -> Result<(), String> {
+        for op in batch.ops {
+            self.stage(tx_id, op)?;
+        }
+        Ok(())
+    }
+
+    fn apply_batch_op(
+        lmpg: &Lmpg,
+        op: BatchOp,
+        acc: &mut TxAccumulator,
+    ) -> Result<(), rushdb_lmpg::LmpgError> {
+        use rushdb_lmpg::BatchOp as B;
+        match op {
+            B::CreateRecord {
+                label,
+                explicit_id,
+                fields,
+            } => {
+                lmpg.create_record_tx(&label, explicit_id, fields, Some(acc))?;
+            }
+            B::UpdateFields {
+                owner,
+                owner_ord,
+                owner_public_id,
+                fields,
+            } => {
+                debug_assert_eq!(owner, rushdb_types::ids::OwnerKind::Record);
+                lmpg.update_fields_tx(
+                    rushdb_lmpg::RecordRef {
+                        record_id: owner_public_id,
+                        ordinal: owner_ord,
+                    },
+                    fields,
+                    Some(acc),
+                )?;
+            }
+            B::RetypeRecord {
+                record,
+                from_label,
+                to_label,
+            } => {
+                lmpg.retype_record_tx(record, &from_label, &to_label, Some(acc))?;
+            }
+            B::DeleteRecord { record } => {
+                lmpg.delete_record_tx(record, Some(acc))?;
+            }
+            B::DeleteRelationship { rel } => {
+                lmpg.delete_relationship_tx(rel, Some(acc))?;
+            }
+            B::CreateRelationship {
+                rel_type,
+                source,
+                target,
+                fields,
+            } => {
+                lmpg.create_relationship_tx(&rel_type, source, target, fields, Some(acc))?;
+            }
+            other @ B::CreateRelationshipById { .. } => {
+                return Err(rushdb_lmpg::LmpgError::Conflict(format!(
+                    "transaction stage does not support operation {other:?} yet"
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    /// Read one record inside the transaction. The result merges committed
+    /// state with the transaction's staged writes (read-your-writes), and every
+    /// key the reconstruction touches is recorded into the transaction's
+    /// dependency set so `commit` aborts on concurrent changes to those keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `tx_id` is unknown or expired, when no record
+    /// has `record_id`, when stored rows are corrupt, or when a read
+    /// dependency exceeds the configured read limits.
+    ///
+    /// A poisoned state mutex is recovered, not propagated.
+    pub fn get_record(
+        &self,
+        tx_id: &str,
+        record_id: [u8; 16],
+    ) -> Result<serde_json::Value, String> {
+        let tenant = self.tenant;
+        self.read_in_tx(tx_id, |txn| {
+            let ordinal = resolve_ordinal(txn, tenant, record_id)?;
+            reconstruct_record(txn, tenant, ordinal, record_id)
+        })
+    }
+
+    /// The storage ordinal of the record with public id `record_id`, as the
+    /// transaction sees it: committed records and records this transaction
+    /// staged. The lookup is a tracked read, so `commit` aborts if a
+    /// concurrent writer changes which record holds the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `tx_id` is unknown or expired, when no record
+    /// has `record_id`, or when the stored row is corrupt.
+    ///
+    /// A poisoned state mutex is recovered, not propagated.
+    pub fn resolve_record(&self, tx_id: &str, record_id: [u8; 16]) -> Result<u64, String> {
+        let tenant = self.tenant;
+        self.read_in_tx(tx_id, |txn| resolve_ordinal(txn, tenant, record_id))
+    }
+
+    /// Run a tracked read against an active transaction's view.
+    fn read_in_tx<P>(
+        &self,
+        tx_id: &str,
+        read: impl FnOnce(&mut rushdb_storage::Txn<'_>) -> Result<P, String>,
+    ) -> Result<P, String> {
+        let mut state = self.lock_state();
+        let now = Instant::now();
+        let expired = state
+            .active
+            .get(tx_id)
+            .is_some_and(|tx| now >= tx.expires_at);
+        let settled = state.expire(now, self.limits.max_expired_ids);
+        drop(state);
+        self.settle(settled);
+        let mut state = self.lock_state();
+        if expired || state.was_expired(tx_id) {
+            return Err("transaction expired".into());
+        }
+        let tx = state
+            .active
+            .get_mut(tx_id)
+            .ok_or("unknown transaction id")?;
+        let out = self
+            .store
+            .tx_read(&mut tx.acc, read)
+            .map_err(|e| e.to_string())?;
+        state.last_activity = now;
+        Ok(out)
+    }
+
+    /// Commit an active transaction, publishing all of its staged work as one
+    /// atomic batch and revalidating the authorization generation captured at
+    /// [`begin`](Self::begin). Retrying with the same `tx_id` discovers the
+    /// durable outcome instead of re-executing.
+    ///
+    /// A poisoned state mutex is recovered, not propagated.
+    pub fn commit(&self, tx_id: &str) -> TxOutcome {
+        let key = commit_key_of(tx_id);
+        match Self::discover(&self.store, tx_id) {
+            Ok(Some(outcome)) => {
+                self.lock_state().forget(tx_id);
+                return outcome;
+            }
+            Ok(None) => {}
+            Err(_) => return TxOutcome::UnknownRetryable,
+        }
+        let taken = {
+            let mut state = self.lock_state();
+            let now = Instant::now();
+            let expired = state
+                .active
+                .get(tx_id)
+                .is_some_and(|tx| now >= tx.expires_at);
+            let settled = state.expire(now, self.limits.max_expired_ids);
+            drop(state);
+            self.settle(settled);
+            let mut state = self.lock_state();
+            if expired || state.was_expired(tx_id) {
+                drop(state);
+                // Settling an autocommit transaction commits it: report that
+                // durable outcome now, not on the next call.
+                return match Self::discover(&self.store, tx_id) {
+                    Ok(Some(outcome)) => {
+                        self.lock_state().forget(tx_id);
+                        outcome
+                    }
+                    Ok(None) => TxOutcome::Expired,
+                    Err(_) => TxOutcome::UnknownRetryable,
+                };
+            }
+            match state.active.remove(tx_id) {
+                Some(tx) => {
+                    state.last_activity = now;
+                    tx
+                }
+                None => return TxOutcome::UnknownRetryable,
+            }
+        };
+        let authorizer = self.authorizer.clone();
+        let captured_generation = taken.policy_generation;
+        let tenant = self.tenant;
+        match self
+            .store
+            .tx_commit_revalidated(key, &taken.acc, move |read| {
+                if authorizer.is_none() {
+                    return Ok(());
+                }
+                let Some(captured) = captured_generation else {
+                    return Ok(());
+                };
+                // Revalidate the generation captured at BEGIN against live policy
+                // state, read through the injected reader (no nested store view).
+                let live = match rushdb_authz::load_policy_from_reader(read, tenant, u64::MAX)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(active) => active.generation,
+                    None => 0,
+                };
+                if live != captured {
+                    return Err(
+                        "authorization_changed: policy generation rotated during transaction"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }) {
+            Ok(ci) => TxOutcome::Committed(ci),
+            Err(e) => {
+                let reason = e.to_string();
+                if reason.contains("serializable_conflict")
+                    || reason.contains("transaction_conflict")
+                {
+                    TxOutcome::ConflictRetryable(reason)
+                } else {
+                    TxOutcome::Aborted(reason)
+                }
+            }
+        }
+    }
+
+    /// Native durable retry discovery needs no coordinator or staging quota.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`rushdb_storage::StorageError`] when the durable
+    /// outcome cannot be read from the store.
+    pub fn discover(
+        store: &Store,
+        tx_id: &str,
+    ) -> Result<Option<TxOutcome>, rushdb_storage::StorageError> {
+        Ok(store
+            .try_outcome_for(commit_key_of(tx_id))?
+            .map(|outcome| match outcome {
+                OutcomeKind::Committed(ci) => TxOutcome::Committed(ci),
+                OutcomeKind::Aborted => TxOutcome::Aborted("rolled back".into()),
+            }))
+    }
+
+    /// Record a whole-keyspace read dependency for `tx_id`.
+    ///
+    /// Statement-language staging plans against a committed graph snapshot
+    /// rather than the transaction's overlay, so its predicate read-set is not
+    /// captured. Recording a whole-keyspace dependency conservatively orders
+    /// the transaction against every concurrent writer, preventing phantoms at
+    /// the cost of additional conflicts. Precise predicate/range locking is
+    /// future work.
+    ///
+    /// # Errors
+    /// Returns a message when `tx_id` is unknown.
+    ///
+    /// # Panics
+    /// Panics if the internal state mutex is poisoned by a previous panic.
+    pub fn record_whole_keyspace_dependency(&self, tx_id: &str) -> Result<(), String> {
+        let mut state = self.lock_state();
+        let tx = state
+            .active
+            .get_mut(tx_id)
+            .ok_or("unknown transaction id")?;
+        tx.acc.deps.record_prefix(&[]);
+        Ok(())
+    }
+
+    /// Discard an active transaction and durably record an aborted outcome so a
+    /// later commit with the same `tx_id` cannot report false success.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `tx_id` is unknown or when the aborted outcome
+    /// cannot be recorded.
+    ///
+    /// A poisoned state mutex is recovered, not propagated.
+    pub fn rollback(&self, tx_id: &str) -> Result<(), String> {
+        let mut state = self.lock_state();
+        if state.active.remove(tx_id).is_none() {
+            return Err("unknown transaction id".into());
+        }
+        state.last_activity = Instant::now();
+        drop(state);
+        self.store
+            .record_aborted_outcome(commit_key_of(tx_id))
+            .map_err(|e| format!("record aborted outcome: {e}"))
+    }
+}
+
+/// The ordinal behind a public record id, read through the transaction so
+/// staged creates resolve and the id row becomes a conflict dependency.
+fn resolve_ordinal(
+    txn: &mut rushdb_storage::Txn<'_>,
+    tenant: TenantId,
+    record_id: [u8; 16],
+) -> Result<u64, String> {
+    let raw = txn
+        .get_tracked(&rushdb_types::keys::record_id_key(tenant, &record_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "record not found: {}",
+                uuid::Uuid::from_bytes(record_id).hyphenated()
+            )
+        })?;
+    Ok(u64::from_be_bytes(
+        raw.as_slice()
+            .try_into()
+            .map_err(|_| "corrupt record id row".to_string())?,
+    ))
+}
+
+/// Rebuild one record's JSON view from the transaction's tracked reads,
+/// recording every key as a conflict dependency.
+fn reconstruct_record(
+    txn: &mut rushdb_storage::Txn<'_>,
+    tenant: TenantId,
+    ordinal: u64,
+    record_id: [u8; 16],
+) -> Result<serde_json::Value, String> {
+    // Tracked reads: the header row becomes the conflict dependency.
+    let hdr_raw = txn
+        .get_tracked(&rushdb_types::keys::record_hdr_key(tenant, ordinal))
+        .map_err(|e| e.to_string())?
+        .ok_or("record not found")?;
+    let (stored_id, label) =
+        rushdb_types::keys::decode_record_hdr(&hdr_raw).ok_or("corrupt record header")?;
+    if stored_id != record_id {
+        return Err("record identity mismatch".into());
+    }
+    let label = label.to_owned();
+    let properties = build_properties(txn, tenant, ordinal)?;
+
+    let mut record = serde_json::Map::new();
+    record.insert(
+        rushdb_types::value::ID_FIELD.into(),
+        serde_json::Value::String(uuid::Uuid::from_bytes(record_id).simple().to_string()),
+    );
+    record.insert(
+        rushdb_types::value::LABEL_FIELD.into(),
+        serde_json::Value::String(label),
+    );
+    record.insert("properties".into(), serde_json::Value::Object(properties));
+    Ok(serde_json::Value::Object(record))
+}
+
+/// Materialize a record's properties from its occurrence rows (one tracked
+/// prefix scan, DC11), resolving family names through tracked reads.
+fn build_properties(
+    txn: &mut rushdb_storage::Txn<'_>,
+    tenant: TenantId,
+    ordinal: u64,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut by_pid: BTreeMap<u64, Vec<(bool, rushdb_types::occurrence::OccurrenceValue, Vec<u8>)>> =
+        BTreeMap::new();
+    for (key, raw) in txn
+        .range_prefix_tracked(&rushdb_types::keys::occ_owner_prefix(
+            tenant,
+            OwnerKind::Record,
+            ordinal,
+        ))
+        .map_err(|e| e.to_string())?
+    {
+        let (_, _, _, pid, _) =
+            rushdb_types::keys::parse_occ_key(&key).ok_or("corrupt occurrence key")?;
+        let occ = rushdb_types::occurrence::decode_occ_value(&raw)
+            .map_err(|_| "corrupt occurrence row".to_string())?;
+        by_pid
+            .entry(pid)
+            .or_default()
+            .push((occ.array, occ.value, occ.payload.to_vec()));
+    }
+    let mut properties = serde_json::Map::new();
+    for (pid, rows) in by_pid {
+        let def_raw = txn
+            .get_tracked(&kx::definition_row_key(tenant, pid))
+            .map_err(|e| e.to_string())?
+            .ok_or("corrupt definition")?;
+        let def: rushdb_types::occurrence::PropertyDefinition =
+            serde_json::from_slice(&def_raw).map_err(|e| format!("corrupt definition: {e}"))?;
+        let fam_raw = txn
+            .get_tracked(&kx::family_key(tenant, def.family_id))
+            .map_err(|e| e.to_string())?
+            .ok_or("corrupt family")?;
+        let fam: rushdb_types::occurrence::PropertyFamily =
+            serde_json::from_slice(&fam_raw).map_err(|e| format!("corrupt family: {e}"))?;
+        let is_array = rows.iter().all(|(array, _, _)| *array);
+        let empty_array = rows.len() == 1
+            && matches!(
+                rows[0].1,
+                rushdb_types::occurrence::OccurrenceValue::EmptyArray
+            );
+        let values = rows
+            .iter()
+            .map(|(_, value, payload)| {
+                rushdb_lmpg::reconstruct::decode_value(*value, payload).map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        properties.insert(
+            fam.display_name,
+            if empty_array {
+                serde_json::Value::Array(vec![])
+            } else if is_array {
+                serde_json::Value::Array(values)
+            } else {
+                values.into_iter().next().unwrap_or(serde_json::Value::Null)
+            },
+        );
+    }
+    Ok(properties)
+}
+
+fn commit_key_of(tx_id: &str) -> uuid::Uuid {
+    let mut bytes = [0u8; 16];
+    let h = rushdb_types::hash::stable_hash64(tx_id.as_bytes());
+    let h2 = rushdb_types::hash::stable_hash64(format!("{tx_id}:commit").as_bytes());
+    bytes[..8].copy_from_slice(&h.to_be_bytes());
+    bytes[8..].copy_from_slice(&h2.to_be_bytes());
+    uuid::Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+#[path = "coordinator_tests.rs"]
+mod tests;
