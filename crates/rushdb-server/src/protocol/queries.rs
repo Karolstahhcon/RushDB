@@ -559,3 +559,564 @@ impl ProtocolExecutor<'_> {
                     property,
                     mode,
                     limit,
+                    rank_by_similarity(search, ranked),
+                ));
+            }
+        }
+        // Unscoped Count is O(1) from the maintained exact-distinct counter
+        //; the posting-scan domain below is the fallback for arrays,
+        // missing counters, or Range/TopK (which need values/min/max).
+        if unscoped && search.is_none() && mode == PropertyValuesMode::Count {
+            if let Some(count) = self
+                .node
+                .distinct_count_from_index_in_view(context.read_view().as_ref(), &property)
+                .map_err(execution_failed)?
+            {
+                return Ok(Response::PropertyValues {
+                    property,
+                    values: Vec::new(),
+                    distinct_count: Some(count),
+                    min: None,
+                    max: None,
+                    truncated: false,
+                    counts: Vec::new(),
+                    search_missed: false,
+                });
+            }
+        }
+        // Unfiltered Count/Range/TopK reads are answered from the maintained
+        // dictionaries (`O(distinct)`), with the match-set count below for
+        // filtered queries, array-valued properties, or non-numeric ranges.
+        let indexed = if unfiltered && search.is_none() {
+            self.node
+                .value_domain_from_index_in_view(
+                    context.read_view().as_ref(),
+                    &property,
+                    &query.labels,
+                    &mut meter,
+                )
+                .map_err(execution_failed)?
+        } else {
+            None
+        };
+        // Unfiltered Values, and Range over non-numeric values, rank or bound
+        // the dictionary's (value, owner count) pairs below, the pairs the
+        // match-set scan would collect, instead of reading every record.
+        // Explicit nulls are not dictionary entries: those properties scan.
+        let from_dictionary =
+            matches!(mode, PropertyValuesMode::Values | PropertyValuesMode::Range)
+                && indexed.is_some()
+                && !self
+                    .node
+                    .explicit_nulls_in_view(context.read_view().as_ref(), &property, &query.labels)
+                    .map_err(execution_failed)?;
+        if let Some(domain) = indexed {
+            match mode {
+                PropertyValuesMode::Count => {
+                    return Ok(Response::PropertyValues {
+                        property,
+                        values: Vec::new(),
+                        distinct_count: Some(domain.distinct_total()),
+                        min: None,
+                        max: None,
+                        truncated: false,
+                        counts: Vec::new(),
+                        search_missed: false,
+                    });
+                }
+                PropertyValuesMode::Range if domain.numeric_only => {
+                    return Ok(Response::PropertyValues {
+                        property,
+                        values: Vec::new(),
+                        distinct_count: Some(domain.distinct_total()),
+                        min: domain.min,
+                        max: domain.max,
+                        truncated: false,
+                        counts: Vec::new(),
+                        search_missed: false,
+                    });
+                }
+                PropertyValuesMode::TopK => {
+                    let k = limit.unwrap_or(10).min(1000) as usize;
+                    if let Some(tops) = self
+                        .node
+                        .value_domain_top_k_in_view(
+                            context.read_view().as_ref(),
+                            &property,
+                            k,
+                            &query.labels,
+                            &mut meter,
+                        )
+                        .map_err(execution_failed)?
+                    {
+                        let (values, counts) = tops.into_iter().unzip();
+                        return Ok(Response::PropertyValues {
+                            property,
+                            values,
+                            distinct_count: Some(domain.distinct_total()),
+                            min: None,
+                            max: None,
+                            truncated: false,
+                            counts,
+                            search_missed: false,
+                        });
+                    }
+                }
+                // A limited list keeps only its head while the dictionary
+                // streams; the count and `truncated` come from the domain.
+                PropertyValuesMode::Values if from_dictionary => {
+                    if let Some(n) = limit {
+                        let n = usize::try_from(n).unwrap_or(usize::MAX);
+                        if let Some(head) = self
+                            .node
+                            .value_domain_top_k_in_view(
+                                context.read_view().as_ref(),
+                                &property,
+                                n,
+                                &query.labels,
+                                &mut meter,
+                            )
+                            .map_err(execution_failed)?
+                        {
+                            let total = domain.distinct_total();
+                            return Ok(Response::PropertyValues {
+                                property,
+                                values: head.into_iter().map(|(value, _)| value).collect(),
+                                distinct_count: Some(total),
+                                min: None,
+                                max: None,
+                                truncated: u64::try_from(n).unwrap_or(u64::MAX) < total,
+                                counts: Vec::new(),
+                                search_missed: false,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let dictionary = if from_dictionary {
+            self.node
+                .value_dictionary_in_view(
+                    context.read_view().as_ref(),
+                    &property,
+                    &query.labels,
+                    None,
+                    &mut meter,
+                )
+                .map_err(execution_failed)?
+        } else {
+            None
+        };
+        let mut seen = if let Some(pairs) = dictionary {
+            pairs
+        } else {
+            // Scoped (or policy-enforced) reads count over the match set from
+            // occurrence rows: first-seen order, one count per distinct value.
+            let ords = self
+                .node
+                .facet_ordinals(
+                    context.read_view(),
+                    &Self::facet_search(query)?,
+                    is_cancelled,
+                )
+                .map_err(execution_failed)?;
+            // Counts and top-k need each distinct value's count, not the value:
+            // they count by digest and read back only the values returned, so
+            // a column of long texts fits the working set.
+            if matcher.is_none()
+                && matches!(mode, PropertyValuesMode::Count | PropertyValuesMode::TopK)
+            {
+                let view = context.read_view().as_ref();
+                let mut counts = self
+                    .node
+                    .facet_value_digests(view, &ords, &property, access, &mut meter)
+                    .map_err(execution_failed)?;
+                counts.retain(|(_, count, _)| access.counted(*count));
+                let distinct_count = Some(counts.len() as u64);
+                let (values, counts) = if mode == PropertyValuesMode::TopK {
+                    let k = limit.unwrap_or(10).min(1000) as usize;
+                    // Stable: equal counts keep first-seen order.
+                    counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+                    counts.truncate(k);
+                    let owners: Vec<u64> = counts.iter().map(|(_, _, ord)| *ord).collect();
+                    let values = self
+                        .node
+                        .facet_values_of(view, &owners, &property, access, &mut meter)
+                        .map_err(execution_failed)?;
+                    (
+                        values,
+                        counts.into_iter().map(|(_, count, _)| count).collect(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                return Ok(Response::PropertyValues {
+                    property,
+                    values,
+                    distinct_count,
+                    min: None,
+                    max: None,
+                    truncated: false,
+                    counts,
+                    search_missed: false,
+                });
+            }
+            self.node
+                .facet_property_values(
+                    context.read_view().as_ref(),
+                    &ords,
+                    &property,
+                    matcher.as_ref(),
+                    access,
+                    &mut meter,
+                )
+                .map_err(execution_failed)?
+        };
+        // An enforced policy reads through this match-set path; under its
+        // small-count threshold, values held by fewer records are withheld
+        //, so counts, ranges and lists cover the reported values only.
+        seen.retain(|(_, count)| access.counted(*count));
+        // The scan kept only matching values.
+        if let Some(search) = matcher.as_ref() {
+            let mut ranked: Vec<(serde_json::Value, u64)> = seen;
+            rank_values(&mut ranked);
+            return Ok(property_values_from_ranked(
+                property,
+                mode,
+                limit,
+                rank_by_similarity(search, ranked),
+            ));
+        }
+        let distinct_count = seen.len() as u64;
+        match mode {
+            PropertyValuesMode::Count => Ok(Response::PropertyValues {
+                property,
+                values: Vec::new(),
+                distinct_count: Some(distinct_count),
+                min: None,
+                max: None,
+                truncated: false,
+                counts: Vec::new(),
+                search_missed: false,
+            }),
+            PropertyValuesMode::Range => {
+                let values: Vec<serde_json::Value> =
+                    seen.into_iter().map(|(value, _)| value).collect();
+                let (min, max) = values_range(&values);
+                Ok(Response::PropertyValues {
+                    property,
+                    values: Vec::new(),
+                    distinct_count: Some(distinct_count),
+                    min,
+                    max,
+                    truncated: false,
+                    counts: Vec::new(),
+                    search_missed: false,
+                })
+            }
+            PropertyValuesMode::TopK => {
+                let k = limit.unwrap_or(10).min(1000) as usize;
+                // Stable: equal counts keep first-seen order.
+                let mut pairs = seen;
+                pairs.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+                let (values, counts) = pairs.into_iter().take(k).unzip();
+                Ok(Response::PropertyValues {
+                    property,
+                    values,
+                    distinct_count: Some(distinct_count),
+                    min: None,
+                    max: None,
+                    truncated: false,
+                    counts,
+                    search_missed: false,
+                })
+            }
+            PropertyValuesMode::Values => {
+                // By descending record count, ties by value, as a search lists
+                // them: scan order is not an order, and `limit` keeps the head.
+                let mut seen = seen;
+                rank_values(&mut seen);
+                let mut values: Vec<serde_json::Value> =
+                    seen.into_iter().map(|(value, _)| value).collect();
+                let (values, truncated) = match limit {
+                    Some(n) => {
+                        let n = (n as usize).min(values.len());
+                        let truncated = n < values.len();
+                        values.truncate(n);
+                        (values, truncated)
+                    }
+                    None => (values, false),
+                };
+                Ok(Response::PropertyValues {
+                    property,
+                    values,
+                    distinct_count: Some(distinct_count),
+                    min: None,
+                    max: None,
+                    truncated,
+                    counts: Vec::new(),
+                    search_missed: false,
+                })
+            }
+        }
+    }
+
+    /// Value search across properties (`query.searchValues`): every
+    /// (label, property) in scope that `access` lists is searched with one
+    /// matcher and one working-set meter. Dictionaries answer what they
+    /// can, read straight (exact per label, so also under a policy); a
+    /// label's long or array values are scanned once over its records, for
+    /// all of its such properties. A property whose read fails (e.g. over
+    /// the working-set limit) is reported in `skipped` instead of failing
+    /// the request; cancellation and the deadline fail it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one pass over the catalog's columns; splitting it would scatter the meter and the ranking it shares"
+    )]
+    pub(super) fn query_search_values(
+        &self,
+        search: &rushdb_protocol::ValueSearch,
+        labels: &[String],
+        limit: Option<u64>,
+        is_cancelled: &dyn Fn() -> bool,
+        context: &mut rushdb_engine::ExecutionContext,
+        access: &CatalogAccess,
+    ) -> Result<Response, ProtocolError> {
+        let wanted = value_matcher(search);
+        let limit = usize::try_from(limit.unwrap_or(50).min(1000)).unwrap_or(1000);
+        let view = std::sync::Arc::clone(context.read_view());
+        let mut meter = self.node.working_set(is_cancelled, context.deadline());
+        let mut by_label: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for column in self
+            .node
+            .catalog_columns(&view, labels, access)
+            .map_err(execution_failed)?
+        {
+            if column.value_type == "null" {
+                continue;
+            }
+            if let Some(label) = column.label {
+                by_label.entry(label).or_default().push(column.name);
+            }
+        }
+        let mut matches: Vec<(f64, rushdb_protocol::ValueMatchRow)> = Vec::new();
+        let mut skipped = Vec::new();
+        let mut total = 0u64;
+        // A read that stops for cancellation or the deadline fails the
+        // request; any other failure skips the property.
+        let stopped = |error: &str| error.contains("cancelled") || error.contains("deadline");
+        // Keeps a property's best `limit` matches (by count, or similarity
+        // for `similar`), counted toward `total`, past the policy's minCount.
+        let mut keep =
+            |label: &str,
+             property: &str,
+             ranked: Vec<(serde_json::Value, u64)>,
+             matches: &mut Vec<(f64, rushdb_protocol::ValueMatchRow)>| {
+                let ranked: Vec<_> = ranked
+                    .into_iter()
+                    .filter(|(_, count)| access.counted(*count))
+                    .collect();
+                total += ranked.len() as u64;
+                for (value, count) in rank_by_similarity(&wanted, ranked).into_iter().take(limit) {
+                    matches.push((
+                        wanted.similarity(&value),
+                        rushdb_protocol::ValueMatchRow {
+                            label: label.to_string(),
+                            property: property.to_string(),
+                            value,
+                            count,
+                        },
+                    ));
+                }
+            };
+        for (label, properties) in by_label {
+            let scope = [label.clone()];
+            let mut scanned = Vec::new();
+            for property in properties {
+                meter.check().map_err(execution_failed)?;
+                let before = meter.charged();
+                let read = self.node.value_dictionary_in_view(
+                    view.as_ref(),
+                    &property,
+                    &scope,
+                    Some(&wanted),
+                    &mut meter,
+                );
+                // What is kept is small (at most `limit` per property); the
+                // dictionary's working set ends here.
+                meter.release(meter.charged() - before);
+                match read {
+                    Ok(Some(ranked)) => keep(&label, &property, ranked, &mut matches),
+                    Ok(None) => scanned.push(property),
+                    Err(error) if stopped(&error) => return Err(execution_failed(error)),
+                    Err(_) => skipped.push(format!("{label}.{property}")),
+                }
+            }
+            if scanned.is_empty() {
+                continue;
+            }
+            let document = rushdb_protocol::QueryDocument {
+                labels: scope.to_vec(),
+                ..rushdb_protocol::QueryDocument::default()
+            };
+            let ords = self
+                .node
+                .facet_ordinals(&view, &Self::facet_search(&document)?, is_cancelled)
+                .map_err(execution_failed)?;
+            for property in scanned {
+                let before = meter.charged();
+                let read = self.node.facet_property_values(
+                    view.as_ref(),
+                    &ords,
+                    &property,
+                    Some(&wanted),
+                    access,
+                    &mut meter,
+                );
+                meter.release(meter.charged() - before);
+                match read {
+                    Ok(mut seen) => {
+                        rank_values(&mut seen);
+                        keep(&label, &property, seen, &mut matches);
+                    }
+                    Err(error) if stopped(&error) => return Err(execution_failed(error)),
+                    Err(_) => skipped.push(format!("{label}.{property}")),
+                }
+            }
+        }
+        let similar = wanted.matching() == TextMatch::Similar;
+        matches.sort_by(|(a_score, a), (b_score, b)| {
+            let by_score = if similar {
+                b_score.total_cmp(a_score)
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            by_score
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.label.cmp(&b.label))
+                .then_with(|| a.property.cmp(&b.property))
+                .then_with(|| a.value.to_string().cmp(&b.value.to_string()))
+        });
+        matches.truncate(limit);
+        Ok(Response::ValueMatches {
+            matches: matches.into_iter().map(|(_, row)| row).collect(),
+            total,
+            skipped,
+        })
+    }
+
+    pub(super) fn query_vector_with_context(
+        &self,
+        execution_context: &mut rushdb_engine::ExecutionContext,
+        query: &rushdb_protocol::VectorQuery,
+    ) -> Result<Response, ProtocolError> {
+        let result = self
+            .node
+            .search_vectors_with_execution_context(execution_context, query)
+            .map_err(|error| {
+                if error == "vector query denied by policy" {
+                    ProtocolError::new(ErrorCode::Unauthorized, error)
+                } else {
+                    execution_failed(error)
+                }
+            })?;
+        let records = response_array(&result, "data")?;
+        let total = records.len() as u64;
+        Ok(Response::Records {
+            records,
+            total,
+            cursor_id: None,
+            vector_search: report(&result, "vectorSearch")?,
+            text_search: report(&result, "textSearch")?,
+            fusion: report(&result, "fusion")?,
+        })
+    }
+
+    pub(super) fn query_vector_index_candidates_with_context(
+        &self,
+        execution_context: &mut rushdb_engine::ExecutionContext,
+        query: &rushdb_protocol::VectorIndexCandidatesQuery,
+    ) -> Result<Response, ProtocolError> {
+        let (records, total) = self
+            .node
+            .vector_index_candidates_with_execution_context(execution_context, query)
+            .map_err(execution_failed)?;
+        Ok(Response::VectorIndexCandidates { records, total })
+    }
+
+    pub(super) fn query_text_with_context(
+        &self,
+        index: &str,
+        query: &str,
+        limit: u64,
+        opts: rushdb_textsearch::LexicalOptions,
+        is_cancelled: &dyn Fn() -> bool,
+        execution_context: &rushdb_engine::ExecutionContext,
+    ) -> Result<Response, ProtocolError> {
+        if is_cancelled() {
+            return Err(ProtocolError::new(
+                ErrorCode::Cancelled,
+                "operation cancelled",
+            ));
+        }
+        let (rows, pending) = self
+            .node
+            .text_search_in_view(
+                index,
+                query,
+                opts,
+                usize::try_from(limit).unwrap_or(10),
+                execution_context.read_view().as_ref(),
+            )
+            .map_err(execution_failed)?;
+        let total = rows.len() as u64;
+        Ok(Response::TextHits {
+            rows,
+            total,
+            pending,
+        })
+    }
+
+    /// Combined graph + vector + lexical query (document 26's hybrid
+    /// pattern); see `Node::hybrid_search_in_view` for the fusion contract.
+    pub(super) fn query_hybrid_with_context(
+        &self,
+        execution_context: &mut rushdb_engine::ExecutionContext,
+        query: &rushdb_protocol::HybridQuery,
+    ) -> Result<Response, ProtocolError> {
+        let result = self
+            .node
+            .hybrid_search_with_execution_context(execution_context, query)
+            .map_err(|error| {
+                if error == "hybrid query denied by policy" {
+                    ProtocolError::new(ErrorCode::Unauthorized, error)
+                } else {
+                    execution_failed(error)
+                }
+            })?;
+        let records = response_array(&result, "data")?;
+        let total = records.len() as u64;
+        Ok(Response::Records {
+            records,
+            total,
+            cursor_id: None,
+            vector_search: report(&result, "vectorSearch")?,
+            text_search: report(&result, "textSearch")?,
+            fusion: report(&result, "fusion")?,
+        })
+    }
+}
+
+/// A search report (`vectorSearch`, `textSearch`) returned next to the rows.
+fn report<T: serde::de::DeserializeOwned>(
+    result: &serde_json::Value,
+    name: &str,
+) -> Result<Option<T>, ProtocolError> {
+    result
+        .get(name)
+        .map(|report| serde_json::from_value(report.clone()))
+        .transpose()
+        .map_err(|error| execution_failed(format!("engine {name} report: {error}")))
+}

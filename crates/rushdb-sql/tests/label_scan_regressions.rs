@@ -22,3 +22,52 @@ fn graph(tenant: u64) -> Lmpg {
     )
 }
 
+fn count(graph: &Lmpg, sql: &str) -> i64 {
+    execute_sql(graph, sql).unwrap()[0]["n"].as_i64().unwrap()
+}
+
+#[test]
+fn label_prefix_does_not_leak_other_labels() {
+    let graph = graph(31);
+    for _ in 0..3 {
+        graph
+            .create_record("user", None, vec![("v".into(), FieldChange::Set(json!(1)))])
+            .unwrap();
+    }
+    for _ in 0..5 {
+        graph
+            .create_record(
+                "user_admin",
+                None,
+                vec![("v".into(), FieldChange::Set(json!(2)))],
+            )
+            .unwrap();
+    }
+    assert_eq!(count(&graph, "SELECT COUNT(*) AS n FROM user"), 3);
+    assert_eq!(count(&graph, "SELECT COUNT(*) AS n FROM user_admin"), 5);
+    assert_eq!(
+        count(&graph, "SELECT COUNT(*) AS n FROM user WHERE v = 2"),
+        0,
+        "user query must not return user_admin rows"
+    );
+}
+
+#[test]
+fn label_scan_handles_ordinals_containing_the_separator_byte() {
+    // Record ordinal 47 is 0x2F, i.e. the `/` separator byte. The scan must
+    // read the ordinal at its fixed offset, not at the last `/` in the key.
+    let graph = graph(32);
+    for i in 0..64 {
+        graph
+            .create_record(
+                "Thing",
+                None,
+                vec![("i".into(), FieldChange::Set(json!(i)))],
+            )
+            .unwrap();
+    }
+    assert_eq!(count(&graph, "SELECT COUNT(*) AS n FROM thing"), 64);
+    let rows = execute_sql(&graph, "SELECT i FROM thing WHERE i = 47").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["i"], json!(47));
+}
