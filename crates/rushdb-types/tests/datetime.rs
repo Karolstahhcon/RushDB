@@ -38,3 +38,44 @@ fn invalid_dates_rejected() {
     assert!(parse_datetime("2026-07-32").is_none(), "day 32");
     assert!(parse_datetime("2026-07-23T25:00:00Z").is_none(), "hour 25");
     assert!(parse_datetime("not-a-date").is_none());
+}
+
+#[test]
+fn leap_years_accepted_and_rejected() {
+    assert!(parse_datetime("2024-02-29").is_some(), "leap year");
+    assert!(parse_datetime("2026-02-29").is_none(), "non-leap Feb 29");
+    assert!(parse_datetime("2000-02-29").is_some(), "century leap year");
+    assert!(parse_datetime("1900-02-29").is_none(), "century non-leap");
+}
+
+#[test]
+fn signed_years_parse_in_order_and_render_signed() {
+    // BBY/ABY dates in the LMPG JSON audit: `-0032-…` stayed text while
+    // `0000-…` parsed, splitting one property by sign.
+    let bc = parse_datetime("-0032-01-01T08:00:00Z").expect("signed year");
+    let year_zero = parse_datetime("0000-01-01T05:00:00Z").unwrap();
+    let ad = parse_datetime("0034-01-01T18:00:00Z").unwrap();
+    assert!(bc < year_zero && year_zero < ad);
+    assert_eq!(ms_to_datetime_string(bc), "-0032-01-01T08:00:00.000Z");
+    assert_eq!(
+        parse_datetime("-0001-01-01T18:00:00Z").map(ms_to_datetime_string),
+        Some("-0001-01-01T18:00:00.000Z".to_string())
+    );
+    assert_eq!(
+        parse_datetime("-0600-01-01").map(ms_to_datetime_string),
+        Some("-0600-01-01".to_string())
+    );
+    assert_eq!(
+        parse_datetime("-0019-01-01T11:45:00+01:00"),
+        parse_datetime("-0019-01-01T10:45:00Z")
+    );
+    assert!(parse_datetime("-0019-01-01T11:45:00").is_some());
+    assert!(parse_datetime("-0032-02-30").is_none(), "Feb 30");
+    assert!(parse_datetime("-0032").is_none(), "year only");
+    assert!(parse_datetime("--0032-01-01").is_none());
+    // Unsigned rendering is unchanged.
+    assert_eq!(
+        parse_datetime("2026-07-23T10:30:00.123Z").map(ms_to_datetime_string),
+        Some("2026-07-23T10:30:00.123Z".to_string())
+    );
+}

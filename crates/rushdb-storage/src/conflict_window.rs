@@ -103,3 +103,108 @@ impl ConflictWindow {
         // makes a validation that needs it fail retryably.
         while self.bytes > self.cap && self.entries.len() > 1 {
             self.evict_oldest();
+        }
+        while !self.charge_bytes() {
+            self.evict_oldest();
+        }
+    }
+
+    /// The write set of commit `ci`, or `None` when it was evicted or never
+    /// published by this process.
+    pub(crate) fn keys(&self, ci: u64) -> Option<Arc<[Vec<u8>]>> {
+        let first = self.entries.front()?.0;
+        let index = usize::try_from(ci.checked_sub(first)?).ok()?;
+        let (found, keys, _) = self.entries.get(index)?;
+        (*found == ci).then(|| Arc::clone(keys))
+    }
+
+    /// Bytes currently charged to the window.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Drop the entry for `ci` (test hook for the eviction path).
+    #[cfg(test)]
+    pub(crate) fn forget(&mut self, ci: u64) {
+        if let Some(position) = self.entries.iter().position(|(found, _, _)| *found == ci) {
+            if let Some((_, _, size)) = self.entries.remove(position) {
+                self.bytes -= size;
+                self.charge_bytes();
+            }
+        }
+    }
+}
+
+fn op_key(op: &Op) -> &Vec<u8> {
+    match op {
+        Op::Put(key, _) | Op::Set(key, _) | Op::Del(key) | Op::Purge(key) => key,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put(key: &[u8]) -> Op {
+        Op::Put(key.to_vec(), b"v".to_vec())
+    }
+
+    #[test]
+    fn records_application_keys_and_skips_coordination_rows() {
+        let mut window = ConflictWindow::new(1024);
+        window.record(
+            1,
+            &[
+                put(b"T/a"),
+                Op::Del(b"T/b".to_vec()),
+                Op::Set(crate::LAST_APPLIED_KEY.to_vec(), Vec::new()),
+            ],
+        );
+        let keys = window.keys(1).unwrap();
+        assert_eq!(&keys[..], &[b"T/a".to_vec(), b"T/b".to_vec()]);
+        assert!(window.keys(2).is_none());
+        assert!(window.keys(0).is_none());
+    }
+
+    #[test]
+    fn evicts_oldest_first_under_the_cap_but_keeps_the_newest() {
+        let mut window = ConflictWindow::new(2 * (3 + PER_KEY_OVERHEAD));
+        for ci in 1..=3 {
+            window.record(ci, &[put(b"T/x")]);
+        }
+        assert!(window.keys(1).is_none(), "oldest evicted");
+        assert!(window.keys(2).is_some() && window.keys(3).is_some());
+        assert_eq!(window.bytes(), 2 * (3 + PER_KEY_OVERHEAD));
+
+        let mut tiny = ConflictWindow::new(1);
+        tiny.record(7, &[put(b"T/huge")]);
+        assert!(
+            tiny.keys(7).is_some(),
+            "a single oversized commit is still kept"
+        );
+    }
+
+    #[test]
+    fn the_window_is_charged_to_the_budget_and_shrinks_to_fit_it() {
+        let per = 3 + PER_KEY_OVERHEAD;
+        let budget = crate::resources::ByteBudget::new("test", 3 * per).unwrap();
+        let mut window = ConflictWindow::charged(1024, &budget);
+        window.record(1, &[put(b"T/x")]);
+        window.record(2, &[put(b"T/y")]);
+        assert_eq!(budget.snapshot().used, 2 * per, "charged to the budget");
+        // Another holder takes the rest: the window gives way, oldest first.
+        let other = budget.try_reserve(per).unwrap();
+        window.record(3, &[put(b"T/z")]);
+        assert!(window.keys(1).is_none(), "the budget evicts the oldest");
+        assert!(window.keys(2).is_some() && window.keys(3).is_some());
+        assert_eq!(window.bytes(), 2 * per);
+        assert_eq!(budget.snapshot().used, 3 * per);
+        drop(other);
+        drop(window);
+        assert_eq!(
+            budget.snapshot().used,
+            0,
+            "dropping the window releases its charge"
+        );
+    }
+}
