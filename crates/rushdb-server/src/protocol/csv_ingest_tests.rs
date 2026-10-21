@@ -83,3 +83,173 @@ fn csv_rows_become_typed_records_and_export_renders_them() {
     let dune = stored
         .iter()
         .find(|record| record["properties"]["title"] == "Dune")
+        .expect("Dune");
+    assert_eq!(dune["properties"]["pages"], 412);
+    assert_eq!(dune["properties"]["in_print"], true);
+    let smith = stored
+        .iter()
+        .find(|record| record["properties"]["title"] == "Smith, J")
+        .expect("Smith, J");
+    assert!(
+        smith["properties"].get("pages").is_none(),
+        "an empty typed cell is left out"
+    );
+
+    let Response::Csv { content, count } = execute(
+        &node,
+        Operation::Query {
+            query: Query::ExportCsv { query: books() },
+        },
+    ) else {
+        panic!("expected csv");
+    };
+    assert_eq!(count, 2);
+    assert_eq!(content, csv::render(&stored));
+    assert!(
+        content.starts_with("__id,__label,in_print,pages,title\r\n"),
+        "{content}"
+    );
+    assert!(content.contains(",Book,true,412,Dune"), "{content}");
+    assert!(content.contains(",Book,false,,\"Smith, J\""), "{content}");
+}
+
+#[test]
+fn csv_rows_carry_their_inline_vectors() {
+    let node = Node::bootstrap(&mut super::tests::config(false)).unwrap();
+    execute(
+        &node,
+        Operation::Index {
+            index: IndexOperation::CreateVector {
+                definition: VectorIndexDefinition {
+                    label: "Book".into(),
+                    property: "title".into(),
+                    dimensions: 2,
+                    similarity: "cosine".into(),
+                    name: Some("book-titles".into()),
+                    model: None,
+                    owner: None,
+                },
+            },
+        },
+    );
+    let vector = |x: f32, y: f32| serde_json::json!([{ "propertyName": "title", "vector": [x, y], "index": "book-titles" }]);
+    execute(
+        &node,
+        ingest_csv(
+            "Book",
+            "title\nDune\nEmma\n",
+            serde_json::json!({}),
+            vec![vector(1.0, 0.0), vector(0.0, 1.0)],
+        ),
+    );
+    let Response::Records { records, .. } = execute(
+        &node,
+        Operation::Query {
+            query: Query::Vector {
+                query: VectorQuery {
+                    labels: vec!["Book".into()],
+                    property: "title".into(),
+                    vector: vec![0.0, 1.0],
+                    similarity: "cosine".into(),
+                    index: Some("book-titles".into()),
+                    predicate: serde_json::json!({}),
+                    offset: 0,
+                    limit: 1,
+                    ef: None,
+                    mode: None,
+                    score_threshold: None,
+                },
+            },
+        },
+    ) else {
+        panic!("expected records");
+    };
+    assert_eq!(records[0]["properties"]["title"], "Emma");
+}
+
+#[test]
+fn csv_ingest_reports_what_it_cannot_import() {
+    let node = Node::bootstrap(&mut super::tests::config(false)).unwrap();
+    let error = |operation| try_execute(&node, operation).expect_err("rejected");
+
+    let unlabelled = error(ingest_csv(" ", "a\n1\n", serde_json::json!({}), Vec::new()));
+    assert_eq!(unlabelled.code, ErrorCode::InvalidRequest);
+    assert_eq!(unlabelled.message, "label is required for CSV import");
+
+    let ragged = error(ingest_csv(
+        "Row",
+        "a,b\n1\n",
+        serde_json::json!({}),
+        Vec::new(),
+    ));
+    assert_eq!(ragged.code, ErrorCode::InvalidRequest);
+    assert_eq!(
+        ragged.message,
+        "CSV parse error: Too few fields: expected 2 fields but parsed 1"
+    );
+
+    let extra_vectors = error(ingest_csv(
+        "Row",
+        "a\n1\n",
+        serde_json::json!({}),
+        vec![serde_json::json!([]), serde_json::json!([])],
+    ));
+    assert_eq!(
+        extra_vectors.message,
+        "vectors length (2) exceeds the number of CSV data rows (1)"
+    );
+
+    let bad_option = error(ingest_csv(
+        "Row",
+        "a\n1\n",
+        serde_json::json!({ "suggestTypes": "yes" }),
+        Vec::new(),
+    ));
+    assert_eq!(bad_option.code, ErrorCode::InvalidRequest);
+
+    // A header with no data rows imports nothing.
+    let empty = execute(
+        &node,
+        ingest_csv("Row", "a,b\n", serde_json::json!({}), Vec::new()),
+    );
+    assert!(
+        matches!(empty, Response::Ingested { count: 0, .. }),
+        "{empty:?}"
+    );
+    assert!(records(
+        &node,
+        QueryDocument {
+            labels: vec!["Row".into()],
+            ..QueryDocument::default()
+        }
+    )
+    .is_empty());
+}
+
+#[test]
+fn export_csv_is_of_records_only() {
+    let node = Node::bootstrap(&mut super::tests::config(false)).unwrap();
+    let error = try_execute(
+        &node,
+        Operation::Query {
+            query: Query::ExportCsv {
+                query: QueryDocument {
+                    select: Some(serde_json::json!({ "count": { "$count": "*" } })),
+                    ..books()
+                },
+            },
+        },
+    )
+    .expect_err("select is rejected");
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+
+    let Response::Csv { content, count } = execute(
+        &node,
+        Operation::Query {
+            query: Query::ExportCsv { query: books() },
+        },
+    ) else {
+        panic!("expected csv");
+    };
+    assert_eq!((content.as_str(), count), ("", 0));
+}
