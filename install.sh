@@ -116,3 +116,121 @@ fetch_location() {
     wget -q --max-redirect=5 -S -O /dev/null "$1" 2>&1 | sed -n 's/^ *Location: *//p' | tail -n 1 | tr -d '\r'
   fi
 }
+
+verify_checksum() {
+  (
+    cd "$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum -c "$2.sha256" >/dev/null
+    elif command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 -c "$2.sha256" >/dev/null
+    else
+      err "needs sha256sum or shasum to verify the download"
+    fi
+  ) || err "checksum mismatch for $2; the download is corrupt or was tampered with"
+}
+
+verify_signature() {
+  if ! command -v cosign >/dev/null 2>&1; then
+    [ "$require_signature" = "1" ] && err "--verify-signature needs cosign (https://docs.sigstore.dev)"
+    return 0
+  fi
+  download "$base/$1.sigstore.json" "$2/$1.sigstore.json" ||
+    err "cannot download the signature bundle for $1"
+  cosign verify-blob \
+    --bundle "$2/$1.sigstore.json" \
+    --certificate-identity-regexp "^https://github.com/$REPO/" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "$2/$1" >/dev/null 2>&1 || err "signature verification failed for $1"
+  say "Verified the Sigstore signature."
+}
+
+add_to_path() {
+  case ":$PATH:" in *":$1:"*) return 0 ;; esac
+  line="export PATH=\"$1:\$PATH\" # rushdb"
+  if [ "$modify_path" != "1" ]; then
+    say ""
+    say "Add RushDB to your PATH:"
+    say "  $line"
+    return 0
+  fi
+  case "$(basename "${SHELL:-sh}")" in
+    zsh) profile="${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash)
+      if [ "$(uname -s)" = "Darwin" ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi
+      ;;
+    fish)
+      profile="$HOME/.config/fish/conf.d/rushdb.fish"
+      line="fish_add_path \"$1\" # rushdb"
+      mkdir -p "$(dirname "$profile")"
+      ;;
+    *) profile="$HOME/.profile" ;;
+  esac
+  if ! grep -qs "# rushdb" "$profile"; then
+    printf '\n%s\n' "$line" >>"$profile"
+    say "Added $1 to PATH in $profile."
+  fi
+  say "Open a new shell, or run:"
+  say "  $line"
+}
+
+main() {
+  version="${RUSHDB_VERSION:-latest}"
+  install_dir="${RUSHDB_INSTALL_DIR:-${HOME:?HOME is not set}/.rushdb/bin}"
+  modify_path=1
+  [ "${RUSHDB_NO_MODIFY_PATH:-0}" = "1" ] && modify_path=0
+  require_signature="${RUSHDB_VERIFY_SIGNATURE:-0}"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) [ $# -ge 2 ] || err "--version needs a tag"; version="$2"; shift 2 ;;
+      --dir) [ $# -ge 2 ] || err "--dir needs a path"; install_dir="$2"; shift 2 ;;
+      --no-modify-path) modify_path=0; shift ;;
+      --verify-signature) require_signature=1; shift ;;
+      -h | --help) sed -n '2,/^set -eu$/{/^#/s/^# \{0,1\}//p;}' "$0" 2>/dev/null || true; exit 0 ;;
+      *) err "unknown option $1" ;;
+    esac
+  done
+
+  need uname
+  need tar
+  target="$(detect_target)"
+  archive="rushdb-$target.tar.gz"
+  if [ -n "${RUSHDB_DOWNLOAD_URL:-}" ]; then
+    base="$RUSHDB_DOWNLOAD_URL"
+  else
+    case "$version" in
+      latest) version="$(latest_tag)" ;;
+      v*) ;;
+      *) version="v$version" ;;
+    esac
+    base="https://github.com/$REPO/releases/download/$version"
+  fi
+
+  tmp="$(mktemp -d 2>/dev/null || mktemp -d -t rushdb)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
+  say "Downloading RushDB ($version) for $target..."
+  download "$base/$archive" "$tmp/$archive" || err "cannot download $base/$archive"
+  download "$base/$archive.sha256" "$tmp/$archive.sha256" || err "cannot download the checksum for $archive"
+  verify_checksum "$tmp" "$archive"
+  verify_signature "$archive" "$tmp"
+
+  mkdir -p "$tmp/unpacked" "$install_dir"
+  tar -xzf "$tmp/$archive" -C "$tmp/unpacked"
+  [ -f "$tmp/unpacked/rushdb" ] || err "the archive has no rushdb"
+  # Replace through a rename so a running server keeps its old binary.
+  cp "$tmp/unpacked/rushdb" "$install_dir/.rushdb.new"
+  chmod 755 "$install_dir/.rushdb.new"
+  mv -f "$install_dir/.rushdb.new" "$install_dir/rushdb"
+
+  installed="$("$install_dir/rushdb" --version 2>/dev/null)" || err "the installed rushdb does not run on this system"
+  say "Installed $installed to $install_dir."
+  add_to_path "$install_dir"
+  say ""
+  say "Start a local database:"
+  say "  rushdb up"
+  say "Docs: https://github.com/$REPO/blob/main/docs/manual/getting-started/README.md"
+}
+
+main "$@"
