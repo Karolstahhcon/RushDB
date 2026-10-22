@@ -280,3 +280,285 @@ impl GrpcServer {
             // The per-message budget is enforced by the codec above
             // (`max_decoding/encoding_message_size`); HTTP/2 frame size
             // stays at the default (tonic enforces h2's 16MB ceiling).
+            // C7: bound concurrent requests per connection and HTTP/2 streams
+            // so one client cannot fan out unbounded in-flight work.
+            let server = tonic::transport::Server::builder()
+                .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
+                .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+                .add_service(router)
+                .serve_with_incoming_shutdown(stream, async move {
+                    while !shutdown_handler.shutdown_requested() {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                });
+            tokio::pin!(server);
+            tokio::select! {
+                result = &mut server => result.map_err(|error| error.to_string()),
+                () = async {
+                    while !handler_for_deadline.shutdown_requested() {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                } => Err("gRPC shutdown drain deadline elapsed".into()),
+            }
+        });
+        rt.shutdown_timeout(std::time::Duration::from_secs(1));
+        outcome
+    }
+}
+/// Shared gRPC error taxonomy: the same `ErrorCode` maps to the same gRPC status
+/// on every adapter. Add below — do not reorder.
+fn grpc_status(error: &rushdb_protocol::ProtocolError) -> tonic::Status {
+    let message = error.message.clone();
+    match error.code {
+        rushdb_protocol::ErrorCode::UnsupportedVersion
+        | rushdb_protocol::ErrorCode::ProtocolViolation
+        | rushdb_protocol::ErrorCode::InvalidRequest
+        | rushdb_protocol::ErrorCode::ExecutionFailed
+        | rushdb_protocol::ErrorCode::LanguageDisabled
+        | rushdb_protocol::ErrorCode::Unsupported => tonic::Status::invalid_argument(message),
+        rushdb_protocol::ErrorCode::Unauthorized => tonic::Status::unauthenticated(message),
+        rushdb_protocol::ErrorCode::MissingScope | rushdb_protocol::ErrorCode::ScopeMismatch => {
+            tonic::Status::unauthenticated(message)
+        }
+        rushdb_protocol::ErrorCode::NotFound => tonic::Status::not_found(message),
+        rushdb_protocol::ErrorCode::Conflict => tonic::Status::already_exists(message),
+        rushdb_protocol::ErrorCode::WriteConflict => tonic::Status::aborted(message),
+        rushdb_protocol::ErrorCode::Cancelled => tonic::Status::cancelled(message),
+        rushdb_protocol::ErrorCode::ResourceExhausted => tonic::Status::resource_exhausted(message),
+        rushdb_protocol::ErrorCode::Unavailable => tonic::Status::unavailable(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_bounds_an_active_uncooperative_grpc_handler() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Mutex,
+        };
+        use std::time::Duration;
+
+        struct Handler {
+            stopping: AtomicBool,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl EnvelopeHandler for Handler {
+            fn shutdown_requested(&self) -> bool {
+                self.stopping.load(Ordering::Acquire)
+            }
+            fn execute(
+                &self,
+                _: RequestEnvelope,
+                _: Option<String>,
+            ) -> Result<rushdb_protocol::ResponseEnvelope, rushdb_protocol::ProtocolError>
+            {
+                self.entered.send(()).unwrap();
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15));
+                Err(rushdb_protocol::ProtocolError::new(
+                    rushdb_protocol::ErrorCode::Cancelled,
+                    "released",
+                ))
+            }
+        }
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let handler = Arc::new(Handler {
+            stopping: AtomicBool::new(false),
+            entered,
+            release: Mutex::new(released),
+        });
+        let (mut server, port) =
+            GrpcServer::bind(handler.clone(), "token".into(), "127.0.0.1", 0, 1024 * 1024).unwrap();
+        let (finished, outcome) = mpsc::channel();
+        let worker = std::thread::spawn(move || finished.send(server.serve_forever()).unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = std::thread::spawn(move || {
+            runtime.block_on(async move {
+                let channel =
+                    tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                        .unwrap()
+                        .connect()
+                        .await
+                        .unwrap();
+                let mut grpc = tonic::client::Grpc::new(channel);
+                grpc.ready().await.unwrap();
+                let mut request = Request::new(BytesEnvelope {
+                    json: serde_json::to_vec(&RequestEnvelope {
+                        protocol_version: rushdb_protocol::PROTOCOL_VERSION,
+                        request_id: None,
+                        context: rushdb_protocol::RequestContext::default(),
+                        operation: rushdb_protocol::Operation::Describe {
+                            describe: rushdb_protocol::Describe::BuildInfo,
+                        },
+                    })
+                    .unwrap(),
+                });
+                request
+                    .metadata_mut()
+                    .insert("authorization", "Bearer token".parse().unwrap());
+                let response = grpc.unary(
+                    request,
+                    http::uri::PathAndQuery::from_static("/rushdb.v1.Database/Execute"),
+                    ProstCodec::<BytesEnvelope, BytesEnvelope>::default(),
+                );
+                tokio::time::timeout(Duration::from_secs(10), response).await
+            })
+        });
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        handler.stopping.store(true, Ordering::Release);
+        let result = outcome.recv_timeout(Duration::from_secs(8));
+        // Release the deliberately uncooperative callback even if the timeout
+        // assertion fails; Rust cannot forcibly cancel a blocking provider.
+        release.send(()).unwrap();
+        assert_eq!(
+            result.unwrap().unwrap_err(),
+            "gRPC shutdown drain deadline elapsed"
+        );
+        worker.join().unwrap();
+        assert!(client.join().unwrap().unwrap().is_err());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+
+    #[test]
+    fn blocking_handler_does_not_stall_a_current_thread_runtime() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Mutex,
+        };
+        use std::time::Duration;
+        struct BlockingHandler {
+            release: Mutex<mpsc::Receiver<()>>,
+            timed_out: Arc<AtomicBool>,
+        }
+        impl EnvelopeHandler for BlockingHandler {
+            fn execute(
+                &self,
+                _: RequestEnvelope,
+                _: Option<String>,
+            ) -> Result<rushdb_protocol::ResponseEnvelope, rushdb_protocol::ProtocolError>
+            {
+                if self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_err()
+                {
+                    self.timed_out.store(true, Ordering::Release);
+                }
+                Err(rushdb_protocol::ProtocolError::new(
+                    rushdb_protocol::ErrorCode::Cancelled,
+                    "finished",
+                ))
+            }
+        }
+        let (release, receiver) = mpsc::channel();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let mut service = DatabaseService::new(
+            Arc::new(BlockingHandler {
+                release: Mutex::new(receiver),
+                timed_out: Arc::clone(&timed_out),
+            }),
+            "token".into(),
+        );
+        let envelope = RequestEnvelope {
+            protocol_version: rushdb_protocol::PROTOCOL_VERSION,
+            request_id: None,
+            context: rushdb_protocol::RequestContext::default(),
+            operation: rushdb_protocol::Operation::Describe {
+                describe: rushdb_protocol::Describe::BuildInfo,
+            },
+        };
+        let mut request = Request::new(BytesEnvelope {
+            json: serde_json::to_vec(&envelope).unwrap(),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer token".parse().unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let future = tower::Service::call(&mut service, request);
+            let release_task = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                release.send(()).unwrap();
+            });
+            assert!(future.await.is_err());
+            release_task.await.unwrap();
+        });
+        assert!(
+            !timed_out.load(Ordering::Acquire),
+            "the handler blocked its async runtime"
+        );
+    }
+
+    #[test]
+    fn grpc_error_taxonomy_is_complete_and_stable() {
+        use tonic::Code;
+        let cases: &[(rushdb_protocol::ErrorCode, Code)] = &[
+            (
+                rushdb_protocol::ErrorCode::UnsupportedVersion,
+                Code::InvalidArgument,
+            ),
+            (
+                rushdb_protocol::ErrorCode::ProtocolViolation,
+                Code::InvalidArgument,
+            ),
+            (
+                rushdb_protocol::ErrorCode::InvalidRequest,
+                Code::InvalidArgument,
+            ),
+            (
+                rushdb_protocol::ErrorCode::Unauthorized,
+                Code::Unauthenticated,
+            ),
+            (
+                rushdb_protocol::ErrorCode::MissingScope,
+                Code::Unauthenticated,
+            ),
+            (
+                rushdb_protocol::ErrorCode::ScopeMismatch,
+                Code::Unauthenticated,
+            ),
+            (rushdb_protocol::ErrorCode::NotFound, Code::NotFound),
+            (rushdb_protocol::ErrorCode::Conflict, Code::AlreadyExists),
+            (rushdb_protocol::ErrorCode::WriteConflict, Code::Aborted),
+            (rushdb_protocol::ErrorCode::Cancelled, Code::Cancelled),
+            (
+                rushdb_protocol::ErrorCode::ResourceExhausted,
+                Code::ResourceExhausted,
+            ),
+            (rushdb_protocol::ErrorCode::Unavailable, Code::Unavailable),
+            (
+                rushdb_protocol::ErrorCode::ExecutionFailed,
+                Code::InvalidArgument,
+            ),
+            (
+                rushdb_protocol::ErrorCode::LanguageDisabled,
+                Code::InvalidArgument,
+            ),
+            (
+                rushdb_protocol::ErrorCode::Unsupported,
+                Code::InvalidArgument,
+            ),
+        ];
+        for (code, grpc_code) in cases {
+            let status = grpc_status(&rushdb_protocol::ProtocolError::new(*code, "x"));
+            assert_eq!(status.code(), *grpc_code, "{code:?}");
+        }
+    }
+}
