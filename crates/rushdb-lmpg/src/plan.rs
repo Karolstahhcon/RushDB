@@ -444,3 +444,450 @@ impl<'a> Planner<'a> {
             LogicalType::Utf8,
             LogicalType::DateTime,
         ] {
+            if let Some(def) = self.definition_exists(fid, TypeState::Known(ty))? {
+                if matches!(def.nullability, Nullability::NotNull) {
+                    return Ok(Some(def));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Checks a proposed change against the definition's nullability and
+    /// resolved type.
+    ///
+    /// # Errors
+    /// Returns [`PlanError::NullRejected`] for an explicit null on a `NotNull`
+    /// definition, or [`PlanError::TypeMismatch`] for an incompatible scalar.
+    pub fn check_write_allowed(
+        &self,
+        def: &PropertyDefinition,
+        field: &str,
+        change: &FieldChange,
+    ) -> Result<(), PlanError> {
+        if let FieldChange::ExplicitNull = change {
+            if matches!(def.nullability, Nullability::NotNull) {
+                return Err(PlanError::NullRejected(field.to_string()));
+            }
+            return Ok(());
+        }
+        if let FieldChange::Set(v) = change {
+            if v.is_null() {
+                // A JSON `null` scalar is an explicit null, checked against
+                // nullability rather than compared as a typed value.
+                if matches!(def.nullability, Nullability::NotNull) {
+                    return Err(PlanError::NullRejected(field.to_string()));
+                }
+                return Ok(());
+            }
+            if !v.is_array() {
+                if let Some(TypeState::Known(expected)) = Some(def.type_state) {
+                    let inferred = infer_scalar(v).map(|(t, _)| t);
+                    match inferred {
+                        Some(t) if t == expected => return Ok(()),
+                        Some(LogicalType::Int64) if expected == LogicalType::Float64 => {
+                            return Ok(())
+                        }
+                        other => {
+                            return Err(PlanError::TypeMismatch {
+                                field: field.to_string(),
+                                expected: format!("{expected}"),
+                                found: format!(
+                                    "{:?}",
+                                    other.map_or_else(|| "?".into(), |t| format!("{t}"))
+                                ),
+                            })
+                        }
+                    }
+                }
+            }
+        }
+        // A typed datetime write must still satisfy the definition's resolved
+        // type; without this guard a `SetDatetime` could bypass the mismatch
+        // check that a plain scalar `Set` is subject to.
+        if let FieldChange::SetDatetime(_) = change {
+            if let TypeState::Known(expected) = def.type_state {
+                if expected != LogicalType::DateTime {
+                    return Err(PlanError::TypeMismatch {
+                        field: field.to_string(),
+                        expected: format!("{expected}"),
+                        found: "DateTime".into(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete every live occurrence this owner holds for the family's
+    /// definitions, returning tombstone rows for embedding invalidation.
+    ///
+    /// # Errors
+    /// Returns [`PlanError::Storage`] if a definition or occurrence row cannot
+    /// be read.
+    pub fn stage_deletes_of_family(
+        &mut self,
+        kind: OwnerKind,
+        owner_ord: u64,
+        family: &PropertyFamily,
+    ) -> Result<(), PlanError> {
+        if self.new_owners.contains(&(kind, owner_ord)) {
+            // Created by this batch: nothing committed to delete.
+            return Ok(());
+        }
+        for ty_state in [
+            TypeState::Unresolved,
+            TypeState::Known(LogicalType::Boolean),
+            TypeState::Known(LogicalType::Int64),
+            TypeState::Known(LogicalType::Float64),
+            TypeState::Known(LogicalType::Utf8),
+            TypeState::Known(LogicalType::DateTime),
+        ] {
+            if let Some(def) = self.definition_exists(family.family_id, ty_state)? {
+                self.stage_delete_owner_property(kind, owner_ord, def.property_id, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage deletion of all occurrences of one (owner, property) pair,
+    /// optionally restricting to one element slot. Skips duplicates already
+    /// staged in this batch.
+    ///
+    /// # Errors
+    /// Returns [`PlanError::Storage`] if the owner index or an occurrence row
+    /// cannot be read or decoded.
+    pub fn stage_delete_owner_property(
+        &mut self,
+        kind: OwnerKind,
+        owner_ord: u64,
+        pid: u64,
+        elem: Option<u64>,
+    ) -> Result<(), PlanError> {
+        let occurrences = crate::reader::try_access::occurrences_of_pid(
+            self.txn,
+            self.tenant,
+            kind,
+            owner_ord,
+            pid,
+        )?;
+        let mut family_id = None;
+        for occ in occurrences {
+            if elem.is_some_and(|e| e != occ.elem) {
+                continue;
+            }
+            self.stage_delete(&occ, &mut family_id)?;
+        }
+        Ok(())
+    }
+
+    /// Stage the tombstone of one occurrence (deduplicated within the batch).
+    fn stage_delete(
+        &mut self,
+        occ: &crate::reader::try_access::Occurrence,
+        family_id: &mut Option<u64>,
+    ) -> Result<(), PlanError> {
+        if !self
+            .deleted_occurrences
+            .insert((occ.kind, occ.owner, occ.pid, occ.elem))
+        {
+            return Ok(());
+        }
+        let fid = if let Some(fid) = *family_id {
+            fid
+        } else {
+            let def = crate::reader::try_access::definition(self.txn, self.tenant, occ.pid)?
+                .ok_or_else(|| PlanError::Storage("occurrence of an unknown property".into()))?;
+            *family_id = Some(def.family_id);
+            def.family_id
+        };
+        self.mutations.push(Mutation::DeleteOccurrence {
+            row: occ.to_row(fid),
+        });
+        Ok(())
+    }
+
+    /// Stage tombstones for every occurrence of one owner (all properties).
+    ///
+    /// # Errors
+    /// Returns [`PlanError::Storage`] if the occurrences or a definition cannot
+    /// be read.
+    pub fn stage_delete_all_of_owner(
+        &mut self,
+        kind: OwnerKind,
+        owner_ord: u64,
+    ) -> Result<(), PlanError> {
+        let occurrences = crate::reader::try_access::occurrences_of_owner(
+            self.txn,
+            self.tenant,
+            kind,
+            owner_ord,
+        )?;
+        let mut current: Option<(u64, Option<u64>)> = None;
+        for occ in occurrences {
+            let mut family_id = match current {
+                Some((pid, fid)) if pid == occ.pid => fid,
+                _ => None,
+            };
+            self.stage_delete(&occ, &mut family_id)?;
+            current = Some((occ.pid, family_id));
+        }
+        Ok(())
+    }
+
+    /// Build and stage `PutOccurrence` mutations for a new field value.
+    ///
+    /// # Errors
+    /// Returns [`PlanError::MixedArray`] if a value cannot be inferred as a
+    /// scalar, or [`PlanError::Storage`] if an ordinal cannot be allocated.
+    ///
+    /// # Panics
+    /// Panics if an inferred scalar cannot be order-preservingly encoded,
+    /// which is unreachable for the scalar types produced by `infer_scalar`.
+    pub fn stage_put_values(
+        &mut self,
+        kind: OwnerKind,
+        owner_ord: u64,
+        family: &PropertyFamily,
+        def: &PropertyDefinition,
+        field_display: &str,
+        payload: &ValuePayload,
+    ) -> Result<(), PlanError> {
+        let elements: Vec<Json> = match payload {
+            ValuePayload::Null => vec![Json::Null],
+            ValuePayload::Single(v) => vec![v.clone()],
+            ValuePayload::Array(items) => items.iter().flat_map(single_element).collect(),
+            ValuePayload::DateTime(ms) => vec![serde_json::json!(ms)],
+        };
+        let is_array = matches!(payload, ValuePayload::Array(_));
+
+        // Empty arrays are stored as a single payload-free marker occurrence so
+        // reconstruction can emit a genuine `[]` (prod preserves empty arrays;
+        // they are not collapsed to null).
+        if is_array && elements.is_empty() {
+            let row = OccurrenceRow {
+                owner_kind: kind,
+                owner_ord,
+                property_id: def.property_id,
+                family_id: family.family_id,
+                elem_ordinal: Some(0),
+                occurrence_value: OccurrenceValue::EmptyArray,
+            };
+            self.mutations.push(Mutation::PutOccurrence {
+                row,
+                canonical_value_bytes: None,
+            });
+            return Ok(());
+        }
+
+        for (idx, ev) in elements.iter().enumerate() {
+            let elem_ord = if is_array { Some(idx as u64) } else { None };
+
+            let (value_state, enc_opt) = if matches!(payload, ValuePayload::DateTime(_)) {
+                let ty = LogicalType::DateTime;
+                let s = rushdb_types::value::Scalar::DateTime(
+                    ev.as_i64()
+                        .ok_or_else(|| PlanError::MixedArray(field_display.into()))?,
+                );
+                let enc = encode_order_preserving(ty, &s).expect("encodable staged scalar");
+                (OccurrenceValue::Stored { ty }, Some(enc))
+            } else {
+                match ev {
+                    Json::Null => (OccurrenceValue::ExplicitNull, None),
+                    scalar => {
+                        let (ty, s) = infer_scalar(scalar)
+                            .ok_or_else(|| PlanError::MixedArray(field_display.into()))?;
+                        // An integer element of a mixed number array is stored
+                        // in the array's Float64 definition as a float, so the
+                        // definition's entries share one encoding.
+                        let (ty, s) = match (def.type_state, s) {
+                            (
+                                TypeState::Known(LogicalType::Float64),
+                                rushdb_types::value::Scalar::Int64(i),
+                            ) => (
+                                LogicalType::Float64,
+                                rushdb_types::value::Scalar::Float64(int_as_float(i)),
+                            ),
+                            (_, s) => (ty, s),
+                        };
+                        let enc = encode_order_preserving(ty, &s).expect("encodable staged scalar");
+                        (OccurrenceValue::Stored { ty }, Some(enc))
+                    }
+                }
+            };
+
+            let row = OccurrenceRow {
+                owner_kind: kind,
+                owner_ord,
+                property_id: def.property_id,
+                family_id: family.family_id,
+                elem_ordinal: elem_ord,
+                occurrence_value: value_state,
+            };
+            self.mutations.push(Mutation::PutOccurrence {
+                row,
+                canonical_value_bytes: enc_opt,
+            });
+        }
+        Ok(())
+    }
+
+    /// Appends a precondition to be enforced by the commit.
+    pub fn push_precondition(&mut self, pc: Precondition) {
+        self.preconditions.push(pc);
+    }
+
+    /// Reads every value under `prefix` from the transaction overlay.
+    ///
+    /// # Errors
+    /// Returns [`PlanError::Storage`] if the range scan fails.
+    pub fn txn_values_under(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, PlanError> {
+        Ok(self
+            .txn
+            .range_prefix(prefix)?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect())
+    }
+
+    /// Stages deletion of a relationship header found during cascade planning.
+    pub fn txn_stage_rel_header_delete(
+        &mut self,
+        hdr: rushdb_types::occurrence::RelationshipHeader,
+    ) {
+        self.mutations.push(Mutation::DeleteRelationshipHeader {
+            relationship_id: hdr.relationship_id,
+            ordinal: hdr.ordinal,
+            rel_type: hdr.rel_type,
+            source_ord: hdr.source_ord,
+            target_ord: hdr.target_ord,
+        });
+    }
+
+    /// Sorts the staged mutations into deterministic commit order and returns
+    /// them.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<Mutation> {
+        self.mutations.sort_by_key(sort_key);
+        self.mutations
+    }
+}
+
+fn sort_key(m: &Mutation) -> String {
+    match m {
+        Mutation::CreateRecordHeader { .. } | Mutation::CreateRelationshipHeader { .. } => {
+            format!("{}|{}", 'a', header_ord(m))
+        }
+        Mutation::EnsureFamily { family_id, .. } => format!("{}|{}", 'f', family_id),
+        Mutation::EnsureDefinition { property_id, .. } => format!("{}|{}", 'd', property_id),
+        Mutation::DeleteFamily { family_id, .. } => format!("{}|{}", 'x', family_id),
+        // A delete of an occurrence slot must apply before a put of the same
+        // slot (an update rewrites `(owner, pid, elem)` in place, DC11).
+        Mutation::DeleteOccurrence { row } => format!(
+            "n|{}|{:020}|{:020}|{:020}",
+            row.owner_kind.as_byte(),
+            row.owner_ord,
+            row.property_id,
+            row.elem_ordinal.unwrap_or(0)
+        ),
+        Mutation::PutOccurrence { row, .. } => format!(
+            "o|{}|{:020}|{:020}|{:020}",
+            row.owner_kind.as_byte(),
+            row.owner_ord,
+            row.property_id,
+            row.elem_ordinal.unwrap_or(0)
+        ),
+        Mutation::RetypeRecordHeader { ordinal, .. } => format!("{}|{}", 'r', ordinal),
+        Mutation::DeleteRecordHeader { ordinal, .. }
+        | Mutation::DeleteRelationshipHeader { ordinal, .. } => format!("{}|{}", 'z', ordinal),
+        Mutation::EnsureEmbeddingSpace { info, .. } => format!("{}|{}", 'f', info.space_id),
+        Mutation::SetMetaValue { .. }
+        | Mutation::SetMetaBlob { .. }
+        | Mutation::DeleteMetaBlob { .. } => format!("{}|{}", 'z', u64::MAX / 4),
+        Mutation::ClearEmbeddingSpace { space_id, .. } => format!("z|clear-embedding|{space_id}"),
+        Mutation::SetSecurityPolicy { .. } | Mutation::SetSecurityPolicyThreshold { .. } => {
+            "z|security-policy".into()
+        }
+        Mutation::PurgeTenantChunk { .. } => {
+            format!("{}|{}", 'z', u64::MAX / 2)
+        }
+        Mutation::RegisterTenant { .. } => "z|register-tenant".into(),
+        Mutation::RetireTenant => "z|retire-tenant".into(),
+        Mutation::UpsertEmbeddingBinding { binding, .. } => {
+            format!("{}|{}", 'o', binding.vector_slot)
+        }
+        Mutation::ReclaimEmbeddingSlots { .. } => "z|reclaim-embedding".into(),
+        Mutation::DefineIndex { name, .. } | Mutation::DropIndex { name } => {
+            format!("z|index|{name}")
+        }
+        Mutation::IndexBackfill { id, .. } | Mutation::IndexDrop { id, .. } => {
+            format!("z|index|{id:010}")
+        }
+        Mutation::IndexApplied { index, .. } => format!("z|index-applied|{index:010}"),
+        Mutation::DeleteRawKey { key } => format!("z|repair-delete|{key:?}"),
+        Mutation::PutRawKey { key, .. } => format!("z|repair-put|{key:?}"),
+    }
+}
+
+fn header_ord(m: &Mutation) -> u64 {
+    match m {
+        Mutation::CreateRecordHeader { ordinal, .. }
+        | Mutation::CreateRelationshipHeader { ordinal, .. } => *ordinal,
+        _ => 0,
+    }
+}
+
+fn state_to_bytes(fid: u64, state: TypeState) -> Vec<u8> {
+    let mut out = rushdb_types::keys::u64be(fid).to_vec();
+    out.extend_from_slice(b"/");
+    match state {
+        TypeState::Unresolved => out.extend_from_slice(b"U"),
+        TypeState::Known(ty) => {
+            out.extend_from_slice(b"K");
+            out.push(logical_tag(ty));
+        }
+    }
+    out
+}
+
+fn unify_array_type(items: &[Json], field: &str) -> Result<LogicalType, PlanError> {
+    // An empty array has no element to type: it is stored as an empty-array
+    // marker and read back as `[]`. Default to string, as for an all-null
+    // array below.
+    if items.is_empty() {
+        return Ok(LogicalType::Utf8);
+    }
+    let mut seen: Option<LogicalType> = None;
+    for it in items {
+        // null elements are type-less explicit-null occurrences (document 22);
+        // they never force a mixed-array error and don't pick the type
+        if it.is_null() {
+            continue;
+        }
+        let Some((ty, _)) = infer_scalar(it) else {
+            return Err(PlanError::MixedArray(field.into()));
+        };
+        seen = Some(match seen {
+            None => ty,
+            Some(prev) if prev == ty => prev,
+            Some(LogicalType::Int64 | LogicalType::Float64)
+                if ty == LogicalType::Int64 || ty == LogicalType::Float64 =>
+            {
+                LogicalType::Float64
+            }
+            Some(other) => other,
+        });
+    }
+    // all elements were null (or the array was empty): string-typed, matching
+    // the reference `suggestPropertyType(null) === STRING`
+    Ok(seen.unwrap_or(LogicalType::Utf8))
+}
+
+/// An integer as the float a Float64 definition stores (exact below 2^53).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a mixed number array is stored as floats"
+)]
+fn int_as_float(i: i64) -> f64 {
+    i as f64
+}
