@@ -132,3 +132,137 @@ fn policy_rotation_aborts_inflight_cross_request_transaction() {
             &tx,
             BatchOp::CreateRecord {
                 label: "Episode".into(),
+                explicit_id: None,
+                fields: vec![("title".into(), FieldChange::Set(json!("s1e1")))],
+            },
+        )
+        .unwrap();
+
+    // Rotate the policy mid-transaction: generation 1 -> 2.
+    store_policy(
+        &lmpg,
+        &policy_allow_episode(),
+        AuthorizationMode::PolicyEnforced,
+    )
+    .unwrap();
+
+    // Commit revalidates the generation captured at begin and must abort.
+    let out = coord.commit(&tx);
+    match out {
+        TxOutcome::Aborted(reason) => assert!(reason.contains("authorization_changed"), "{reason}"),
+        other => panic!("expected authorization_changed abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn committed_under_stable_policy_survives_rotation() {
+    let (store, tenant) = memory();
+    let lmpg = Lmpg::new(store.clone(), tenant);
+    lmpg.set_authorizer(Arc::new(ActiveAuthorizer::new(store.clone(), tenant)));
+    let coord = TxCoordinator::new_with_authorizer(
+        store.clone(),
+        tenant,
+        Duration::from_secs(60),
+        Some(Arc::new(ActiveAuthorizer::new(store, tenant))),
+    )
+    .unwrap();
+
+    let tx = coord.begin().unwrap();
+    coord
+        .stage(
+            &tx,
+            BatchOp::CreateRecord {
+                label: "Episode".into(),
+                explicit_id: None,
+                fields: vec![],
+            },
+        )
+        .unwrap();
+
+    // No rotation before commit: the transaction commits cleanly.
+    match coord.commit(&tx) {
+        TxOutcome::Committed(_) => {}
+        other => panic!("expected commit, got {other:?}"),
+    }
+
+    // A later rotation does not retroactively abort the committed data.
+    store_policy(
+        &lmpg,
+        &policy_allow_episode(),
+        AuthorizationMode::PolicyEnforced,
+    )
+    .unwrap();
+    assert_eq!(count_label(&lmpg, "Episode"), 1);
+}
+
+#[test]
+fn load_active_policy_roundtrip_matches_fingerprint() {
+    let (store, tenant) = memory();
+    let lmpg = Lmpg::new(store, tenant);
+
+    assert!(
+        load_active_policy(&lmpg).unwrap().is_none(),
+        "no policy before first store"
+    );
+
+    let ap = store_policy(
+        &lmpg,
+        &policy_allow_episode(),
+        AuthorizationMode::PolicyEnforced,
+    )
+    .unwrap();
+    let loaded = load_active_policy(&lmpg)
+        .unwrap()
+        .expect("policy persisted");
+    assert_eq!(loaded.generation, ap.generation);
+    assert_eq!(loaded.mode, AuthorizationMode::PolicyEnforced);
+    assert_eq!(loaded.fingerprint, ap.fingerprint);
+    assert_eq!(loaded.policy.allowed_labels, vec!["Episode".to_string()]);
+}
+
+#[test]
+fn policy_and_enforcement_survive_redb_restart() {
+    let dir = rushdb_storage::TempPath::dir("authz-restart");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tenant = TenantId::from_ordinal(71);
+
+    // First process: store a policy and an allowed record in redb.
+    let db = dir.join("rushdb.redb");
+    let store1 = Arc::new(Store::open(&db).unwrap());
+    let lmpg1 = Lmpg::new(store1.clone(), tenant);
+    lmpg1.set_authorizer(Arc::new(ActiveAuthorizer::new(store1.clone(), tenant)));
+    let ap = store_policy(
+        &lmpg1,
+        &policy_allow_episode(),
+        AuthorizationMode::PolicyEnforced,
+    )
+    .unwrap();
+    lmpg1.create_record("Episode", None, vec![]).unwrap();
+    let ci = store1.committed_version();
+    drop(lmpg1);
+    drop(store1);
+
+    // Second process: reopen from redb. Policy, generation, and enforcement
+    // must all come back.
+    let store2 = Arc::new(Store::open(&db).unwrap());
+    assert_eq!(store2.committed_version(), ci);
+
+    let lmpg2 = Lmpg::new(store2.clone(), tenant);
+    lmpg2.set_authorizer(Arc::new(ActiveAuthorizer::new(store2, tenant)));
+
+    let loaded = load_active_policy(&lmpg2)
+        .unwrap()
+        .expect("policy survives restart");
+    assert_eq!(loaded.generation, 1);
+    assert_eq!(loaded.fingerprint, ap.fingerprint);
+
+    // Record created before restart is still there.
+    assert_eq!(count_label(&lmpg2, "Episode"), 1);
+
+    // Denied label still rejected after restart.
+    let err = lmpg2.create_record("Note", None, vec![]).unwrap_err();
+    assert!(err.to_reason().contains("not authorized"), "{err:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
