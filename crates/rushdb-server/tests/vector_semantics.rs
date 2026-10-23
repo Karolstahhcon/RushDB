@@ -607,3 +607,612 @@ fn explain_vector_reports_access_path_and_candidate_count() {
     assert_eq!(plan.access_path, "vector_index");
     assert_eq!(plan.label, "FRUIT");
     assert_eq!(
+        plan.candidate_count, 1,
+        "banana predicate resolves 1 candidate"
+    );
+    assert_eq!(plan.k, 10);
+    assert_eq!(plan.predicate, serde_json::json!({ "tag": "banana" }));
+}
+
+/// A custom-named index (two same-shape embedding models) must bind and search
+/// through its explicit name, not a re-derived legacy alias.
+#[test]
+fn custom_named_index_binds_and_searches_by_name() {
+    let n = node();
+    let custom = "openai.text-embedding-3-small.v2";
+    n.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            name: Some(custom.into()),
+            label: "FRUIT".into(),
+            property: "embedding".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    let apple = create_vector_record(&n, "FRUIT", "apple", &[1.0, 0.0]);
+    let banana = create_vector_record(&n, "FRUIT", "banana", &[0.9, 0.1]);
+    let result = n
+        .scope()
+        .upsert_vector_index(
+            custom,
+            &[
+                VectorItem {
+                    record_id: apple,
+                    vector: vec![1.0, 0.0],
+                    source_hash: None,
+                    index_generation: None,
+                },
+                VectorItem {
+                    record_id: banana,
+                    vector: vec![0.9, 0.1],
+                    source_hash: None,
+                    index_generation: None,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(result["requested"], 2);
+    assert_eq!(
+        result["updated"], 2,
+        "a custom-named index must accept vectors: {result}"
+    );
+
+    let hits = vector_find(
+        &n,
+        &VectorQuery {
+            labels: vec!["FRUIT".into()],
+            property: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            similarity: "cosine".into(),
+            index: Some(custom.into()),
+            predicate: serde_json::json!({}),
+            offset: 0,
+            limit: 10,
+            ef: None,
+            mode: None,
+            score_threshold: None,
+        },
+    );
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].1, "apple");
+}
+
+/// Two indexes with identical `(label, property, dims, similarity)` are
+/// distinct spaces when explicitly named: vectors never cross-talk.
+#[test]
+fn same_shape_spaces_do_not_cross_talk() {
+    let n = node();
+    for name in ["space_a", "space_b"] {
+        n.scope()
+            .create_vector_index(&VectorIndexDefinition {
+                name: Some(name.into()),
+                label: "FRUIT".into(),
+                property: "embedding".into(),
+                dimensions: 2,
+                similarity: "cosine".into(),
+                model: None,
+                owner: None,
+            })
+            .unwrap();
+    }
+    let apple = create_vector_record(&n, "FRUIT", "apple", &[1.0, 0.0]);
+    let banana = create_vector_record(&n, "FRUIT", "banana", &[0.0, 1.0]);
+    n.scope()
+        .upsert_vector_index(
+            "space_a",
+            &[VectorItem {
+                record_id: apple,
+                vector: vec![1.0, 0.0],
+                source_hash: None,
+                index_generation: None,
+            }],
+        )
+        .unwrap();
+    n.scope()
+        .upsert_vector_index(
+            "space_b",
+            &[VectorItem {
+                record_id: banana,
+                vector: vec![1.0, 0.0],
+                source_hash: None,
+                index_generation: None,
+            }],
+        )
+        .unwrap();
+
+    let query = |index: &str| VectorQuery {
+        labels: vec!["FRUIT".into()],
+        property: "embedding".into(),
+        vector: vec![1.0, 0.0],
+        similarity: "cosine".into(),
+        index: Some(index.into()),
+        predicate: serde_json::json!({}),
+        offset: 0,
+        limit: 10,
+        ef: None,
+        mode: None,
+        score_threshold: None,
+    };
+    let a: Vec<String> = vector_find(&n, &query("space_a"))
+        .into_iter()
+        .map(|(_, tag)| tag)
+        .collect();
+    let b: Vec<String> = vector_find(&n, &query("space_b"))
+        .into_iter()
+        .map(|(_, tag)| tag)
+        .collect();
+    assert_eq!(a, vec!["apple"]);
+    assert_eq!(b, vec!["banana"]);
+}
+
+/// Explicit aliases are validated and a declared model is immutable under an
+/// existing name, so incomparable spaces cannot be mixed silently.
+#[test]
+fn index_alias_validation_and_model_provenance() {
+    let n = node();
+    let def = |name: Option<&str>, model: Option<&str>| VectorIndexDefinition {
+        label: "FRUIT".into(),
+        property: "embedding".into(),
+        dimensions: 2,
+        similarity: "cosine".into(),
+        name: name.map(str::to_string),
+        model: model.map(str::to_string),
+        owner: None,
+    };
+
+    for bad in ["", "has space", "slash/name", "emb__reserved__x"] {
+        let err = n
+            .scope()
+            .create_vector_index(&def(Some(bad), None))
+            .unwrap_err();
+        assert!(err.contains("vector index name"), "name `{bad}`: {err}");
+    }
+    let long = "a".repeat(65);
+    assert!(n
+        .scope()
+        .create_vector_index(&def(Some(&long), None))
+        .is_err());
+
+    let created = n
+        .scope()
+        .create_vector_index(&def(
+            Some("space.model.v1"),
+            Some("openai/text-embedding-3-small"),
+        ))
+        .unwrap();
+    assert_eq!(created["nameSource"], "explicit");
+    assert_eq!(created["model"], "openai/text-embedding-3-small");
+
+    let err = n
+        .scope()
+        .create_vector_index(&def(Some("space.model.v1"), Some("qwen/other")))
+        .unwrap_err();
+    assert!(err.contains("different model"), "{err}");
+    n.scope()
+        .create_vector_index(&def(
+            Some("space.model.v1"),
+            Some("openai/text-embedding-3-small"),
+        ))
+        .unwrap();
+
+    // Implicit derivation itself (opt-out of the now-mandatory gate) is a
+    // separate concern from the alias/model validation above, so it gets its
+    // own node with the gate explicitly disabled.
+    let mut off_cfg = ServerConfig::default();
+    off_cfg.resources.require_vector_index_name = false;
+    let off_node = Node::bootstrap(&mut off_cfg).unwrap();
+    let derived = off_node
+        .scope()
+        .create_vector_index(&def(None, None))
+        .unwrap();
+    assert_eq!(derived["nameSource"], "derived");
+}
+
+/// Relationship-owned vector indexes: an index over a relationship type binds
+/// and searches relationships (not records), with the same exact filter oracle.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear fixture-build -> index -> search -> assert flow; splitting it would scatter shared setup"
+)]
+fn relationship_owned_vector_index_binds_and_searches() {
+    let n = node();
+    let lmpg = n.scope().lmpg();
+    let a = lmpg
+        .create_record(
+            "PERSON",
+            None,
+            vec![("name".into(), FieldChange::Set(serde_json::json!("a")))],
+        )
+        .unwrap();
+    let b = lmpg
+        .create_record(
+            "PERSON",
+            None,
+            vec![("name".into(), FieldChange::Set(serde_json::json!("b")))],
+        )
+        .unwrap();
+    let rel = lmpg
+        .create_relationship(
+            "KNOWS",
+            a,
+            b,
+            vec![(
+                "embedding".into(),
+                FieldChange::Set(serde_json::json!("friend")),
+            )],
+        )
+        .unwrap();
+    let rel_hex = rel
+        .relationship_id
+        .iter()
+        .fold(String::with_capacity(32), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        });
+
+    n.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            label: "KNOWS".into(),
+            property: "embedding".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            name: Some("rel-index".into()),
+            model: None,
+            owner: Some("relationship".into()),
+        })
+        .unwrap();
+    // The backfill helper lists the unbound relationship before it is bound.
+    let (candidates, total) = n
+        .scope()
+        .vector_index_candidates(&VectorIndexCandidatesQuery {
+            label: "KNOWS".into(),
+            property: "embedding".into(),
+            index: "rel-index".into(),
+            skip: 0,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["value"], serde_json::json!("friend"));
+
+    let updated = n
+        .scope()
+        .upsert_vector_index(
+            "rel-index",
+            &[VectorItem {
+                record_id: rel_hex,
+                vector: vec![1.0, 0.0],
+                source_hash: None,
+                index_generation: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(updated["updated"], 1, "{updated}");
+
+    let envelope = RequestEnvelope {
+        protocol_version: 1,
+        request_id: Some("rel-vector".into()),
+        context: RequestContext::default(),
+        operation: Operation::Query {
+            query: Query::Vector {
+                query: VectorQuery {
+                    labels: vec!["KNOWS".into()],
+                    property: "embedding".into(),
+                    vector: vec![1.0, 0.0],
+                    similarity: "cosine".into(),
+                    index: Some("rel-index".into()),
+                    predicate: serde_json::json!({}),
+                    offset: 0,
+                    limit: 10,
+                    ef: None,
+                    mode: None,
+                    score_threshold: None,
+                },
+            },
+        },
+    };
+    let res = rushdb_server::protocol::ProtocolExecutor::new(&n, None)
+        .execute(envelope)
+        .unwrap();
+    let Response::Records { records, .. } = res.response else {
+        panic!("expected records, got {:?}", res.response);
+    };
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["__type"], serde_json::json!("KNOWS"));
+    assert_eq!(records[0]["embedding"], serde_json::json!("friend"));
+}
+
+/// Inline `$vectors` with an explicit `index` binds to that space; a missing
+/// name fails before any record is created.
+#[test]
+fn inline_vectors_bind_to_the_explicit_index() {
+    let n = node();
+    let custom = "custom-inline";
+    n.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            name: Some(custom.into()),
+            label: "FRUIT".into(),
+            property: "embedding".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    n.scope()
+        .create_record(
+            "FRUIT",
+            &serde_json::json!({ "tag": "apple" }),
+            &[serde_json::json!({
+                "propertyName": "embedding",
+                "vector": [1.0, 0.0],
+                "index": custom,
+            })],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    let hits = vector_find(
+        &n,
+        &VectorQuery {
+            labels: vec!["FRUIT".into()],
+            property: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            similarity: "cosine".into(),
+            index: Some(custom.into()),
+            predicate: serde_json::json!({}),
+            offset: 0,
+            limit: 10,
+            ef: None,
+            mode: None,
+            score_threshold: None,
+        },
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].1, "apple");
+
+    let err = n
+        .scope()
+        .create_record(
+            "FRUIT",
+            &serde_json::json!({ "tag": "ghost" }),
+            &[serde_json::json!({
+                "propertyName": "embedding",
+                "vector": [1.0, 0.0],
+                "index": "does-not-exist",
+            })],
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("no embedding index named"),
+        "missing explicit index must fail loudly, got: {err}"
+    );
+}
+
+/// C9 (cloud-capacity F10): inline (external) vectors are not stored
+/// properties, so an index whose every record is bound must report `ready`
+/// with honest counts — not `awaiting_vectors` with `totalRecords: 0`.
+#[test]
+fn inline_vector_index_stats_report_ready_with_bound_counts() {
+    let n = node();
+    let alias = "inline-stats";
+    n.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            name: Some(alias.into()),
+            label: "DOC".into(),
+            property: "emb".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    for i in 0..5u8 {
+        n.scope()
+            .create_record(
+                "DOC",
+                &serde_json::json!({ "n": i }),
+                &[serde_json::json!({
+                    "propertyName": "emb",
+                    "vector": [1.0, f32::from(i)],
+                    "index": alias,
+                })],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    let stats = n.scope().vector_index_stats(alias).unwrap();
+    assert_eq!(stats["indexedRecords"], 5, "{stats}");
+    assert_eq!(stats["totalRecords"], 5, "{stats}");
+    assert_eq!(stats["unindexedRecords"], 0, "{stats}");
+    assert_eq!(stats["status"], "ready", "{stats}");
+}
+
+/// C9: a managed index counts records carrying the property from the derived
+/// support catalog — bound or not — exactly like the old reconstruction did.
+#[test]
+fn managed_vector_index_total_counts_records_carrying_the_property() {
+    let n = node();
+    let alias = "managed-stats";
+    n.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            name: Some(alias.into()),
+            label: "FRUIT".into(),
+            property: "embedding".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    for (tag, vector) in [("a", [1.0, 0.0]), ("b", [0.0, 1.0]), ("c", [1.0, 1.0])] {
+        create_vector_record(&n, "FRUIT", tag, &vector);
+    }
+    // A record of the label without the property is not counted.
+    n.scope()
+        .create_record(
+            "FRUIT",
+            &serde_json::json!({ "tag": "bare" }),
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    let stats = n.scope().vector_index_stats(alias).unwrap();
+    assert_eq!(stats["totalRecords"], 3, "{stats}");
+}
+
+/// C9 (cloud-capacity F11): an unfiltered search checks label membership per
+/// candidate instead of materializing every member up front. A record deleted
+/// after binding must still never be returned, by exact or ANN search.
+#[test]
+fn unfiltered_vector_search_excludes_deleted_records() {
+    let n = node();
+    let alias = "unfiltered";
+    n.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            name: Some(alias.into()),
+            label: "FRUIT".into(),
+            property: "embedding".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    let mut ids = Vec::new();
+    for (tag, vector) in [
+        ("keep", [1.0, 0.0]),
+        ("gone", [0.99, 0.01]),
+        ("far", [0.0, 1.0]),
+    ] {
+        let id = n
+            .scope()
+            .create_record(
+                "FRUIT",
+                &serde_json::json!({ "tag": tag }),
+                &[serde_json::json!({ "propertyName": "embedding", "vector": vector, "index": alias })],
+                &serde_json::json!({}),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        ids.push(id);
+    }
+    n.scope().delete_record(&ids[1]).unwrap();
+    for ef in [None, Some(64)] {
+        let hits = vector_find(
+            &n,
+            &VectorQuery {
+                labels: vec!["FRUIT".into()],
+                property: "embedding".into(),
+                vector: vec![1.0, 0.0],
+                similarity: "cosine".into(),
+                index: Some(alias.into()),
+                predicate: serde_json::json!({}),
+                offset: 0,
+                limit: 10,
+                ef,
+                mode: None,
+                score_threshold: None,
+            },
+        );
+        let tags: Vec<&str> = hits.iter().map(|(_, tag)| tag.as_str()).collect();
+        assert_eq!(tags, ["keep", "far"], "ef={ef:?}");
+    }
+}
+
+/// C9 (cloud-capacity F10): the ANN graph is a cache. When the vector budget
+/// cannot admit a build, an ANN query must answer exactly instead of failing.
+#[test]
+fn ann_search_falls_back_to_exact_when_the_budget_cannot_admit_a_build() {
+    let mut cfg = ServerConfig::default();
+    // Room for the store's own needs, far too little for any ANN build.
+    cfg.resources.logical_cache_bytes = rushdb_server::resource_config::ByteSize(64 * 1024);
+    let n = Node::bootstrap(&mut cfg).unwrap();
+    let alias = "tiny-budget";
+    n.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            name: Some(alias.into()),
+            label: "FRUIT".into(),
+            property: "embedding".into(),
+            dimensions: 64,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    for i in 0..300u16 {
+        let mut vector = vec![0.0_f32; 64];
+        vector[usize::from(i % 64)] = 1.0;
+        vector[0] += f32::from(i) / 1000.0;
+        n.scope()
+            .create_record(
+                "FRUIT",
+                &serde_json::json!({ "tag": format!("t{i}") }),
+                &[serde_json::json!({ "propertyName": "embedding", "vector": vector, "index": alias })],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+    }
+    let mut query = vec![0.0_f32; 64];
+    query[5] = 1.0;
+    let search = |ef| {
+        vector_find(
+            &n,
+            &VectorQuery {
+                labels: vec!["FRUIT".into()],
+                property: "embedding".into(),
+                vector: query.clone(),
+                similarity: "cosine".into(),
+                index: Some(alias.into()),
+                predicate: serde_json::json!({}),
+                offset: 0,
+                limit: 5,
+                ef,
+                mode: None,
+                score_threshold: None,
+            },
+        )
+    };
+    assert_eq!(
+        search(Some(64)),
+        search(None),
+        "ANN must equal exact when it falls back"
+    );
+}
+
+/// Vector indexes are built from the current snapshot, never replayed from the
+/// WAL, so declaring, binding and revalidating one must not pin WAL retention.
+#[test]
+fn vector_index_lifecycle_never_pins_wal_retention() {
+    let n = node();
+    let alias = "no-retention-pin";
+    n.scope()
+        .create_vector_index(&VectorIndexDefinition {
+            name: Some(alias.into()),
+            label: "DOC".into(),
+            property: "emb".into(),
+            dimensions: 2,
+            similarity: "cosine".into(),
+            model: None,
+            owner: None,
+        })
+        .unwrap();
+    n.scope()
+        .create_record(
+            "DOC",
+            &serde_json::json!({ "n": 1 }),
+            &[serde_json::json!({ "propertyName": "emb", "vector": [1.0, 0.0], "index": alias })],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    n.scope().vector_index_stats(alias).unwrap();
+    n.scope().revalidate_vector_index(alias).unwrap();
+    assert_eq!(n.protected_retention_floor(), None);
+}
