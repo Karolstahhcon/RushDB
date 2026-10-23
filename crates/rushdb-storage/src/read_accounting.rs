@@ -24,3 +24,30 @@ pub fn enable(on: bool) {
 }
 
 /// Count one backend read of kind `op` (`get`, `scan`, `seek`) at `key`.
+pub(crate) fn record(op: &'static str, key: &[u8]) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let family = rushdb_types::keys::family_label(key);
+    LOCAL.with(|local| *local.borrow_mut().entry((op, family.clone())).or_default() += 1);
+    let mut counts = COUNTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *counts.entry((op, family)).or_default() += 1;
+}
+
+/// Take and reset the calling thread's counts.
+#[must_use]
+pub fn take_local() -> BTreeMap<(&'static str, String), u64> {
+    LOCAL.with(|local| std::mem::take(&mut *local.borrow_mut()))
+}
+
+/// Take and reset the counts: `(op, family) -> reads`.
+#[must_use]
+pub fn take() -> BTreeMap<(&'static str, String), u64> {
+    std::mem::take(
+        &mut *COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
