@@ -87,7 +87,7 @@ thiserror = "2"
 crc32fast = "1.5"
 hmac = "0.12"
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1.8"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive", "env"] }
